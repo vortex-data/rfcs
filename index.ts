@@ -4,11 +4,22 @@ import { watch } from "fs";
 const isDev = process.argv.includes("--dev");
 const PORT = 3000;
 
+interface GitCommit {
+  hash: string;
+  date: Date;
+}
+
+interface RFCGitInfo {
+  accepted: GitCommit | null;
+  lastUpdated: GitCommit | null; // null if same as accepted or no git history
+}
+
 interface RFC {
   number: string;
   title: string;
   filename: string;
   html: string;
+  git: RFCGitInfo;
 }
 
 const THEME_SCRIPT = `
@@ -113,9 +124,47 @@ ${list}
   return baseHTML("Vortex RFCs", content, "styles.css", liveReload);
 }
 
-function rfcPage(rfc: RFC, liveReload: boolean = false): string {
+function formatDate(date: Date): string {
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+function rfcPage(rfc: RFC, repoUrl: string | null, liveReload: boolean = false): string {
+  let gitHeader = "";
+
+  if (rfc.git.accepted) {
+    const acceptedLink = repoUrl
+      ? `<a href="${repoUrl}/commit/${rfc.git.accepted.hash}" class="commit-link">${formatDate(rfc.git.accepted.date)}</a>`
+      : formatDate(rfc.git.accepted.date);
+
+    gitHeader = `
+      <div class="rfc-meta-header">
+        <div class="rfc-meta-item">
+          <span class="rfc-meta-label">Accepted:</span>
+          ${acceptedLink}
+        </div>`;
+
+    if (rfc.git.lastUpdated) {
+      const updatedLink = repoUrl
+        ? `<a href="${repoUrl}/commit/${rfc.git.lastUpdated.hash}" class="commit-link">${formatDate(rfc.git.lastUpdated.date)}</a>`
+        : formatDate(rfc.git.lastUpdated.date);
+
+      gitHeader += `
+        <div class="rfc-meta-item">
+          <span class="rfc-meta-label">Last updated:</span>
+          ${updatedLink}
+        </div>`;
+    }
+
+    gitHeader += `
+      </div>`;
+  }
+
   const content = `
-      <a href="../" class="back-link">&larr; Back to index</a>
+      <a href="../" class="back-link">&larr; Back to index</a>${gitHeader}
       <article class="rfc-content">
         ${rfc.html}
       </article>`;
@@ -127,6 +176,52 @@ function parseRFCNumber(filename: string): string {
   // Extract number from filename like "0002-patches-galp.md"
   const match = filename.match(/^(\d+)/);
   return match?.[1] ?? "0000";
+}
+
+async function getGitHubRepoUrl(): Promise<string | null> {
+  try {
+    const result = await $`git remote get-url origin`.quiet();
+    const url = result.stdout.toString().trim();
+    // Convert git@github.com:user/repo.git to https://github.com/user/repo
+    if (url.startsWith("git@github.com:")) {
+      return "https://github.com/" + url.slice(15).replace(/\.git$/, "");
+    }
+    // Convert https://github.com/user/repo.git to https://github.com/user/repo
+    if (url.startsWith("https://github.com/")) {
+      return url.replace(/\.git$/, "");
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function getGitHistory(filepath: string): Promise<RFCGitInfo> {
+  try {
+    const result = await $`git log --follow --format=%H\ %aI -- ${filepath}`.quiet();
+    const lines = result.stdout.toString().trim().split("\n").filter(Boolean);
+
+    if (lines.length === 0) {
+      return { accepted: null, lastUpdated: null };
+    }
+
+    const parseCommit = (line: string): GitCommit => {
+      const [hash, dateStr] = line.split(" ");
+      return { hash, date: new Date(dateStr) };
+    };
+
+    const mostRecent = parseCommit(lines[0]);
+    const oldest = parseCommit(lines[lines.length - 1]);
+
+    // If only one commit, or same commit, don't show lastUpdated
+    if (lines.length === 1 || mostRecent.hash === oldest.hash) {
+      return { accepted: oldest, lastUpdated: null };
+    }
+
+    return { accepted: oldest, lastUpdated: mostRecent };
+  } catch {
+    return { accepted: null, lastUpdated: null };
+  }
 }
 
 interface ValidationError {
@@ -190,6 +285,9 @@ async function build(liveReload: boolean = false): Promise<number> {
     process.exit(1);
   }
 
+  // Get GitHub repo URL for commit links
+  const repoUrl = await getGitHubRepoUrl();
+
   const glob = new Bun.Glob("*.md");
   const rfcs: RFC[] = [];
 
@@ -202,8 +300,9 @@ async function build(liveReload: boolean = false): Promise<number> {
     const html = Bun.markdown.html(content);
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
+    const git = await getGitHistory(path);
 
-    rfcs.push({ number, title, filename, html });
+    rfcs.push({ number, title, filename, html, git });
   }
 
   if (rfcs.length === 0) {
@@ -231,7 +330,7 @@ async function build(liveReload: boolean = false): Promise<number> {
 
   // Generate individual RFC pages
   for (const rfc of rfcs) {
-    const html = rfcPage(rfc, liveReload);
+    const html = rfcPage(rfc, repoUrl, liveReload);
     const outPath = `dist/rfc/${rfc.number}.html`;
     await Bun.write(outPath, html);
     console.log(`Generated ${outPath}`);

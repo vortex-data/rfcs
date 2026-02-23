@@ -271,6 +271,36 @@ th {
 }
 
 /* RFC page specific */
+.rfc-meta-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  padding: 1rem;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 1.5rem;
+  font-size: 0.875rem;
+}
+
+.rfc-meta-item {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.rfc-meta-label {
+  color: var(--fg-muted);
+}
+
+.commit-link {
+  color: var(--link);
+}
+
+.commit-link:hover {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+
 .rfc-header {
   margin-bottom: 2rem;
   padding-bottom: 1rem;
