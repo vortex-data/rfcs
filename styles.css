@@ -238,20 +238,32 @@ th {
 }
 
 .rfc-list li {
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  margin: 0 -1rem;
+  border-radius: 4px;
+  transition: box-shadow 0.15s ease, background 0.15s ease;
 }
 
-.rfc-list li:last-child {
-  border-bottom: none;
+.rfc-list li:hover {
+  background: var(--bg-alt);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+:root[data-theme="dark"] .rfc-list li:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 .rfc-item {
-  display: block;
-  padding: 1rem 0;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex: 1;
   text-decoration: none;
   color: var(--fg);
-  transition: background 0.1s ease;
+  min-width: 0;
 }
 
 .rfc-item:hover {
@@ -262,12 +274,50 @@ th {
 .rfc-item .rfc-number {
   color: var(--fg-muted);
   font-size: 0.875rem;
+  flex-shrink: 0;
+  width: 5rem;
 }
 
 .rfc-item .rfc-title {
-  display: block;
   font-weight: 500;
-  margin-top: 0.25rem;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rfc-item .rfc-date {
+  color: var(--fg-muted);
+  font-size: 0.875rem;
+  flex-shrink: 0;
+}
+
+.rfc-author-link {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--fg-muted);
+  text-decoration: none;
+  flex-shrink: 0;
+}
+
+.rfc-author-link:hover {
+  color: var(--link);
+}
+
+.rfc-author-link:hover .rfc-author-name {
+  text-decoration: underline;
+}
+
+.rfc-author-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+}
+
+.rfc-author-name {
+  font-size: 0.875rem;
 }
 
 /* RFC page specific */

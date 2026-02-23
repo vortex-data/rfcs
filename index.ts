@@ -110,16 +110,32 @@ function escapeHTML(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function indexPage(rfcs: RFC[], liveReload: boolean = false): string {
-  const sorted = [...rfcs].sort((a, b) => a.number.localeCompare(b.number));
+function indexPage(rfcs: RFC[], repoUrl: string | null, liveReload: boolean = false): string {
+  // Sort in reverse numeric order (newest first)
+  const sorted = [...rfcs].sort((a, b) => b.number.localeCompare(a.number));
 
-  const list = sorted.map(rfc => `
+  const list = sorted.map(rfc => {
+    const dateStr = rfc.git.accepted ? formatDate(rfc.git.accepted.date) : "";
+
+    let authorHTML = "";
+    if (rfc.git.author && rfc.git.accepted) {
+      const commitUrl = repoUrl ? `${repoUrl}/commit/${rfc.git.accepted.hash}` : `https://github.com/${rfc.git.author.login}`;
+      authorHTML = `
+          <a href="${commitUrl}" class="rfc-author-link" title="${rfc.git.author.login}">
+            <img src="${rfc.git.author.avatarUrl}" alt="${rfc.git.author.login}" class="rfc-author-avatar">
+            <span class="rfc-author-name">${rfc.git.author.login}</span>
+          </a>`;
+    }
+
+    return `
       <li>
         <a href="rfc/${rfc.number}.html" class="rfc-item">
           <span class="rfc-number">RFC ${rfc.number}</span>
           <span class="rfc-title">${escapeHTML(rfc.title)}</span>
-        </a>
-      </li>`).join("\n");
+          <span class="rfc-date">${dateStr}</span>
+        </a>${authorHTML}
+      </li>`;
+  }).join("\n");
 
   const content = `
       <h1>Request for Comments</h1>
@@ -374,7 +390,7 @@ async function build(liveReload: boolean = false): Promise<number> {
   }
 
   // Generate index page
-  const indexHTML = indexPage(rfcs, liveReload);
+  const indexHTML = indexPage(rfcs, repoUrl, liveReload);
   await Bun.write("dist/index.html", indexHTML);
   console.log("Generated dist/index.html");
 
