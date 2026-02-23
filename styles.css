@@ -342,13 +342,29 @@ th {
   color: var(--fg-muted);
 }
 
+.rfc-meta-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
 .commit-link {
+  display: inline-flex;
+  align-items: center;
   color: var(--link);
 }
 
 .commit-link:hover {
   color: var(--link-hover);
-  text-decoration: underline;
+}
+
+.commit-link svg {
+  display: block;
+  transition: stroke-width 0.1s ease;
+}
+
+.commit-link:hover svg {
+  stroke-width: 2.5;
 }
 
 .rfc-author {
