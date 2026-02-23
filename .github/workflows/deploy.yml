@@ -16,6 +16,8 @@ concurrency:
 
 jobs:
   build:
+    env:
+      GH_TOKEN: ${{ github.token }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
