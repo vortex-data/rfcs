@@ -301,6 +301,38 @@ th {
   text-decoration: underline;
 }
 
+.rfc-author {
+  display: flex;
+  align-items: center;
+}
+
+.author-link {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.author-link:hover {
+  color: var(--link);
+}
+
+.author-link:hover .author-name {
+  text-decoration: underline;
+}
+
+.author-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.author-name {
+  font-weight: 500;
+}
+
 .rfc-header {
   margin-bottom: 2rem;
   padding-bottom: 1rem;

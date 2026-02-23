@@ -9,9 +9,16 @@ interface GitCommit {
   date: Date;
 }
 
+interface GitHubAuthor {
+  login: string;
+  avatarUrl: string;
+  profileUrl: string;
+}
+
 interface RFCGitInfo {
   accepted: GitCommit | null;
   lastUpdated: GitCommit | null; // null if same as accepted or no git history
+  author: GitHubAuthor | null;
 }
 
 interface RFC {
@@ -135,18 +142,35 @@ function formatDate(date: Date): string {
 function rfcPage(rfc: RFC, repoUrl: string | null, liveReload: boolean = false): string {
   let gitHeader = "";
 
-  if (rfc.git.accepted) {
-    const acceptedLink = repoUrl
-      ? `<a href="${repoUrl}/commit/${rfc.git.accepted.hash}" class="commit-link">${formatDate(rfc.git.accepted.date)}</a>`
-      : formatDate(rfc.git.accepted.date);
-
+  if (rfc.git.accepted || rfc.git.author) {
     gitHeader = `
-      <div class="rfc-meta-header">
+      <div class="rfc-meta-header">`;
+
+    // Author section
+    if (rfc.git.author) {
+      gitHeader += `
+        <div class="rfc-meta-item rfc-author">
+          <a href="${rfc.git.author.profileUrl}" class="author-link">
+            <img src="${rfc.git.author.avatarUrl}" alt="${rfc.git.author.login}" class="author-avatar">
+            <span class="author-name">${rfc.git.author.login}</span>
+          </a>
+        </div>`;
+    }
+
+    // Accepted date
+    if (rfc.git.accepted) {
+      const acceptedLink = repoUrl
+        ? `<a href="${repoUrl}/commit/${rfc.git.accepted.hash}" class="commit-link">${formatDate(rfc.git.accepted.date)}</a>`
+        : formatDate(rfc.git.accepted.date);
+
+      gitHeader += `
         <div class="rfc-meta-item">
           <span class="rfc-meta-label">Accepted:</span>
           ${acceptedLink}
         </div>`;
+    }
 
+    // Last updated date
     if (rfc.git.lastUpdated) {
       const updatedLink = repoUrl
         ? `<a href="${repoUrl}/commit/${rfc.git.lastUpdated.hash}" class="commit-link">${formatDate(rfc.git.lastUpdated.date)}</a>`
@@ -196,31 +220,55 @@ async function getGitHubRepoUrl(): Promise<string | null> {
   }
 }
 
-async function getGitHistory(filepath: string): Promise<RFCGitInfo> {
+async function getGitHubAuthor(repoPath: string, commitHash: string): Promise<GitHubAuthor | null> {
+  try {
+    // Use gh CLI to fetch commit info from GitHub API
+    const result = await $`gh api repos/${repoPath}/commits/${commitHash} --jq '.author.login, .author.avatar_url, .author.html_url'`.quiet();
+    const lines = result.stdout.toString().trim().split("\n");
+
+    if (lines.length >= 3 && lines[0] && lines[1] && lines[2]) {
+      return {
+        login: lines[0],
+        avatarUrl: lines[1],
+        profileUrl: lines[2],
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function getGitHistory(filepath: string, repoPath: string | null): Promise<RFCGitInfo> {
   try {
     const result = await $`git log --follow --format=%H\ %aI -- ${filepath}`.quiet();
     const lines = result.stdout.toString().trim().split("\n").filter(Boolean);
 
     if (lines.length === 0) {
-      return { accepted: null, lastUpdated: null };
+      return { accepted: null, lastUpdated: null, author: null };
     }
 
     const parseCommit = (line: string): GitCommit => {
-      const [hash, dateStr] = line.split(" ");
+      const parts = line.split(" ");
+      const hash = parts[0] ?? "";
+      const dateStr = parts[1] ?? "";
       return { hash, date: new Date(dateStr) };
     };
 
-    const mostRecent = parseCommit(lines[0]);
-    const oldest = parseCommit(lines[lines.length - 1]);
+    const mostRecent = parseCommit(lines[0]!);
+    const oldest = parseCommit(lines[lines.length - 1]!);
+
+    // Fetch author info from the first commit
+    const author = repoPath ? await getGitHubAuthor(repoPath, oldest.hash) : null;
 
     // If only one commit, or same commit, don't show lastUpdated
     if (lines.length === 1 || mostRecent.hash === oldest.hash) {
-      return { accepted: oldest, lastUpdated: null };
+      return { accepted: oldest, lastUpdated: null, author };
     }
 
-    return { accepted: oldest, lastUpdated: mostRecent };
+    return { accepted: oldest, lastUpdated: mostRecent, author };
   } catch {
-    return { accepted: null, lastUpdated: null };
+    return { accepted: null, lastUpdated: null, author: null };
   }
 }
 
@@ -287,6 +335,8 @@ async function build(liveReload: boolean = false): Promise<number> {
 
   // Get GitHub repo URL for commit links
   const repoUrl = await getGitHubRepoUrl();
+  // Extract repo path (e.g., "vortex-data/rfcs") for API calls
+  const repoPath = repoUrl ? repoUrl.replace("https://github.com/", "") : null;
 
   const glob = new Bun.Glob("*.md");
   const rfcs: RFC[] = [];
@@ -300,7 +350,7 @@ async function build(liveReload: boolean = false): Promise<number> {
     const html = Bun.markdown.html(content);
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
-    const git = await getGitHistory(path);
+    const git = await getGitHistory(path, repoPath);
 
     rfcs.push({ number, title, filename, html, git });
   }
