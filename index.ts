@@ -40,6 +40,8 @@ const ICON_SUN = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
 
 const ICON_MOON = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>`;
 
+const ICON_EXTERNAL = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h10v10"/><path d="M7 17 17 7"/></svg>`;
+
 const TOGGLE_SCRIPT = `
 function toggleTheme() {
   const root = document.documentElement;
@@ -176,27 +178,27 @@ function rfcPage(rfc: RFC, repoUrl: string | null, liveReload: boolean = false):
 
     // Accepted date
     if (rfc.git.accepted) {
-      const acceptedLink = repoUrl
-        ? `<a href="${repoUrl}/commit/${rfc.git.accepted.hash}" class="commit-link">${formatDate(rfc.git.accepted.date)}</a>`
-        : formatDate(rfc.git.accepted.date);
+      const commitLink = repoUrl
+        ? ` <a href="${repoUrl}/commit/${rfc.git.accepted.hash}" class="commit-link" title="View commit">${ICON_EXTERNAL}</a>`
+        : "";
 
       gitHeader += `
         <div class="rfc-meta-item">
           <span class="rfc-meta-label">Accepted:</span>
-          ${acceptedLink}
+          <span class="rfc-meta-value">${formatDate(rfc.git.accepted.date)}${commitLink}</span>
         </div>`;
     }
 
     // Last updated date
     if (rfc.git.lastUpdated) {
-      const updatedLink = repoUrl
-        ? `<a href="${repoUrl}/commit/${rfc.git.lastUpdated.hash}" class="commit-link">${formatDate(rfc.git.lastUpdated.date)}</a>`
-        : formatDate(rfc.git.lastUpdated.date);
+      const commitLink = repoUrl
+        ? ` <a href="${repoUrl}/commit/${rfc.git.lastUpdated.hash}" class="commit-link" title="View commit">${ICON_EXTERNAL}</a>`
+        : "";
 
       gitHeader += `
         <div class="rfc-meta-item">
           <span class="rfc-meta-label">Last updated:</span>
-          ${updatedLink}
+          <span class="rfc-meta-value">${formatDate(rfc.git.lastUpdated.date)}${commitLink}</span>
         </div>`;
     }
 
