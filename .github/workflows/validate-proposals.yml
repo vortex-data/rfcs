@@ -1,0 +1,17 @@
+name: Validate Proposals
+
+on:
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  validate-naming:
+    name: Validate proposal naming convention
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate proposal file names
+        run: ./scripts/validate-proposals.sh
