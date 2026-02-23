@@ -221,45 +221,30 @@ async function getGitHubRepoUrl(): Promise<string | null> {
 }
 
 async function getGitHubAuthor(repoPath: string, commitHash: string): Promise<GitHubAuthor | null> {
-  console.log(`[DEBUG] getGitHubAuthor called with repoPath=${repoPath}, commitHash=${commitHash}`);
   try {
     // Use gh CLI to fetch commit info from GitHub API
-    const cmd = `gh api repos/${repoPath}/commits/${commitHash} --jq '.author.login, .author.avatar_url, .author.html_url'`;
-    console.log(`[DEBUG] Running command: ${cmd}`);
     const result = await $`gh api repos/${repoPath}/commits/${commitHash} --jq '.author.login, .author.avatar_url, .author.html_url'`.quiet();
-    const stdout = result.stdout.toString();
-    const stderr = result.stderr.toString();
-    console.log(`[DEBUG] gh api stdout: ${stdout}`);
-    console.log(`[DEBUG] gh api stderr: ${stderr}`);
-    const lines = stdout.trim().split("\n");
-    console.log(`[DEBUG] Parsed lines: ${JSON.stringify(lines)}`);
+    const lines = result.stdout.toString().trim().split("\n");
 
     if (lines.length >= 3 && lines[0] && lines[1] && lines[2]) {
-      const author = {
+      return {
         login: lines[0],
         avatarUrl: lines[1],
         profileUrl: lines[2],
       };
-      console.log(`[DEBUG] Returning author: ${JSON.stringify(author)}`);
-      return author;
     }
-    console.log(`[DEBUG] Not enough lines or empty values, returning null`);
     return null;
-  } catch (error) {
-    console.log(`[DEBUG] getGitHubAuthor error: ${error}`);
+  } catch {
     return null;
   }
 }
 
 async function getGitHistory(filepath: string, repoPath: string | null): Promise<RFCGitInfo> {
-  console.log(`[DEBUG] getGitHistory called with filepath=${filepath}, repoPath=${repoPath}`);
   try {
     const result = await $`git log --follow --format=%H\ %aI -- ${filepath}`.quiet();
     const lines = result.stdout.toString().trim().split("\n").filter(Boolean);
-    console.log(`[DEBUG] git log returned ${lines.length} commits`);
 
     if (lines.length === 0) {
-      console.log(`[DEBUG] No commits found, returning nulls`);
       return { accepted: null, lastUpdated: null, author: null };
     }
 
@@ -272,11 +257,9 @@ async function getGitHistory(filepath: string, repoPath: string | null): Promise
 
     const mostRecent = parseCommit(lines[0]!);
     const oldest = parseCommit(lines[lines.length - 1]!);
-    console.log(`[DEBUG] oldest commit hash: ${oldest.hash}`);
 
     // Fetch author info from the first commit
     const author = repoPath ? await getGitHubAuthor(repoPath, oldest.hash) : null;
-    console.log(`[DEBUG] author result: ${JSON.stringify(author)}`);
 
     // If only one commit, or same commit, don't show lastUpdated
     if (lines.length === 1 || mostRecent.hash === oldest.hash) {
@@ -354,7 +337,6 @@ async function build(liveReload: boolean = false): Promise<number> {
   const repoUrl = await getGitHubRepoUrl();
   // Extract repo path (e.g., "vortex-data/rfcs") for API calls
   const repoPath = repoUrl ? repoUrl.replace("https://github.com/", "") : null;
-  console.log(`[DEBUG] repoUrl=${repoUrl}, repoPath=${repoPath}`);
 
   const glob = new Bun.Glob("*.md");
   const rfcs: RFC[] = [];
