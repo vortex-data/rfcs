@@ -372,7 +372,7 @@ async function build(liveReload: boolean = false): Promise<number> {
 
     const path = `./proposals/${filename}`;
     const content = await Bun.file(path).text();
-    const html = Bun.markdown.html(content);
+    const html = Bun.markdown.html(content, { autolinks: true });
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
     const git = await getGitHistory(path, repoPath);

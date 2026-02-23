@@ -226,6 +226,7 @@ pre {
   overflow-x: auto;
   margin-bottom: 1rem;
   font-size: 0.875rem;
+  line-height: 1;
 }
 
 pre code {
