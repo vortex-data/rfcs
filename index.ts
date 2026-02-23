@@ -78,6 +78,7 @@ function baseHTML(title: string, content: string, cssPath: string = "styles.css"
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHTML(title)}</title>
+  <link rel="icon" type="image/svg+xml" href="${basePath}vortex_logo.svg">
   <link rel="stylesheet" href="${cssPath}">
   <script>${THEME_SCRIPT}</script>
 </head>
