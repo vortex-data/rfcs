@@ -17,3 +17,41 @@ There's no set template but it should at the very least include the following de
 For changes that affect serialization, please take special care at explaining how compatibility is maintained and tested.
 
 Once an agreement is achieved and concerns are addressed, the proposal will be merged into the repo.
+
+## Building the Site
+
+The RFCs are published as a static website. You'll need [Bun](https://bun.sh) installed.
+
+### Install dependencies
+
+```sh
+bun install
+```
+
+### Development
+
+Run the dev server with live reload:
+
+```sh
+bun run dev
+```
+
+Open http://localhost:3000 to view the site. Changes to files in `proposals/` or `styles.css` will automatically rebuild and refresh the browser.
+
+### Production build
+
+Generate the static site:
+
+```sh
+bun run build
+```
+
+The output is written to `dist/`. This folder can be deployed to any static hosting service (Cloudflare Pages, GitHub Pages, S3, Netlify, etc.).
+
+### Clean
+
+Remove the build output:
+
+```sh
+bun run clean
+```

@@ -1,7 +1,38 @@
----
-author: Adam Gutglick <adam@spiraldb.com>
-description: This is a template for future proposals, using frontmatter for metadata.
-date: 2025-02-23
----
+# RFC 0000 - Template Mode
 
-# Example Title
+## Goals
+
+1. Create RFCs
+1. ??
+1. Profit
+
+## Diagrams
+
+Here is an ASCII diagram:
+
+```
+     ╔ ═ ═ ═ ═ ═ ═ ═ ═ ═ ═                     
+                          ║                    
+     ║   BitPackedArray                        
+                          ║                    
+     ╚│═ ═ ═ ═ ═ ═ ═ ╤ ═ ═                     
+      │              │                         
+      │              │                         
+      │              │                         
+      │              │                         
+      │              │                         
+      │              │                         
+      │              │  patch                  
+      │              │  indices    ╔ ═ ═ ═ ═ ═ 
+┌─────▼─────┐        ├─────────────▶ ArrayRef ║
+│░░░░░░░░░░░│        │             ╚ ═ ═ ═ ═ ═ 
+│░░Buffer░░░│        │                         
+│░░░░░░░░░░░│        │  patch                  
+└───────────┘        │  values     ╔ ═ ═ ═ ═ ═ 
+   encoded           └─────────────▶ ArrayRef ║
+                                   ╚ ═ ═ ═ ═ ═ 
+```
+
+We can have links, like https://github.com/vortex-data
+
+BUT, we can also have [**LINKS**](https://vortex.dev) or [__links__](https://docs.vortex.dev)
