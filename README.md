@@ -2,6 +2,21 @@
 
 This repo is used to store and discuss design decisions, features and significant changes in Vortex, either in specific APIs, 3rd-party integrations or the conceptual model.
 
+## What needs an RFC?
+
+Vortex is a rapidly changing open source project that provides a file format, a compute toolkit, and a set of Rust libraries implementing a range of state-of-the-art compression codecs.
+
+Most development decisions in Vortex happen through the Discussions functionality. Simply open a new discussion describing the kind of change you'd like to make to the project, and if the maintainers like it, open a PR.
+
+This is a great process for bug fixes, simple features and purely additive changes.
+
+However, if you are making a significant change to the way Vortex functions, you may need to write an RFC first. Some example changes that would require an RFC:
+
+* Making a risky change to the format, such as adding new required fields to file metadata
+* Rearchitecting core components of Vortex, or wide-ranging refactors that might break language bindings
+* Creating new libraries or SDKs that we expect others to adopt
+* Making changes to subsystems that are likely to affect performance if not done thoughfully, such as the core IO traits
+
 ## Process
 
 The general process is that changes should be opened as PRs, with the discussion happening in comments on top of it.
