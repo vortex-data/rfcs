@@ -57,11 +57,14 @@ While there has been talk for a long time of converting the Vortex scalar system
 
 Just like when extracting child arrays, Variant's need to support an additional expression, `get_variant_scalar(idx, path, dtype)` that will indicate the desired dtype.
 
-### Constructing and writing scalars
+### Path to usefulness
 
-The API for creating variant arrays is complex, as shredding decisions need to be made either before hand based on data-specific knowledge, or on the fly during writes.
+A key component of making variants useable will be making sure the experience of writing and using them , without forcing them to go through complex builders or serialization (unless they require it).
 
-In the medium/long term, I believe the compressor should support a JSON extension type, which will take JSON formatted UTF8 column, and parse it gradually into a binary formatted and typed variant encoding.
+I can see multiple things we can do:
+
+1. The compressor should support compressing arrays with the JSON extension type into variant columns, initially with a pre-configured policy and potentially with more complex heuristics, as seen in the [JSON Tiles paper](https://db.in.tum.de/~durner/papers/json-tiles-sigmod21.pdf).
+2. Add expression to convert UTF-8 arrays formatted as JSON into variants, and vice versa. This can also include some other parsing and utilities to handle JSON.
 
 ## Prior Art
 
