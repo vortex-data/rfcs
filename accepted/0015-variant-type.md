@@ -122,3 +122,7 @@ As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type
 ## Future Possibilities
 
 In the future, we could add a Vortex-native encoding, but at this point in time it seems like 3rd-party integration is a more useful target.
+
+As mentioned above, I believe starting with a simple shredding policy in the compressor is the best way forward, but exploring things like JSON Tiles could prove to be useful.
+
+Integration with query engines will be an ongoing effort, depending on what features they support and how expressive they are.
