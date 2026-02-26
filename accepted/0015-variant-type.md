@@ -1,6 +1,8 @@
 - Start Date: 2025-02-25
-- RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/15)
+- RFC PR: [vortex-data/rfcs#15](https://github.com/vortex-data/rfcs/pull/15)
 - Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
+
+# Variant Type
 
 ## Summary
 
@@ -18,7 +20,7 @@ The variant can be commonly described as the following rust type:
 enum Variant {
 	Value(Scalar),
 	List(Vec<Variant>),
-	Object(BTreeMap<String, Variant>), // Usually sorted to allow efficent key finding
+	Object(BTreeMap<String, Variant>), // Usually sorted to allow efficient key finding
 }
 ```
 
@@ -26,11 +28,40 @@ Different systems have different variations of this idea, but at its core its a 
 
 I propose a new dtype - `DType::Variant`. The variant type is always nullable, and its canonical encoding is just an array with a single child array, which is encoded in some specialized variant type.
 
-In addition to a new canonical encoding, we'll need a few more pieces to make variant columns useful:
+### Nullability
 
-1. A set of new expressions, which extract children of variant arrays with a combination of path (similarly to `GetExpr`) and a dtype.
-2. Extending the compressor to support writing variant columns, and making choices like "which columns should be shredded" either automatically based on a set of heuristics, or by user-provided configuration.
-3. As different systems support different variations of this idea, we'll probably end up with multiple potential encodings. The most obvious one to start with is the `parquet-variant` arrow encoding, which is now a canonical Arrow extension type.
+In order to support data with a changing or unexpected schema, Variant arrays are always nullable, even for a specific key/path, its value might change type between items which will cause null values in shredded children.
+
+Combined with shredding, handling nulls can be complex and is encoding dependent (Like this [parquet example](https://github.com/apache/parquet-format/blob/master/VariantShredding.md#arrays) for handling arrays).
+
+### Expressions
+
+Variant columns are commonly accessed through a combination of column, path and the desired type, which are all required to extract a column with a known type. Our current `GetItem` has two issues:
+
+1. It assumes the input can be executed into a struct array.
+2. Access is only based on name.
+
+I suggest we add a new expression - `get_variant_element(path, dtype)` (name TBD) which will support flexible paths and allow extracting children from variants.
+
+Every variant encoding will need to be able to dispatch these behaviors, returning arrays of the expected type.
+
+### Arrow representation
+
+Arrow now has a new [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to represent Parquet's variant type. I think supporting this encoding will be a good start, but it requires supporting Arrow extension types.
+
+Supporting extension types requires replacing the target `DataType` and nullability with a `Field`, which also includes metadata like a desired extension type. I belive this change is desired, as Vortex DTypes include more information than a plain `arrow::DataType`.
+
+### Scalar
+
+While there has been talk for a long time of converting the Vortex scalar system from an enum to length 1 arrays, I do believe the current system actually works very well for variants, and the Variant scalar can just be some version of the type described above.
+
+Just like when extracting child arrays, Variant's need to support an additional expression, `get_variant_scalar(idx, path, dtype)` that will indicate the desired dtype.
+
+### Constructing and writing scalars
+
+The API for creating variant arrays is complex, as shredding decisions need to be made either before hand based on data-specific knowledge, or on the fly during writes.
+
+In the medium/long term, I believe the compressor should support a JSON extension type, which will take JSON formatted UTF8 column, and parse it gradually into a binary formatted and typed variant encoding.
 
 ## Prior Art
 
@@ -54,15 +85,16 @@ Statistics are only stored for the shredded columns, at the file/row group or pa
 
 #### In-Memory
 
-When loaded into memory, Arrow has defined a [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to support Parquet's variant type. Its stored as a struct array, which contains a mandatory `metadata` binary child, an optional binary `value`  child, and an optional `typed_value` which can be a "variant primitive", list or struct, allowing for nested shredding.
+When loaded into memory, Arrow has defined a [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to support Parquet's variant type. Its stored as a struct array, which contains a mandatory `metadata` binary child, an optional binary `value` child, and an optional `typed_value` which can be a "variant primitive", list or struct, allowing for nested shredding.
 
 ### Clickhouse
 
 As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type-for-clickhouse#building-block-2---dynamic-type) fantastic blogpost, Clickhouse offers multiple features that build on top of each other to support similar data:
-1. [Variant](https://clickhouse.com/docs/sql-reference/data-types/variant) - Allows for arbitrary nesting of types. Variant can contains ints, strings and arrays of ints, strings or another variant type (note the lack of the "object" variant). Each leaf (`col_x.str` vs `col_x.int32`) column is stored separately with some additional metadata which points to which one is used by each row.  Types have to be declared in advance.
+
+1. [Variant](https://clickhouse.com/docs/sql-reference/data-types/variant) - Allows for arbitrary nesting of types. Variant can contains ints, strings and arrays of ints, strings or another variant type (note the lack of the "object" variant). Each leaf (`col_x.str` vs `col_x.int32`) column is stored separately with some additional metadata which points to which one is used by each row. Types have to be declared in advance.
 2. [Dynamic](https://clickhouse.com/docs/sql-reference/data-types/dynamic) - Like variant, but types don't have to be declared in advance. Shreds a limited number of columns
 3. [JSON](https://clickhouse.com/docs/sql-reference/data-types/newjson) - Builds on top of `Dynamic`, with a few specialized features - allowing users to specify known "typed paths", how many dynamic paths and types to support for untyped paths, and some JSON-specific configuration allowing skipping specific JSON paths on insert.
-The full blogpost is worth reading, but Clickhouse's on-disk model roughly mirrors the arrow in-memory format, and they store some metadata outside of the array.
+   The full blogpost is worth reading, but Clickhouse's on-disk model roughly mirrors the arrow in-memory format, and they store some metadata outside of the array.
 
 ### Others
 
