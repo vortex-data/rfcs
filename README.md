@@ -12,10 +12,10 @@ This is a great process for bug fixes, simple features and purely additive chang
 
 However, if you are making a significant change to the way Vortex functions, you may need to write an RFC first. Some example changes that would require an RFC:
 
-* Making a risky change to the format, such as adding new required fields to file metadata
-* Rearchitecting core components of Vortex, or wide-ranging refactors that might break language bindings
-* Creating new libraries or SDKs that we expect others to adopt
-* Making changes to subsystems that are likely to affect performance if not done thoughfully, such as the core IO traits
+- Making a risky change to the format, such as adding new required fields to file metadata
+- Rearchitecting core components of Vortex, or wide-ranging refactors that might break language bindings
+- Creating new libraries or SDKs that we expect others to adopt
+- Making changes to subsystems that are likely to affect performance if not done thoughfully, such as the core IO traits
 
 ## Process
 
@@ -69,4 +69,15 @@ Remove the build output:
 
 ```sh
 bun run clean
+```
+
+### Formatting
+
+We use [`prettiest`](https://prettier.io/) to format the code and documents, and check it in CI.
+
+Running it is as easy as:
+
+```sh
+bunx prettier --write .
+bunx prettier --check .
 ```
