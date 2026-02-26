@@ -6,7 +6,7 @@
 
 ## Summary
 
-Vortex currently requires a strict schema, but real world data is often only semi-structured. Logs, traces and user-generated data often try to capture generally sparse data, which requires some processing to make it useful for most analytical systems.
+Vortex currently requires a strict schema, but real world data is often only semi-structured and deeply hierarchical. Logs, traces and user-generated data often take the form of many sparse fields.
 
 This proposal introduces a new type - `Variant`, which can capture data with row-level schema, while storing it in a columnar form that can compress well while being available for efficient analysis in a columnar format.
 
@@ -24,7 +24,7 @@ enum Variant {
 }
 ```
 
-Different systems have different variations of this idea, but at its core its a type that can hold nested data with either a flexible or no schema. In addition to this "catch all" column, most system include the concept of "shredding", extracting a key with a specific type out of this column, and storing it in a dense way. This design can make commonly access subfields perform like first-class columns, while keeping the overall schema flexible.
+Different systems have different variations of this idea, but at its core its a type that can hold nested data with either a flexible or no schema. In addition to this "catch all" column, most system include the concept of "shredding", extracting a key with a specific type out of this column, and storing it in a dense way. This design can make commonly accessed subfields perform like first-class columns, while keeping the overall schema flexible.
 
 I propose a new dtype - `DType::Variant`. The variant type is always nullable, and its canonical encoding is just an array with a single child array, which is encoded in some specialized variant type.
 
@@ -41,15 +41,19 @@ Variant columns are commonly accessed through a combination of column, path and 
 1. It assumes the input can be executed into a struct array.
 2. Access is only based on name.
 
-I suggest we add a new expression - `get_variant_element(path, dtype)` (name TBD) which will support flexible paths and allow extracting children from variants.
+I suggest we add a new expression - `get_variant_element(path, dtype)` (name TBD) which will support flexible paths and allow extracting children from variants. I use the `path` argument in this document loosely, but a subset of JSONPath might be appropriate here, see the [prior art](#prior-art) section to see how other systems handle it.
 
 Every variant encoding will need to be able to dispatch these behaviors, returning arrays of the expected type.
+
+### Stats and pushdown
+
+Statistics will only be collected for shredded children of the variant array. As all variant expressions are typed, this will allow us to not only use the same type of pushdown we have currently have, but for row ranges where specific key might exist but with an unexpected type, we could skip it completely.
 
 ### Arrow representation
 
 Arrow now has a new [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to represent Parquet's variant type. I think supporting this encoding will be a good start, but it requires supporting Arrow extension types.
 
-Supporting extension types requires replacing the target `DataType` and nullability with a `Field`, which also includes metadata like a desired extension type. I belive this change is desired, as Vortex DTypes include more information than a plain `arrow::DataType`.
+Supporting extension types requires replacing the target `DataType` and nullability with a `Field`, which also includes metadata like a desired extension type. I believe this change is desired, as Vortex DTypes include more information than a plain `arrow::DataType`.
 
 ### Scalar
 
@@ -59,14 +63,18 @@ Just like when extracting child arrays, Variant's need to support an additional 
 
 ### Path to usefulness
 
-A key component of making variants useable will be making sure the experience of writing and using them , without forcing them to go through complex builders or serialization (unless they require it).
+A key component of making variants useable will be making sure the experience of writing and using them, without forcing them to go through complex builders or serialization (unless they require it).
 
 I can see multiple things we can do:
 
-1. The compressor should support compressing arrays with the JSON extension type into variant columns, initially with a pre-configured policy and potentially with more complex heuristics, as seen in the [JSON Tiles paper](https://db.in.tum.de/~durner/papers/json-tiles-sigmod21.pdf).
+1. The compressor should support compressing arrays with the JSON extension type into variant columns, initially with a pre-configured policy and with more complex heuristics in the future, as seen in the [JSON Tiles paper](https://db.in.tum.de/~durner/papers/json-tiles-sigmod21.pdf).
 2. Add expression to convert UTF-8 arrays formatted as JSON into variants, and vice versa. This can also include some other parsing and utilities to handle JSON.
 
+Its important to note that while I suggest the canonical encoding will be basically opaque with regards to the specific encoding of the child array, we could still compress the children using our hierarchical compressor.
+
 ## Prior Art
+
+Many systems have a `Variant` type or similar concept, and they generally differ from each other both in implementation and meaning, I've tried to summarize some of the common ones, but I suggested reading the linked sources, especially [Clickhouse's](#clickhouse) blogpost about their variant, dynamic and JSON types.
 
 ### Parquet/Arrow
 
@@ -94,7 +102,7 @@ When loaded into memory, Arrow has defined a [canonical extension type](https://
 
 As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type-for-clickhouse#building-block-2---dynamic-type) fantastic blogpost, Clickhouse offers multiple features that build on top of each other to support similar data:
 
-1. [Variant](https://clickhouse.com/docs/sql-reference/data-types/variant) - Allows for arbitrary nesting of types. Variant can contains ints, strings and arrays of ints, strings or another variant type (note the lack of the "object" variant). Each leaf (`col_x.str` vs `col_x.int32`) column is stored separately with some additional metadata which points to which one is used by each row. Types have to be declared in advance.
+1. [Variant](https://clickhouse.com/docs/sql-reference/data-types/variant) - Allows for arbitrary nesting of types. Variant can contain integers, strings and arrays of integers, strings or another variant type (note the lack of the "object" variant). Each leaf (`col_x.str` vs `col_x.int32`) column is stored separately with some additional metadata which points to which one is used by each row. Types have to be declared in advance.
 2. [Dynamic](https://clickhouse.com/docs/sql-reference/data-types/dynamic) - Like variant, but types don't have to be declared in advance. Shreds a limited number of columns
 3. [JSON](https://clickhouse.com/docs/sql-reference/data-types/newjson) - Builds on top of `Dynamic`, with a few specialized features - allowing users to specify known "typed paths", how many dynamic paths and types to support for untyped paths, and some JSON-specific configuration allowing skipping specific JSON paths on insert.
    The full blogpost is worth reading, but Clickhouse's on-disk model roughly mirrors the arrow in-memory format, and they store some metadata outside of the array.
@@ -103,7 +111,7 @@ As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type
 
 - Iceberg seems to support the variant type (as described in [this](https://docs.google.com/document/d/1sq70XDiWJ2DemWyA5dVB80gKzwi0CWoM0LOWM7VJVd8/edit?tab=t.0) proposal), but the docs are minimal.
 - Datafusion's variant support is being developed [here](https://github.com/datafusion-contrib/datafusion-variant), its unclear to me how much effort is going into it and whether its going to be merged upstream.
-- DuckDB doesn't support a variant type. It does have a [Union](https://docs.google.com/document/d/1sq70XDiWJ2DemWyA5dVB80gKzwi0CWoM0LOWM7VJVd8/edit?tab=t.0) type, but its basically a struct. It also seems to have support for Parquet's shredding, but I can't find any docs and seems like PRs are being merged as I'm looking through their issues.
+- DuckDB doesn't support a variant type. It does have a [Union](https://duckdb.org/docs/stable/sql/data_types/union) type, but its basically a struct. It also seems to have support for Parquet's shredding, but I can't find any docs and seems like PRs are being merged as I'm looking through their issues.
 - Databricks supports some specialized [variant functions](https://docs.databricks.com/gcp/en/sql/language-manual/sql-ref-functions-builtin#variant-functions).
 
 ## Unresolved Questions
@@ -113,4 +121,4 @@ As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type
 
 ## Future Possibilities
 
-What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
+In the future, we could add a Vortex-native encoding, but at this point in time it seems like 3rd-party integration is a more useful target.
