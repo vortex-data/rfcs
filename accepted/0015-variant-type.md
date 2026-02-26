@@ -8,13 +8,13 @@
 
 Vortex currently requires a strict schema, but real world data is often only semi-structured and deeply hierarchical. Logs, traces and user-generated data often take the form of many sparse fields.
 
-This proposal introduces a new type - `Variant`, which can capture data with row-level schema, while storing it in a columnar form that can compress well while being available for efficient analysis in a columnar format.
+This proposal introduces a new dtype - `Variant`, which can capture data with row-level schema, while storing it in a columnar form that can compress well while being available for efficient analysis in a columnar format.
 
 ## Design
 
-We'll start with a rough description of the variant type, as many different systems define in different ways (see the [Prior Art] section at the bottom of the page).
+We'll start with a rough description of the variant type, as many different systems define in different ways (see the [Prior Art](#prior-art) section at the bottom of the page).
 
-The variant can be commonly described as the following rust type:
+The variant type can be commonly described as the following rust type:
 
 ```rust
 enum Variant {
@@ -24,9 +24,15 @@ enum Variant {
 }
 ```
 
-Different systems have different variations of this idea, but at its core its a type that can hold nested data with either a flexible or no schema. In addition to this "catch all" column, most system include the concept of "shredding", extracting a key with a specific type out of this column, and storing it in a dense way. This design can make commonly accessed subfields perform like first-class columns, while keeping the overall schema flexible.
+Different systems have different variations of this idea, but at its core its a type that can hold nested data with either a flexible or no schema.
 
-I propose a new dtype - `DType::Variant`. The variant type is always nullable, and its canonical encoding is just an array with a single child array, which is encoded in some specialized variant type.
+Variant types are usually stored in two ways - values that aren't accessed often in some system-specific binary encoding, and some number of "shredded" columns, where a specific key is extracted from the variant and stored in a dense format with a specific type, allowing for much more performant access. This design can make commonly accessed subfields perform like first-class columns, while keeping the overall schema flexible. Shredding policies differ by system, and can be pre-determined or inferred from the data itself or from usage patterns.
+
+### Arrow representation
+
+Arrow now has a new [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to represent Parquet's variant type. I think supporting this encoding will be a good start, but it requires supporting Arrow extension types.
+
+Supporting extension types requires replacing the target `DataType` and nullability with a `Field`, which also includes metadata like a desired extension type. I believe this change is desired, as Vortex DTypes include more information than a plain `arrow::DataType`.
 
 ### Nullability
 
@@ -45,25 +51,19 @@ I suggest we add a new expression - `get_variant_element(path, dtype)` (name TBD
 
 Every variant encoding will need to be able to dispatch these behaviors, returning arrays of the expected type.
 
-### Stats and pushdown
-
-Statistics will only be collected for shredded children of the variant array. As all variant expressions are typed, this will allow us to not only use the same type of pushdown we have currently have, but for row ranges where specific key might exist but with an unexpected type, we could skip it completely.
-
-### Arrow representation
-
-Arrow now has a new [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to represent Parquet's variant type. I think supporting this encoding will be a good start, but it requires supporting Arrow extension types.
-
-Supporting extension types requires replacing the target `DataType` and nullability with a `Field`, which also includes metadata like a desired extension type. I believe this change is desired, as Vortex DTypes include more information than a plain `arrow::DataType`.
-
 ### Scalar
 
 While there has been talk for a long time of converting the Vortex scalar system from an enum to length 1 arrays, I do believe the current system actually works very well for variants, and the Variant scalar can just be some version of the type described above.
 
 Just like when extracting child arrays, Variant's need to support an additional expression, `get_variant_scalar(idx, path, dtype)` that will indicate the desired dtype.
 
+### Stats and pushdown
+
+Statistics will only be collected for shredded children of the variant array. As all variant expressions are typed, this will allow us to not only use the same type of pushdown we currently support, but for row ranges where specific key might exist but with an unexpected type, we could skip it completely.
+
 ### Path to usefulness
 
-A key component of making variants useable will be making sure the experience of writing and using them, without forcing them to go through complex builders or serialization (unless they require it).
+A key component of making variants useable will be making sure the experience of writing and using them is as straightforward as possible, without forcing them to go through complex builders or serialization (unless they require it).
 
 I can see multiple things we can do:
 
