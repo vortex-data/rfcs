@@ -74,9 +74,17 @@ const LIVE_RELOAD_SCRIPT = `
 })();
 `;
 
-function baseHTML(title: string, content: string, cssPath: string = "styles.css", liveReload: boolean = false, repoUrl: string | null = null): string {
+function baseHTML(
+  title: string,
+  content: string,
+  cssPath: string = "styles.css",
+  liveReload: boolean = false,
+  repoUrl: string | null = null,
+): string {
   const basePath = cssPath === "styles.css" ? "./" : "../";
-  const githubLink = repoUrl ? `<a href="${repoUrl}" class="github-link" aria-label="View on GitHub" target="_blank" rel="noopener">${ICON_GITHUB}</a>` : "";
+  const githubLink = repoUrl
+    ? `<a href="${repoUrl}" class="github-link" aria-label="View on GitHub" target="_blank" rel="noopener">${ICON_GITHUB}</a>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -119,24 +127,31 @@ function escapeHTML(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function indexPage(rfcs: RFC[], repoUrl: string | null, liveReload: boolean = false): string {
+function indexPage(
+  rfcs: RFC[],
+  repoUrl: string | null,
+  liveReload: boolean = false,
+): string {
   // Sort in reverse numeric order (newest first)
   const sorted = [...rfcs].sort((a, b) => b.number.localeCompare(a.number));
 
-  const list = sorted.map(rfc => {
-    const dateStr = rfc.git.accepted ? formatDate(rfc.git.accepted.date) : "";
+  const list = sorted
+    .map((rfc) => {
+      const dateStr = rfc.git.accepted ? formatDate(rfc.git.accepted.date) : "";
 
-    let authorHTML = "";
-    if (rfc.git.author && rfc.git.accepted) {
-      const commitUrl = repoUrl ? `${repoUrl}/commit/${rfc.git.accepted.hash}` : `https://github.com/${rfc.git.author.login}`;
-      authorHTML = `
+      let authorHTML = "";
+      if (rfc.git.author && rfc.git.accepted) {
+        const commitUrl = repoUrl
+          ? `${repoUrl}/commit/${rfc.git.accepted.hash}`
+          : `https://github.com/${rfc.git.author.login}`;
+        authorHTML = `
           <a href="${commitUrl}" class="rfc-author-link" title="${rfc.git.author.login}">
             <img src="${rfc.git.author.avatarUrl}" alt="${rfc.git.author.login}" class="rfc-author-avatar">
             <span class="rfc-author-name">${rfc.git.author.login}</span>
           </a>`;
-    }
+      }
 
-    return `
+      return `
       <li>
         <a href="rfc/${rfc.number}.html" class="rfc-item">
           <span class="rfc-number">RFC ${rfc.number}</span>
@@ -144,7 +159,8 @@ function indexPage(rfcs: RFC[], repoUrl: string | null, liveReload: boolean = fa
           <span class="rfc-date">${dateStr}</span>
         </a>${authorHTML}
       </li>`;
-  }).join("\n");
+    })
+    .join("\n");
 
   const content = `
       <h1>Request for Comments</h1>
@@ -164,7 +180,11 @@ function formatDate(date: Date): string {
   });
 }
 
-function rfcPage(rfc: RFC, repoUrl: string | null, liveReload: boolean = false): string {
+function rfcPage(
+  rfc: RFC,
+  repoUrl: string | null,
+  liveReload: boolean = false,
+): string {
   let gitHeader = "";
 
   if (rfc.git.accepted || rfc.git.author) {
@@ -218,7 +238,13 @@ function rfcPage(rfc: RFC, repoUrl: string | null, liveReload: boolean = false):
         ${rfc.html}
       </article>`;
 
-  return baseHTML(`RFC ${rfc.number} - ${rfc.title}`, content, "../styles.css", liveReload, repoUrl);
+  return baseHTML(
+    `RFC ${rfc.number} - ${rfc.title}`,
+    content,
+    "../styles.css",
+    liveReload,
+    repoUrl,
+  );
 }
 
 function parseRFCNumber(filename: string): string {
@@ -245,10 +271,14 @@ async function getGitHubRepoUrl(): Promise<string | null> {
   }
 }
 
-async function getGitHubAuthor(repoPath: string, commitHash: string): Promise<GitHubAuthor | null> {
+async function getGitHubAuthor(
+  repoPath: string,
+  commitHash: string,
+): Promise<GitHubAuthor | null> {
   try {
     // Use gh CLI to fetch commit info from GitHub API
-    const result = await $`gh api repos/${repoPath}/commits/${commitHash} --jq '.author.login, .author.avatar_url, .author.html_url'`.quiet();
+    const result =
+      await $`gh api repos/${repoPath}/commits/${commitHash} --jq '.author.login, .author.avatar_url, .author.html_url'`.quiet();
     const lines = result.stdout.toString().trim().split("\n");
 
     if (lines.length >= 3 && lines[0] && lines[1] && lines[2]) {
@@ -264,9 +294,13 @@ async function getGitHubAuthor(repoPath: string, commitHash: string): Promise<Gi
   }
 }
 
-async function getGitHistory(filepath: string, repoPath: string | null): Promise<RFCGitInfo> {
+async function getGitHistory(
+  filepath: string,
+  repoPath: string | null,
+): Promise<RFCGitInfo> {
   try {
-    const result = await $`git log --follow --format=%H\ %aI -- ${filepath}`.quiet();
+    const result =
+      await $`git log --follow --format=%H\ %aI -- ${filepath}`.quiet();
     const lines = result.stdout.toString().trim().split("\n").filter(Boolean);
 
     if (lines.length === 0) {
@@ -284,7 +318,9 @@ async function getGitHistory(filepath: string, repoPath: string | null): Promise
     const oldest = parseCommit(lines[lines.length - 1]!);
 
     // Fetch author info from the first commit
-    const author = repoPath ? await getGitHubAuthor(repoPath, oldest.hash) : null;
+    const author = repoPath
+      ? await getGitHubAuthor(repoPath, oldest.hash)
+      : null;
 
     // If only one commit, or same commit, don't show lastUpdated
     if (lines.length === 1 || mostRecent.hash === oldest.hash) {
@@ -479,7 +515,7 @@ async function startDevServer() {
           headers: {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            Connection: "keep-alive",
           },
         });
       }
@@ -503,9 +539,11 @@ async function startDevServer() {
 if (isDev) {
   startDevServer().catch(console.error);
 } else {
-  build().then(count => {
-    if (count > 0) {
-      console.log("Output directory: ./dist/");
-    }
-  }).catch(console.error);
+  build()
+    .then((count) => {
+      if (count > 0) {
+        console.log("Output directory: ./dist/");
+      }
+    })
+    .catch(console.error);
 }
