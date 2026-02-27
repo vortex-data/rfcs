@@ -493,3 +493,78 @@ footer {
   color: var(--fg-muted);
   font-size: 0.875rem;
 }
+
+/* State filter bar */
+.filter-bar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.filter-btn {
+  font-family: inherit;
+  font-size: 0.875rem;
+  padding: 0.375rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.filter-btn:hover {
+  background: var(--bg-alt);
+  color: var(--fg);
+}
+
+.filter-btn.active {
+  background: var(--fg);
+  color: var(--bg);
+  border-color: var(--fg);
+}
+
+/* State pills */
+.rfc-state-pill {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  text-transform: capitalize;
+  flex-shrink: 0;
+}
+
+.state-proposed {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.state-accepted {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.state-completed {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+:root[data-theme="dark"] .state-proposed {
+  background: #78350f;
+  color: #fef3c7;
+}
+
+:root[data-theme="dark"] .state-accepted {
+  background: #1e3a8a;
+  color: #dbeafe;
+}
+
+:root[data-theme="dark"] .state-completed {
+  background: #064e3b;
+  color: #d1fae5;
+}

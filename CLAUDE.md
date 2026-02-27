@@ -7,9 +7,14 @@ Static site generator for Vortex RFC proposals built with Bun.
 ```
 index.ts      - Main build script and dev server
 styles.css    - Site styling (light/dark themes)
-proposals/    - RFC markdown files (format: NNNN-slug.md)
+proposed/     - RFC markdown files in proposed state
+accepted/     - RFC markdown files in accepted state
+completed/    - RFC markdown files in completed state
 dist/         - Build output (gitignored)
 ```
+
+RFC filenames follow the format `NNNN-slug.md` (e.g., `0001-galp-patches.md`).
+Numbering is global across all states - no duplicates allowed.
 
 ## Commands
 
@@ -21,18 +26,29 @@ bun run clean    # Remove dist/
 
 ## How the Build Works
 
-1. Scans `proposals/*.md` for RFC files
+1. Scans `proposed/`, `accepted/`, `completed/` for RFC files
 2. Parses RFC number from filename (e.g., `0002-foo.md` → RFC 0002)
-3. Extracts title from first `# ` heading
-4. Converts markdown to HTML using `Bun.markdown.html()`
-5. Generates `dist/index.html` (table of contents)
-6. Generates `dist/rfc/{number}.html` for each RFC
+3. Determines state from containing folder
+4. Extracts title from first `# ` heading
+5. Converts markdown to HTML using `Bun.markdown.html()`
+6. Generates `dist/index.html` (table of contents with filter UI)
+7. Generates `dist/rfc/{number}.html` for each RFC
 
 ## Dev Server
 
 - Uses `Bun.serve()` to serve static files from `dist/`
-- Watches `proposals/` and `styles.css` for changes
+- Watches `proposed/`, `accepted/`, `completed/`, and `styles.css` for changes
 - SSE endpoint at `/__reload` for live reload
+
+## RFC States
+
+RFCs progress through three states by moving files between folders:
+
+- **proposed**: New RFCs under discussion
+- **accepted**: Approved RFCs ready for implementation
+- **completed**: Fully implemented RFCs
+
+The index page shows a state pill for each RFC and supports filtering by state.
 
 ## Styling
 
