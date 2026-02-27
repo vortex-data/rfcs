@@ -115,15 +115,15 @@ the next one. The accumulator owns its output buffer and returns all results at 
 pub trait Accumulator: Send + Sync {
     /// Feed a batch of element values for the current group.
     /// Can be called multiple times per group (e.g., chunked elements).
-    fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()>;
+    fn accumulate(&mut self, batch: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()>;
 
     /// Finalize the current group: push its result into the output buffer
     /// and reset internal state for the next group.
-    fn flush(&mut self) -> VortexResult<()>;
+    fn flush(&mut self, ctx: &mut ExecutionCtx) -> VortexResult<()>;
 
     /// Return all flushed results as a single array.
     /// Length = number of flush() calls.
-    fn finish(self: Box<Self>) -> VortexResult<ArrayRef>;
+    fn finish(self: Box<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef>;
 }
 ```
 
@@ -134,10 +134,10 @@ This handles all aggregation cases uniformly:
 let mut acc = aggregate.accumulator(element_dtype)?;
 for i in 0..n_lists {
     let group_elements = elements.slice(offsets[i]..offsets[i+1])?;
-    acc.accumulate(&group_elements)?;
-    acc.flush()?;
+    acc.accumulate(&group_elements, ctx)?;
+    acc.flush(ctx)?;
 }
-acc.finish()  // → ArrayRef of length n_lists
+acc.finish(ctx)  // → ArrayRef of length n_lists
 ```
 
 **Case 2 — Large lists with chunked elements:**
@@ -148,11 +148,11 @@ let mut acc = aggregate.accumulator(element_dtype)?;
 for i in 0..n_lists {
     let group_elements = elements.slice(offsets[i]..offsets[i+1])?;
     for chunk in iter_chunks(&group_elements) {
-        acc.accumulate(&chunk)?;
+        acc.accumulate(&chunk, ctx)?;
     }
-    acc.flush()?;
+    acc.flush(ctx)?;
 }
-acc.finish()
+acc.finish(ctx)
 ```
 
 **Case 3 — Ungrouped full-column aggregation:**
@@ -160,10 +160,10 @@ One group, fold across chunks:
 ```rust
 let mut acc = aggregate.accumulator(dtype)?;
 for chunk in chunked_array.chunks() {
-    acc.accumulate(&chunk)?;
+    acc.accumulate(&chunk, ctx)?;
 }
-acc.flush()?;
-acc.finish()  // → 1-element array
+acc.flush(ctx)?;
+acc.finish(ctx)  // → 1-element array
 ```
 
 **Case 4 — ListView with scattered elements:**
@@ -228,16 +228,17 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
         options: &Self::Options,
         input: &ArrayRef,
         offsets: &ArrayRef,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let n_groups = offsets.len() - 1;
         let mut acc = self.accumulator(options, input.dtype())?;
         for i in 0..n_groups {
             let start = scalar_at(offsets, i)?;
             let end = scalar_at(offsets, i + 1)?;
-            acc.accumulate(&input.slice(start..end)?)?;
-            acc.flush()?;
+            acc.accumulate(&input.slice(start..end)?, ctx)?;
+            acc.flush(ctx)?;
         }
-        acc.finish()
+        acc.finish(ctx)
     }
 
     /// Ungrouped full-column aggregation returning a scalar.
@@ -248,10 +249,11 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
         &self,
         options: &Self::Options,
         input: &ArrayRef,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
         let n = input.len();
         let offsets: ArrayRef = buffer![0u64, n as u64].into_array();
-        let result = self.execute_grouped(options, input, &offsets)?;
+        let result = self.execute_grouped(options, input, &offsets, ctx)?;
         result.scalar_at(0)
     }
 }
@@ -278,13 +280,13 @@ struct MeanAccumulator {
 }
 
 impl Accumulator for MeanAccumulator {
-    fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()> {
-        self.running_sum += Sum.execute_scalar(&EmptyOptions, batch)?.as_f64()?;
-        self.running_count += Count.execute_scalar(&EmptyOptions, batch)?.as_u64()?;
+    fn accumulate(&mut self, batch: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+        self.running_sum += Sum.execute_scalar(&EmptyOptions, batch, ctx)?.as_f64()?;
+        self.running_count += Count.execute_scalar(&EmptyOptions, batch, ctx)?.as_u64()?;
         Ok(())
     }
 
-    fn flush(&mut self) -> VortexResult<()> {
+    fn flush(&mut self, _ctx: &mut ExecutionCtx) -> VortexResult<()> {
         let mean = if self.running_count > 0 {
             self.running_sum / self.running_count as f64
         } else {
@@ -296,7 +298,7 @@ impl Accumulator for MeanAccumulator {
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> VortexResult<ArrayRef> {
+    fn finish(self: Box<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         Ok(PrimitiveArray::from_vec(self.output).into_array())
     }
 }
@@ -373,6 +375,7 @@ impl ScalarFnVTable for ListAggregate {
         args: ExecutionArgs,
     ) -> VortexResult<ArrayRef> {
         let list_input = &args.inputs[0];
+        let ctx = args.ctx;
         // Execute the child into a ListArray, decompose, and aggregate.
         let list = list_input.to_list()?;
         let elements = list.elements();
@@ -388,13 +391,13 @@ impl ScalarFnVTable for ListAggregate {
                     offset_at(&offsets, i)..offset_at(&offsets, i+1)
                 )?;
                 for chunk in iter_chunks(&group_elements) {
-                    acc.accumulate(&chunk)?;
+                    acc.accumulate(&chunk, ctx)?;
                 }
-                acc.flush()?;
+                acc.flush(ctx)?;
             }
-            acc.finish()
+            acc.finish(ctx)
         } else {
-            options.aggregate_fn.execute_grouped(&elements, &offsets)
+            options.aggregate_fn.execute_grouped(&elements, &offsets, ctx)
         }
     }
 
@@ -452,6 +455,7 @@ fn execute_ordered_group_by(
     value_column: &ArrayRef,
     key_column: &ArrayRef,     // sorted
     aggregate: &AggregateFnRef,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     // Step 1: Compute group offsets from run boundaries in the key column.
     // E.g., key = [A, A, A, B, B, C] → offsets = [0, 3, 5, 6]
@@ -617,15 +621,16 @@ is canonical for `DType::List`.
 ```rust
 fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
     let list_input = &args.inputs[0];
+    let ctx = args.ctx;
     let listview = list_input.to_listview()?;
     if listview.is_zero_copy_to_list() {
         // Fast path: offsets are sorted, use directly
         let offsets = build_list_offsets_from_list_view(&listview);
-        options.aggregate_fn.execute_grouped(&listview.elements(), &offsets)
+        options.aggregate_fn.execute_grouped(&listview.elements(), &offsets, ctx)
     } else {
         // Slow path: rebuild to sorted form first
         let list = list_from_list_view(listview)?;
-        options.aggregate_fn.execute_grouped(&list.elements(), &list.offsets())
+        options.aggregate_fn.execute_grouped(&list.elements(), &list.offsets(), ctx)
     }
 }
 ```
@@ -691,8 +696,7 @@ This RFC does not change the file format or wire format. `ListAggregate` produce
 ## Drawbacks
 
 - **New trait surface area.** `AggregateFnVTable` and `Accumulator` are new traits to
-  learn, though they closely mirror `ScalarFnVTable` and the existing accumulator pattern
-  in `compute::sum`.
+  learn, though they closely mirror `ScalarFnVTable`.
 
 - **Reduce rule coverage.** Not all encoding × aggregate combinations will have optimized
   reduce_parent rules initially. The fallback (canonicalize list, then accumulator loop)
