@@ -1,5 +1,6 @@
 import { $, type Server } from "bun";
 import { watch } from "fs";
+import { createHighlighter, type Highlighter } from "shiki";
 
 const isDev = process.argv.includes("--dev");
 const PORT = 3000;
@@ -434,6 +435,64 @@ function parseTitle(markdown: string, filename: string): string {
   return filename.replace(/^\d+-/, "").replace(/\.md$/, "").replace(/-/g, " ");
 }
 
+// Syntax highlighting with Shiki
+let highlighter: Highlighter | null = null;
+
+async function getHighlighter(): Promise<Highlighter> {
+  if (!highlighter) {
+    highlighter = await createHighlighter({
+      themes: ["github-light", "github-dark"],
+      langs: ["rust", "python", "markdown"],
+    });
+  }
+  return highlighter;
+}
+
+async function highlightCodeBlocks(html: string): Promise<string> {
+  const hl = await getHighlighter();
+
+  // Match <pre><code class="language-X">...</code></pre> blocks
+  const codeBlockRegex =
+    /<pre><code class="language-(\w+)">([\s\S]*?)<\/code><\/pre>/g;
+
+  const matches = [...html.matchAll(codeBlockRegex)];
+  let result = html;
+
+  for (const match of matches) {
+    const [fullMatch, lang, code] = match;
+    if (!lang || !code) continue;
+
+    // Decode HTML entities back to raw code
+    const rawCode = code
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+
+    // Check if this language is supported
+    const loadedLangs = hl.getLoadedLanguages();
+    if (!loadedLangs.includes(lang)) {
+      // Skip unsupported languages, leave original markup
+      continue;
+    }
+
+    // Generate highlighted HTML with both themes using CSS variables
+    const highlighted = hl.codeToHtml(rawCode.trim(), {
+      lang,
+      themes: {
+        light: "github-light",
+        dark: "github-dark",
+      },
+      defaultColor: false,
+    });
+
+    result = result.replace(fullMatch, highlighted);
+  }
+
+  return result;
+}
+
 async function build(liveReload: boolean = false): Promise<number> {
   console.log("Building Vortex RFC site...\n");
 
@@ -465,7 +524,8 @@ async function build(liveReload: boolean = false): Promise<number> {
 
       const path = `${folder}/${filename}`;
       const content = await Bun.file(path).text();
-      const html = Bun.markdown.html(content, { autolinks: true });
+      const rawHtml = Bun.markdown.html(content, { autolinks: true });
+      const html = await highlightCodeBlocks(rawHtml);
       const number = parseRFCNumber(filename);
       const title = parseTitle(content, filename);
       const git = await getGitHistory(path, repoPath);

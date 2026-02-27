@@ -23,7 +23,14 @@ Describe the proposed design in enough detail that someone familiar with Vortex 
 - Why is this the best approach in the space of possible designs?
 - Which crates are affected and how the dependency graph changes, if at all.
 
-Use code examples and diagrams where they might help.
+Use code examples and diagrams where they might help, like this:
+
+```rust
+pub fn main() {
+    let x = f32::to_bits(100.0f32);
+    dbg!(x);
+}
+```
 
 ## Compatibility
 
@@ -64,3 +71,4 @@ This section helps frame the design in a broader context. If there is no relevan
 ## Future Possibilities
 
 What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
+

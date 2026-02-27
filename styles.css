@@ -568,3 +568,51 @@ footer {
   background: #064e3b;
   color: #d1fae5;
 }
+
+/* Shiki syntax highlighting - dual theme support */
+pre.shiki {
+  font-family:
+    "IBM Plex Mono", "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+pre.shiki code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* Light theme (default) */
+:root pre.shiki,
+:root pre.shiki span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+
+:root[data-theme="light"] pre.shiki,
+:root[data-theme="light"] pre.shiki span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+
+/* Dark theme */
+:root[data-theme="dark"] pre.shiki,
+:root[data-theme="dark"] pre.shiki span {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+}
+
+/* System preference dark mode */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) pre.shiki,
+  :root:not([data-theme="light"]) pre.shiki span {
+    color: var(--shiki-dark);
+    background-color: var(--shiki-dark-bg);
+  }
+}
