@@ -71,4 +71,3 @@ This section helps frame the design in a broader context. If there is no relevan
 ## Future Possibilities
 
 What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
-
