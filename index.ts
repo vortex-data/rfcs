@@ -29,10 +29,17 @@ interface RFC {
   git: RFCGitInfo;
 }
 
+const HLJS_VERSION = "11.11.1";
+const HLJS_CDN = `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/${HLJS_VERSION}`;
+
 const THEME_SCRIPT = `
 (function() {
   const saved = localStorage.getItem('theme') || 'light';
   document.documentElement.setAttribute('data-theme', saved);
+  var light = document.getElementById('hljs-light');
+  var dark = document.getElementById('hljs-dark');
+  if (light) light.disabled = saved === 'dark';
+  if (dark) dark.disabled = saved !== 'dark';
 })();
 `;
 
@@ -60,6 +67,10 @@ function updateToggleIcon() {
   const current = document.documentElement.getAttribute('data-theme');
   btn.innerHTML = current === 'dark' ? '${ICON_SUN}' : '${ICON_MOON}';
   btn.setAttribute('aria-label', current === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+  var light = document.getElementById('hljs-light');
+  var dark = document.getElementById('hljs-dark');
+  if (light) light.disabled = current === 'dark';
+  if (dark) dark.disabled = current !== 'dark';
 }
 
 document.addEventListener('DOMContentLoaded', updateToggleIcon);
@@ -93,6 +104,8 @@ function baseHTML(
   <title>${escapeHTML(title)}</title>
   <link rel="icon" type="image/svg+xml" href="${basePath}vortex_logo.svg">
   <link rel="stylesheet" href="${cssPath}">
+  <link rel="stylesheet" id="hljs-light" href="${HLJS_CDN}/styles/github.min.css">
+  <link rel="stylesheet" id="hljs-dark" href="${HLJS_CDN}/styles/github-dark.min.css">
   <script>${THEME_SCRIPT}</script>
 </head>
 <body>
@@ -114,7 +127,9 @@ ${content}
       Vortex RFC Archive
     </footer>
   </div>
-  <script>${TOGGLE_SCRIPT}</script>${liveReload ? `\n  <script>${LIVE_RELOAD_SCRIPT}</script>` : ""}
+  <script src="${HLJS_CDN}/highlight.min.js"></script>
+  <script>${TOGGLE_SCRIPT}</script>
+  <script>hljs.highlightAll();</script>${liveReload ? `\n  <script>${LIVE_RELOAD_SCRIPT}</script>` : ""}
 </body>
 </html>`;
 }
