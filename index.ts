@@ -1,5 +1,6 @@
 import { $, type Server } from "bun";
 import { watch } from "fs";
+import { createHighlighter, type Highlighter } from "shiki";
 
 const isDev = process.argv.includes("--dev");
 const PORT = 3000;
@@ -21,12 +22,17 @@ interface RFCGitInfo {
   author: GitHubAuthor | null;
 }
 
+type RFCState = "proposed" | "accepted" | "completed";
+
+const RFC_STATES: RFCState[] = ["proposed", "accepted", "completed"];
+
 interface RFC {
   number: string;
   title: string;
   filename: string;
   html: string;
   git: RFCGitInfo;
+  state: RFCState;
 }
 
 const THEME_SCRIPT = `
@@ -63,6 +69,33 @@ function updateToggleIcon() {
 }
 
 document.addEventListener('DOMContentLoaded', updateToggleIcon);
+`;
+
+const FILTER_SCRIPT = `
+function filterRFCs(state) {
+  const items = document.querySelectorAll('.rfc-list li');
+  const buttons = document.querySelectorAll('.filter-btn');
+
+  buttons.forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.state === state);
+  });
+
+  items.forEach(item => {
+    if (state === 'all' || item.dataset.state === state) {
+      item.style.display = '';
+    } else {
+      item.style.display = 'none';
+    }
+  });
+
+  // Save filter preference
+  localStorage.setItem('rfc-filter', state);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  const saved = localStorage.getItem('rfc-filter') || 'all';
+  filterRFCs(saved);
+});
 `;
 
 const LIVE_RELOAD_SCRIPT = `
@@ -127,6 +160,10 @@ function escapeHTML(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function stateLabel(state: RFCState): string {
+  return state.charAt(0).toUpperCase() + state.slice(1);
+}
+
 function indexPage(
   rfcs: RFC[],
   repoUrl: string | null,
@@ -152,9 +189,10 @@ function indexPage(
       }
 
       return `
-      <li>
+      <li data-state="${rfc.state}">
         <a href="rfc/${rfc.number}.html" class="rfc-item">
           <span class="rfc-number">RFC ${rfc.number}</span>
+          <span class="rfc-state-pill state-${rfc.state}">${stateLabel(rfc.state)}</span>
           <span class="rfc-title">${escapeHTML(rfc.title)}</span>
           <span class="rfc-date">${dateStr}</span>
         </a>${authorHTML}
@@ -162,12 +200,22 @@ function indexPage(
     })
     .join("\n");
 
+  const filterButtons = `
+      <div class="filter-bar">
+        <button class="filter-btn active" data-state="all" onclick="filterRFCs('all')">All</button>
+        <button class="filter-btn" data-state="proposed" onclick="filterRFCs('proposed')">Proposed</button>
+        <button class="filter-btn" data-state="accepted" onclick="filterRFCs('accepted')">Accepted</button>
+        <button class="filter-btn" data-state="completed" onclick="filterRFCs('completed')">Completed</button>
+      </div>`;
+
   const content = `
       <h1>Request for Comments</h1>
       <p>Technical proposals for the Vortex file format.</p>
+${filterButtons}
       <ul class="rfc-list">
 ${list}
-      </ul>`;
+      </ul>
+      <script>${FILTER_SCRIPT}</script>`;
 
   return baseHTML("Vortex RFCs", content, "styles.css", liveReload, repoUrl);
 }
@@ -185,12 +233,13 @@ function rfcPage(
   repoUrl: string | null,
   liveReload: boolean = false,
 ): string {
-  let gitHeader = "";
+  let gitHeader = `
+      <div class="rfc-meta-header">
+        <div class="rfc-meta-item">
+          <span class="rfc-state-pill state-${rfc.state}">${stateLabel(rfc.state)}</span>
+        </div>`;
 
   if (rfc.git.accepted || rfc.git.author) {
-    gitHeader = `
-      <div class="rfc-meta-header">`;
-
     // Author section
     if (rfc.git.author) {
       gitHeader += `
@@ -227,10 +276,10 @@ function rfcPage(
           <span class="rfc-meta-value">${formatDate(rfc.git.lastUpdated.date)}${commitLink}</span>
         </div>`;
     }
-
-    gitHeader += `
-      </div>`;
   }
+
+  gitHeader += `
+      </div>`;
 
   const content = `
       <a href="../" class="back-link">&larr; Back to index</a>${gitHeader}
@@ -341,28 +390,34 @@ interface ValidationError {
 async function validateProposals(): Promise<ValidationError[]> {
   const errors: ValidationError[] = [];
   const glob = new Bun.Glob("*");
-  const seenNumbers = new Map<string, string>();
+  const seenNumbers = new Map<string, string>(); // number -> "folder/filename"
 
-  for await (const filename of glob.scan("./proposals")) {
-    // Check filename format: NNNN-slug.md
-    if (!filename.match(/^\d{4}-[a-zA-Z0-9_-]+\.md$/)) {
-      errors.push({
-        filename,
-        message: `Invalid filename format. Expected: NNNN-name.md (e.g., 0007-my-proposal.md)`,
-      });
-      continue;
-    }
+  for (const state of RFC_STATES) {
+    const folder = `./${state}`;
 
-    // Check for duplicate RFC numbers
-    const number = filename.slice(0, 4);
-    const existing = seenNumbers.get(number);
-    if (existing) {
-      errors.push({
-        filename,
-        message: `Duplicate RFC number ${number} (also used by ${existing})`,
-      });
-    } else {
-      seenNumbers.set(number, filename);
+    for await (const filename of glob.scan(folder)) {
+      const fullPath = `${state}/${filename}`;
+
+      // Check filename format: NNNN-slug.md
+      if (!filename.match(/^\d{4}-[a-zA-Z0-9_-]+\.md$/)) {
+        errors.push({
+          filename: fullPath,
+          message: `Invalid filename format. Expected: NNNN-name.md (e.g., 0007-my-proposal.md)`,
+        });
+        continue;
+      }
+
+      // Check for duplicate RFC numbers across all folders
+      const number = filename.slice(0, 4);
+      const existing = seenNumbers.get(number);
+      if (existing) {
+        errors.push({
+          filename: fullPath,
+          message: `Duplicate RFC number ${number} (also used by ${existing})`,
+        });
+      } else {
+        seenNumbers.set(number, fullPath);
+      }
     }
   }
 
@@ -378,6 +433,64 @@ function parseTitle(markdown: string, filename: string): string {
   }
   // Fallback to filename
   return filename.replace(/^\d+-/, "").replace(/\.md$/, "").replace(/-/g, " ");
+}
+
+// Syntax highlighting with Shiki
+let highlighter: Highlighter | null = null;
+
+async function getHighlighter(): Promise<Highlighter> {
+  if (!highlighter) {
+    highlighter = await createHighlighter({
+      themes: ["github-light", "github-dark"],
+      langs: ["rust", "python", "markdown"],
+    });
+  }
+  return highlighter;
+}
+
+async function highlightCodeBlocks(html: string): Promise<string> {
+  const hl = await getHighlighter();
+
+  // Match <pre><code class="language-X">...</code></pre> blocks
+  const codeBlockRegex =
+    /<pre><code class="language-(\w+)">([\s\S]*?)<\/code><\/pre>/g;
+
+  const matches = [...html.matchAll(codeBlockRegex)];
+  let result = html;
+
+  for (const match of matches) {
+    const [fullMatch, lang, code] = match;
+    if (!lang || !code) continue;
+
+    // Decode HTML entities back to raw code
+    const rawCode = code
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+
+    // Check if this language is supported
+    const loadedLangs = hl.getLoadedLanguages();
+    if (!loadedLangs.includes(lang)) {
+      // Skip unsupported languages, leave original markup
+      continue;
+    }
+
+    // Generate highlighted HTML with both themes using CSS variables
+    const highlighted = hl.codeToHtml(rawCode.trim(), {
+      lang,
+      themes: {
+        light: "github-light",
+        dark: "github-dark",
+      },
+      defaultColor: false,
+    });
+
+    result = result.replace(fullMatch, highlighted);
+  }
+
+  return result;
 }
 
 async function build(liveReload: boolean = false): Promise<number> {
@@ -402,22 +515,29 @@ async function build(liveReload: boolean = false): Promise<number> {
   const glob = new Bun.Glob("*.md");
   const rfcs: RFC[] = [];
 
-  // Parse all RFC markdown files
-  for await (const filename of glob.scan("./proposals")) {
-    console.log(`Processing ${filename}...`);
+  // Parse all RFC markdown files from each state folder
+  for (const state of RFC_STATES) {
+    const folder = `./${state}`;
 
-    const path = `./proposals/${filename}`;
-    const content = await Bun.file(path).text();
-    const html = Bun.markdown.html(content, { autolinks: true });
-    const number = parseRFCNumber(filename);
-    const title = parseTitle(content, filename);
-    const git = await getGitHistory(path, repoPath);
+    for await (const filename of glob.scan(folder)) {
+      console.log(`Processing ${state}/${filename}...`);
 
-    rfcs.push({ number, title, filename, html, git });
+      const path = `${folder}/${filename}`;
+      const content = await Bun.file(path).text();
+      const rawHtml = Bun.markdown.html(content, { autolinks: true });
+      const html = await highlightCodeBlocks(rawHtml);
+      const number = parseRFCNumber(filename);
+      const title = parseTitle(content, filename);
+      const git = await getGitHistory(path, repoPath);
+
+      rfcs.push({ number, title, filename, html, git, state });
+    }
   }
 
   if (rfcs.length === 0) {
-    console.log("No RFC files found in ./proposals/");
+    console.log(
+      "No RFC files found in ./proposed/, ./accepted/, or ./completed/",
+    );
     return 0;
   }
 
@@ -468,7 +588,9 @@ async function startDevServer() {
   // Initial build with live reload enabled
   await build(true);
   console.log(`\nStarting dev server at http://localhost:${PORT}`);
-  console.log("Watching for changes in ./proposals/ and ./styles.css\n");
+  console.log(
+    "Watching for changes in ./proposed/, ./accepted/, ./completed/, and ./styles.css\n",
+  );
 
   // Debounce rebuilds
   let rebuildTimeout: Timer | null = null;
@@ -481,12 +603,14 @@ async function startDevServer() {
     }, 100);
   };
 
-  // Watch proposals directory
-  watch("./proposals", { recursive: true }, (_event, filename) => {
-    if (filename?.endsWith(".md")) {
-      scheduleRebuild();
-    }
-  });
+  // Watch all state directories
+  for (const state of RFC_STATES) {
+    watch(`./${state}`, { recursive: true }, (_event, filename) => {
+      if (filename?.endsWith(".md")) {
+        scheduleRebuild();
+      }
+    });
+  }
 
   // Watch styles.css
   watch("./styles.css", () => {

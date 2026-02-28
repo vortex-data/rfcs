@@ -1,5 +1,4 @@
 - Start Date: (today's date, YYYY-MM-DD)
-- RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
 - Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
 
 ## Summary
@@ -23,7 +22,14 @@ Describe the proposed design in enough detail that someone familiar with Vortex 
 - Why is this the best approach in the space of possible designs?
 - Which crates are affected and how the dependency graph changes, if at all.
 
-Use code examples and diagrams where they might help.
+Use code examples and diagrams where they might help, like this:
+
+```rust
+pub fn main() {
+    let x = f32::to_bits(100.0f32);
+    dbg!(x);
+}
+```
 
 ## Compatibility
 

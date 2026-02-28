@@ -493,3 +493,126 @@ footer {
   color: var(--fg-muted);
   font-size: 0.875rem;
 }
+
+/* State filter bar */
+.filter-bar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.filter-btn {
+  font-family: inherit;
+  font-size: 0.875rem;
+  padding: 0.375rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.filter-btn:hover {
+  background: var(--bg-alt);
+  color: var(--fg);
+}
+
+.filter-btn.active {
+  background: var(--fg);
+  color: var(--bg);
+  border-color: var(--fg);
+}
+
+/* State pills */
+.rfc-state-pill {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  text-transform: capitalize;
+  flex-shrink: 0;
+}
+
+.state-proposed {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.state-accepted {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.state-completed {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+:root[data-theme="dark"] .state-proposed {
+  background: #78350f;
+  color: #fef3c7;
+}
+
+:root[data-theme="dark"] .state-accepted {
+  background: #1e3a8a;
+  color: #dbeafe;
+}
+
+:root[data-theme="dark"] .state-completed {
+  background: #064e3b;
+  color: #d1fae5;
+}
+
+/* Shiki syntax highlighting - dual theme support */
+pre.shiki {
+  font-family:
+    "IBM Plex Mono", "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+pre.shiki code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* Light theme (default) */
+:root pre.shiki,
+:root pre.shiki span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+
+:root[data-theme="light"] pre.shiki,
+:root[data-theme="light"] pre.shiki span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+
+/* Dark theme */
+:root[data-theme="dark"] pre.shiki,
+:root[data-theme="dark"] pre.shiki span {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+}
+
+/* System preference dark mode */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) pre.shiki,
+  :root:not([data-theme="light"]) pre.shiki span {
+    color: var(--shiki-dark);
+    background-color: var(--shiki-dark-bg);
+  }
+}
