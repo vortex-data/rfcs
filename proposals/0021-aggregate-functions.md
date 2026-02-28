@@ -20,13 +20,13 @@ The key observation is that a list column stored as `(offsets, elements)` is a p
 grouping. Computing `list_sum(list_col)` is a grouped `sum` over the flat elements partitioned
 by offsets. Every aggregate function has a corresponding list scalar function for free:
 
-| Aggregate  | List scalar          | Operation                  |
-|------------|----------------------|----------------------------|
-| `sum`      | `list_sum(list_col)` | Sum elements per list      |
-| `min`      | `list_min(list_col)` | Min element per list       |
-| `max`      | `list_max(list_col)` | Max element per list       |
-| `count`    | `list_count(list_col)` | Count non-null per list  |
-| `mean`     | `list_mean(list_col)` | Mean of elements per list |
+| Aggregate | List scalar            | Operation                 |
+| --------- | ---------------------- | ------------------------- |
+| `sum`     | `list_sum(list_col)`   | Sum elements per list     |
+| `min`     | `list_min(list_col)`   | Min element per list      |
+| `max`     | `list_max(list_col)`   | Max element per list      |
+| `count`   | `list_count(list_col)` | Count non-null per list   |
+| `mean`    | `list_mean(list_col)`  | Mean of elements per list |
 
 Since Vortex does not support shuffling, grouped aggregates only apply to pre-existing groups.
 These are naturally represented by List or ListView encodings as a view over the elements array.
@@ -116,14 +116,14 @@ Each aggregate declares a `state_dtype` — the type of its intermediate accumul
 State is a single `Scalar` whose dtype matches this declaration. For aggregates with multiple
 fields, use a struct dtype:
 
-| Aggregate    | `state_dtype`                          | Example state value        |
-|--------------|----------------------------------------|----------------------------|
-| `Sum`        | `i64` (or widened input type)          | `Scalar(42)`               |
-| `Count`      | `u64`                                  | `Scalar(7)`                |
-| `Min`        | input element type                     | `Scalar(3)`                |
-| `Mean`       | `Struct { sum: f64, count: u64 }`      | `Scalar({sum: 10.0, count: 5})` |
+| Aggregate    | `state_dtype`                            | Example state value                     |
+| ------------ | ---------------------------------------- | --------------------------------------- |
+| `Sum`        | `i64` (or widened input type)            | `Scalar(42)`                            |
+| `Count`      | `u64`                                    | `Scalar(7)`                             |
+| `Min`        | input element type                       | `Scalar(3)`                             |
+| `Mean`       | `Struct { sum: f64, count: u64 }`        | `Scalar({sum: 10.0, count: 5})`         |
 | `IsConstant` | `Struct { value: T, is_constant: bool }` | `Scalar({value: 5, is_constant: true})` |
-| `IsSorted`   | `Struct { last: T, is_sorted: bool }`  | `Scalar({last: 9, is_sorted: true})` |
+| `IsSorted`   | `Struct { last: T, is_sorted: bool }`    | `Scalar({last: 9, is_sorted: true})`    |
 
 The `merge` method on `Accumulator` combines a partial state scalar into the currently open
 group. For Sum, this is addition. For IsConstant, this checks whether the incoming value
@@ -215,22 +215,22 @@ fn aggregate_list(
 
 **Ungrouped examples** (`aggregate` returns `Option<Scalar>`):
 
-| Encoding           | Aggregate    | Returns                                          |
-|--------------------|--------------|--------------------------------------------------|
-| Constant(5, n=100) | Sum          | `Some(Scalar(500))` — value * len                |
-| Constant(5, n=100) | IsConstant   | `Some({value: 5, is_constant: true})`            |
-| RunEnd([1,5,3], [2,5,8]) | Sum   | `Some(Scalar(26))` — weighted sum                |
-| RunEnd(...)        | Min          | `Some(Scalar(1))` — min of run values            |
-| Primitive          | Sum          | `None` — no shortcut, process elements           |
+| Encoding                 | Aggregate  | Returns                                |
+| ------------------------ | ---------- | -------------------------------------- |
+| Constant(5, n=100)       | Sum        | `Some(Scalar(500))` — value \* len     |
+| Constant(5, n=100)       | IsConstant | `Some({value: 5, is_constant: true})`  |
+| RunEnd([1,5,3], [2,5,8]) | Sum        | `Some(Scalar(26))` — weighted sum      |
+| RunEnd(...)              | Min        | `Some(Scalar(1))` — min of run values  |
+| Primitive                | Sum        | `None` — no shortcut, process elements |
 
 **Grouped examples** (`aggregate_list` returns `Option<ArrayRef>`):
 
-| Elements encoding  | Aggregate | Optimization                                        |
-|--------------------|-----------|-----------------------------------------------------|
-| Constant(5)        | Sum       | `constant * list.sizes()` — one multiply            |
-| Constant(5)        | IsConstant| All groups constant with same value                 |
-| Dict(codes, values)| Min       | Min code per group → look up value                  |
-| Dict(codes, values)| Max       | Max code per group → look up value                  |
+| Elements encoding   | Aggregate  | Optimization                             |
+| ------------------- | ---------- | ---------------------------------------- |
+| Constant(5)         | Sum        | `constant * list.sizes()` — one multiply |
+| Constant(5)         | IsConstant | All groups constant with same value      |
+| Dict(codes, values) | Min        | Min code per group → look up value       |
+| Dict(codes, values) | Max        | Max code per group → look up value       |
 
 The accumulator wires these into its methods:
 
@@ -303,6 +303,7 @@ min/max from statistics, sum of constant elements.
 
 **Parent-reduce** (encoding-specific): child encodings match on `ExactScalarFn<ListAggregate>`
 to optimize specific aggregate + encoding combinations. For example:
+
 - **Dict**: `ListAggregate(Min/Max, List(Dict(codes, values)))` pushes down to values.
 - **RunEnd**: `ListAggregate(Sum, List(RunEnd))` becomes a weighted sum over run values.
 
@@ -317,12 +318,12 @@ The details of scan-level push-down are out of scope for this RFC.
 
 Each `ComputeFn` kernel is replaced by creating an accumulator and driving it directly:
 
-| Current `ComputeFn`       | New                                                             |
-|---------------------------|-----------------------------------------------------------------|
-| `compute::sum(array)`     | `Sum.accumulator(dtype)` -> accumulate -> flush/finish          |
-| `compute::min_max(array)` | `Min/Max.accumulator(dtype)` -> accumulate -> flush/finish      |
-| `compute::is_constant()`  | `IsConstant.accumulator(dtype)` -> accumulate -> flush/finish   |
-| `compute::is_sorted()`    | `IsSorted.accumulator(dtype)` -> accumulate -> flush/finish     |
+| Current `ComputeFn`       | New                                                           |
+| ------------------------- | ------------------------------------------------------------- |
+| `compute::sum(array)`     | `Sum.accumulator(dtype)` -> accumulate -> flush/finish        |
+| `compute::min_max(array)` | `Min/Max.accumulator(dtype)` -> accumulate -> flush/finish    |
+| `compute::is_constant()`  | `IsConstant.accumulator(dtype)` -> accumulate -> flush/finish |
+| `compute::is_sorted()`    | `IsSorted.accumulator(dtype)` -> accumulate -> flush/finish   |
 
 Convenience functions (e.g., `compute::sum()`) can be kept as thin wrappers that create an
 accumulator, feed the array, flush, and extract the scalar result.
