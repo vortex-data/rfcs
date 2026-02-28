@@ -43,34 +43,14 @@ and begin the next. The accumulator owns an output buffer and returns all result
 
 ```rust
 pub trait Accumulator: Send + Sync {
-    /// Feed a batch of elements for the current group.
+    /// Feed a batch of elements for the currently open group.
     /// May be called multiple times per group (e.g., chunked elements).
     fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()>;
 
-    /// Merge pre-computed partial state into the currently open group.
-    /// The scalar's dtype must match the aggregate's `state_dtype`.
-    fn merge(&mut self, state: &Scalar) -> VortexResult<()>;
-
-    /// Merge an array of pre-computed states, one per group. Flushes each group.
-    /// The array's dtype must match the aggregate's `state_dtype`.
-    /// Default: scalar_at each element, merge, flush.
-    fn merge_list(&mut self, states: &ArrayRef) -> VortexResult<()> {
-        for i in 0..states.len() {
-            self.merge(&states.scalar_at(i)?)?;
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Finalize the current group: push its result to the output buffer and reset
-    /// internal state for the next group.
-    fn flush(&mut self) -> VortexResult<()>;
-
     /// Accumulate all groups defined by a ListView in one call.
-    ///
-    /// Default: slice elements per group, accumulate each, flush each.
-    /// Override for vectorized fast paths (e.g., segmented sum that avoids
-    /// per-group slicing by operating on the flat elements + offsets directly).
+    /// Default: for each group, accumulate its elements then flush.
+    /// Override for vectorized fast paths (e.g., segmented sum over the flat
+    /// elements + offsets without per-group slicing).
     fn accumulate_list(&mut self, list: &ListViewArray) -> VortexResult<()> {
         for i in 0..list.len() {
             self.accumulate(&list.list_elements_at(i)?)?;
@@ -79,7 +59,35 @@ pub trait Accumulator: Send + Sync {
         Ok(())
     }
 
-    /// Return all flushed results as a single array. Length = number of flush() calls.
+    /// Merge pre-computed partial state into the currently open group.
+    /// The scalar's dtype must match the aggregate's `state_dtype`.
+    /// This is equivalent to having processed raw elements that would produce
+    /// this state — used by encoding-specific optimizations (see aggregate).
+    fn merge(&mut self, state: &Scalar) -> VortexResult<()>;
+
+    /// Merge an array of pre-computed states, one per group, flushing each.
+    /// The array's dtype must match the aggregate's `state_dtype`.
+    /// Default: merge + flush for each element.
+    fn merge_list(&mut self, states: &ArrayRef) -> VortexResult<()> {
+        for i in 0..states.len() {
+            self.merge(&states.scalar_at(i)?)?;
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the currently open group's result is fully determined.
+    /// When true, callers may skip further accumulate/merge calls and proceed
+    /// directly to flush. Resets to false after flush().
+    /// Examples: IsConstant after seeing two distinct values, All after seeing false.
+    fn is_saturated(&self) -> bool { false }
+
+    /// Finalize the currently open group: push its result to the output buffer
+    /// and reset internal state for the next group.
+    fn flush(&mut self) -> VortexResult<()>;
+
+    /// Return all flushed results as a single array.
+    /// Length = number of flush() calls made over the accumulator's lifetime.
     fn finish(self: Box<Self>) -> VortexResult<ArrayRef>;
 }
 ```
@@ -95,6 +103,7 @@ acc.finish()  // ArrayRef of length n_lists
 // Ungrouped (full-column): single group, fold across chunks
 let mut acc = aggregate.accumulator(dtype)?;
 for chunk in chunked_array.chunks() {
+    if acc.is_saturated() { break; }
     acc.accumulate(&chunk)?;
 }
 acc.flush()?;
@@ -126,7 +135,7 @@ across nodes.
 
 ### `AggregateFnVTable`
 
-A new trait parallel to `ScalarFnVTable`. The only required method is `accumulator()`:
+A new trait parallel to `ScalarFnVTable`:
 
 ```rust
 pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
@@ -138,7 +147,7 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
     fn deserialize(&self, metadata: &[u8], session: &VortexSession) -> VortexResult<Self::Options>;
 
     /// Result dtype per group.
-    fn return_dtype(&self, options: &Self::Options, input_dtypes: &[DType]) -> VortexResult<DType>;
+    fn return_dtype(&self, options: &Self::Options, input_dtype: &DType) -> VortexResult<DType>;
 
     /// DType of the intermediate accumulator state.
     /// Use a struct dtype when multiple fields are needed (e.g., Mean: {sum: f64, count: u64}).
@@ -186,7 +195,7 @@ Two new methods on the Array VTable:
 /// Produce partial accumulator state for the given aggregate, treating the
 /// entire array as a single group.
 /// Returns None to fall back to element-by-element accumulation.
-fn aggregate_parent(
+fn aggregate(
     &self,
     array: &Self::Array,
     aggregate_fn: &AggregateFnRef,
@@ -196,7 +205,7 @@ fn aggregate_parent(
 /// over this array. Returns an array of state values (one per group) with
 /// dtype = aggregate_fn.state_dtype() and length = list.len().
 /// Returns None to fall back to per-group accumulation.
-fn aggregate_parent_list(
+fn aggregate_list(
     &self,
     elements: &Self::Array,
     list: &ListViewArray,
@@ -204,7 +213,7 @@ fn aggregate_parent_list(
 ) -> VortexResult<Option<ArrayRef>>;
 ```
 
-**Ungrouped examples** (`aggregate_parent` returns `Option<Scalar>`):
+**Ungrouped examples** (`aggregate` returns `Option<Scalar>`):
 
 | Encoding           | Aggregate    | Returns                                          |
 |--------------------|--------------|--------------------------------------------------|
@@ -214,7 +223,7 @@ fn aggregate_parent_list(
 | RunEnd(...)        | Min          | `Some(Scalar(1))` — min of run values            |
 | Primitive          | Sum          | `None` — no shortcut, process elements           |
 
-**Grouped examples** (`aggregate_parent_list` returns `Option<ArrayRef>`):
+**Grouped examples** (`aggregate_list` returns `Option<ArrayRef>`):
 
 | Elements encoding  | Aggregate | Optimization                                        |
 |--------------------|-----------|-----------------------------------------------------|
@@ -227,13 +236,13 @@ The accumulator wires these into its methods:
 
 ```rust
 // In accumulate():
-if let Some(state) = batch.aggregate_parent(&self.aggregate_fn)? {
+if let Some(state) = batch.aggregate(&self.aggregate_fn)? {
     return self.merge(&state);
 }
 // ... fall back to canonical processing
 
 // In accumulate_list() default:
-if let Some(states) = list.elements().aggregate_parent_list(list, &self.aggregate_fn)? {
+if let Some(states) = list.elements().aggregate_list(list, &self.aggregate_fn)? {
     return self.merge_list(&states);
 }
 // ... fall back to per-group slice + accumulate + flush
