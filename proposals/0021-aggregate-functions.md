@@ -1,5 +1,5 @@
 - Start Date: 2026-02-26
-- RFC PR: [vortex-data/rfcs#0020](https://github.com/vortex-data/rfcs/pull/0021)
+- RFC PR: [vortex-data/rfcs#0021](https://github.com/vortex-data/rfcs/pull/0021)
 - Tracking Issue: [vortex-data/vortex#6719](https://github.com/vortex-data/vortex/issues/6719)
 
 ## Summary
@@ -10,8 +10,8 @@ aggregate system, replacing what would otherwise be N separate list scalar funct
 
 ## Motivation
 
-Vortex has aggregate operations (`sum`, `min_max`, `is_constant`, `is_sorted`) implemented as
-standalone `ComputeFn` kernels. These cannot participate in expression trees, benefit from lazy
+Vortex has aggregate operations (`sum`, `min_max`, `is_constant`, `is_sorted`, `nan_count`)
+implemented as standalone `ComputeFn` kernels. These cannot participate in expression trees, benefit from lazy
 evaluation, or be optimized via reduce/reduce_parent rules. Meanwhile, list scalar functions
 like `list_sum`, `list_min`, etc. don't yet exist — and implementing each one separately would
 duplicate the underlying aggregation logic.
@@ -27,6 +27,7 @@ by offsets. Every aggregate function has a corresponding list scalar function fo
 | `max`     | `list_max(list_col)`   | Max element per list      |
 | `count`   | `list_count(list_col)` | Count non-null per list   |
 | `mean`    | `list_mean(list_col)`  | Mean of elements per list |
+| `nan_count` | `list_nan_count(list_col)` | Count NaN elements per list |
 
 Since Vortex does not support shuffling, grouped aggregates only apply to pre-existing groups.
 These are naturally represented by List or ListView encodings as a view over the elements array.
@@ -37,9 +38,11 @@ ungrouped column-level aggregation and grouped list-scalar operations from a sin
 
 ### `Accumulator`
 
-The `Accumulator` trait is the core aggregation primitive. It processes one group at a time:
-the caller feeds element batches via `accumulate`, then calls `flush` to finalize the group
-and begin the next. The accumulator owns an output buffer and returns all results at the end.
+The `Accumulator` is the single execution interface for all aggregation. It processes one group
+at a time: the caller feeds element batches via `accumulate`, then calls `flush` to finalize
+the group and begin the next. Encodings can short-circuit by producing partial state (via
+`aggregate` / `aggregate_list` on the array vtable) that is merged into the accumulator.
+The accumulator owns an output buffer and returns all results at the end.
 
 ```rust
 pub trait Accumulator: Send + Sync {
@@ -84,6 +87,11 @@ pub trait Accumulator: Send + Sync {
 
     /// Finalize the currently open group: push its result to the output buffer
     /// and reset internal state for the next group.
+    ///
+    /// Flushing a group with zero accumulated elements produces the aggregate's
+    /// identity value (e.g., 0 for Sum, u64::MAX for Min) or null if no identity
+    /// exists. If accumulation fails mid-group, the accumulator is left in an
+    /// unspecified state — callers should not flush after an error.
     fn flush(&mut self) -> VortexResult<()>;
 
     /// Return all flushed results as a single array.
@@ -118,8 +126,9 @@ fields, use a struct dtype:
 
 | Aggregate    | `state_dtype`                            | Example state value                     |
 | ------------ | ---------------------------------------- | --------------------------------------- |
-| `Sum`        | `i64` (or widened input type)            | `Scalar(42)`                            |
+| `Sum`        | `i64` (or widened input type)            | `Scalar(42)` — overflow saturates to null |
 | `Count`      | `u64`                                    | `Scalar(7)`                             |
+| `NanCount`   | `u64`                                    | `Scalar(2)`                             |
 | `Min`        | input element type                       | `Scalar(3)`                             |
 | `Mean`       | `Struct { sum: f64, count: u64 }`        | `Scalar({sum: 10.0, count: 5})`         |
 | `IsConstant` | `Struct { value: T, is_constant: bool }` | `Scalar({value: 5, is_constant: true})` |
@@ -162,18 +171,21 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
 }
 ```
 
-All execution flows through the `Accumulator`. Grouped aggregation uses `accumulate_list`;
-ungrouped aggregation uses `accumulate`/`flush`/`finish` directly. There is no need for
-`execute_grouped` or `execute_scalar` methods on the vtable — the accumulator is the single
-entry point, and its `accumulate_list` override is where vectorized fast paths live.
+The `Accumulator` is the single execution interface. Grouped aggregation uses
+`accumulate_list`; ungrouped aggregation uses `accumulate`/`flush`/`finish` directly.
+Encodings can short-circuit by producing partial state (via `aggregate`/`aggregate_list` on
+the array vtable) that is merged into the accumulator via `merge`/`merge_list`. There is no
+need for `execute_grouped` or `execute_scalar` methods on the vtable — the accumulator
+handles both paths, and its `accumulate_list` override is where vectorized fast paths live.
 
 ### Built-in aggregates
 
 The initial set, each implementing `AggregateFnVTable`:
 
 ```rust
-pub struct Sum;       // sum of elements per group
+pub struct Sum;       // sum of elements per group (overflow saturates to null)
 pub struct Count;     // count of non-null elements per group
+pub struct NanCount;  // count of NaN elements per group (float input)
 pub struct Min;       // minimum element per group
 pub struct Max;       // maximum element per group
 pub struct Mean;      // mean of elements per group (returns f64)
@@ -181,7 +193,8 @@ pub struct Any;       // logical OR per group (bool input)
 pub struct All;       // logical AND per group (bool input)
 ```
 
-These replace the standalone `ComputeFn` kernels (e.g., `Sum` replaces `compute::sum()`).
+All built-in aggregates use `EmptyOptions` as their `Options` type. These replace the
+standalone `ComputeFn` kernels (e.g., `Sum` replaces `compute::sum()`).
 
 ### Encoding-specific optimization
 
@@ -269,7 +282,17 @@ impl ScalarFnVTable for ListAggregate {
 
     fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
         let list = args.inputs[0].to_listview()?;
-        let mut acc = options.aggregate_fn.accumulator(list.elements().dtype())?;
+        let agg = &options.aggregate_fn;
+
+        // Try encoding-specific fast path first.
+        if let Some(states) = list.elements().aggregate_list(&list, agg)? {
+            let mut acc = agg.accumulator(list.elements().dtype())?;
+            acc.merge_list(&states)?;
+            return acc.finish();
+        }
+
+        // Fall back to accumulator-driven execution.
+        let mut acc = agg.accumulator(list.elements().dtype())?;
         acc.accumulate_list(&list)?;
         acc.finish()
     }
@@ -287,7 +310,7 @@ pub fn list_sum(list: Expression) -> Expression {
         [list],
     )
 }
-// list_min, list_max, list_count, list_mean, list_any, list_all analogously
+// list_min, list_max, list_count, list_nan_count, list_mean, list_any, list_all analogously
 ```
 
 This is one scalar function parameterized by the aggregate, analogous to DuckDB's
@@ -314,20 +337,6 @@ computed during file scanning without materializing full columns. For example, `
 be resolved from row group metadata alone; `Min`/`Max` can use column-chunk statistics.
 The details of scan-level push-down are out of scope for this RFC.
 
-## Migration
-
-Each `ComputeFn` kernel is replaced by creating an accumulator and driving it directly:
-
-| Current `ComputeFn`       | New                                                           |
-| ------------------------- | ------------------------------------------------------------- |
-| `compute::sum(array)`     | `Sum.accumulator(dtype)` -> accumulate -> flush/finish        |
-| `compute::min_max(array)` | `Min/Max.accumulator(dtype)` -> accumulate -> flush/finish    |
-| `compute::is_constant()`  | `IsConstant.accumulator(dtype)` -> accumulate -> flush/finish |
-| `compute::is_sorted()`    | `IsSorted.accumulator(dtype)` -> accumulate -> flush/finish   |
-
-Convenience functions (e.g., `compute::sum()`) can be kept as thin wrappers that create an
-accumulator, feed the array, flush, and extract the scalar result.
-
 ## Compatibility
 
 No file format or wire format changes. `ListAggregate` produces a `ScalarFnArray` at runtime
@@ -336,8 +345,8 @@ and is not persisted. Public API additions:
 - `Accumulator` trait
 - `AggregateFnVTable` trait and built-in implementations
 - `ListAggregate` scalar function
-- Expression constructors: `list_sum()`, `list_count()`, `list_min()`, `list_max()`,
-  `list_mean()`, `list_any()`, `list_all()`
+- Expression constructors: `list_sum()`, `list_count()`, `list_nan_count()`, `list_min()`,
+  `list_max()`, `list_mean()`, `list_any()`, `list_all()`
 
 ## Drawbacks
 
