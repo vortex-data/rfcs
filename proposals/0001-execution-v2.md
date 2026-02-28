@@ -4,17 +4,11 @@
 
 ## Summary
 
-Replace the current execution VTable with a cleaner model. `reduce` and `reduce_parent` remain
-metadata-only in both proposals and are identical. The proposals differ in how `execute` and
-`execute_parent` work:
-
-- **Proposal A (Scheduler-driven)**: `execute` returns an `ExecutionStep` — either requesting
-  the scheduler to execute a specific child, or declaring that it is done. The scheduler drives
-  all iteration. `execute_parent` is retained and returns an `ArrayRef` (any encoding).
-
-- **Proposal B (Canonical builder)**: `execute` pushes its result into a caller-owned
-  `CanonicalBuilder`. The result is always canonical. `execute_parent` is retained and also
-  pushes into the builder.
+Replace the current execution VTable with a scheduler-driven model. `reduce` and
+`reduce_parent` remain metadata-only. `execute` returns an `ExecutionStep` telling the scheduler
+which child to execute next, or that execution is done. `execute_parent` is retained and returns
+an `ArrayRef` in any encoding. The scheduler drives all iteration and runs reduce rules between
+steps.
 
 ## Motivation
 
@@ -28,12 +22,12 @@ trees overflow the stack.
 **Unclear execute/reduce boundary.** Some `execute_parent` implementations are metadata-only
 and belong in `reduce_parent`. The boundary isn't enforced.
 
-## Shared design
+## Design
 
-### reduce / reduce_parent (identical in both proposals)
+### reduce / reduce_parent (unchanged)
 
-Both proposals keep these methods with unchanged signatures. They are **strictly metadata-only**
-— they never read data buffers.
+These methods keep their current signatures. They are **strictly metadata-only** — they never
+read data buffers.
 
 ```rust
 fn reduce(array: &Self::Array) -> VortexResult<Option<ArrayRef>>;
@@ -50,8 +44,7 @@ fn reduce_parent(
 values. RunEnd child pulls ScalarFn through to its values. FSST child rewrites Compare by
 compressing the RHS literal.
 
-The framework runs these to a fixpoint before execution begins (and, in Proposal A, between
-execution steps).
+The framework runs these to a fixpoint before execution begins and between execution steps.
 
 Implementations currently misplaced in `execute_parent` that are metadata-only (Dict + Compare,
 ALP + Compare, FoR + Compare, FSST + Compare) move to `reduce_parent`. Implementations that
@@ -60,26 +53,21 @@ Between) move into `ScalarFn::execute`.
 
 ### FilterArray
 
-FilterArray continues to exist as a lazy wrapper in both models. It is not subsumed by the
-execution method. Both models handle it — the difference is what `execute_parent` can return
-when a child encoding wants to handle a FilterArray parent (see comparison section).
+FilterArray continues to exist as a lazy wrapper. It is not subsumed by the execution method
+signature.
 
----
-
-## Proposal A: Scheduler-driven iterative execution
-
-### VTable
+### execute / execute_parent
 
 ```rust
-fn reduce(array: &Self::Array) -> VortexResult<Option<ArrayRef>>;
-fn reduce_parent(array: &Self::Array, parent: &ArrayRef, child_idx: usize)
-    -> VortexResult<Option<ArrayRef>>;
-
 fn execute(array: &Self::Array, ctx: &mut ExecutionCtx)
     -> VortexResult<ExecutionStep>;
 
-fn execute_parent(array: &Self::Array, parent: &ArrayRef, child_idx: usize, ctx: &mut ExecutionCtx)
-    -> VortexResult<Option<ArrayRef>>;
+fn execute_parent(
+    array: &Self::Array,
+    parent: &ArrayRef,
+    child_idx: usize,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>>;
 ```
 
 ```rust
@@ -95,6 +83,9 @@ pub enum ExecutionStep {
 
 The encoding never recurses into children. It yields control back to the scheduler, telling it
 what work is needed. The scheduler maintains the work stack.
+
+`execute_parent` returns `Option<ArrayRef>` — the result can be in **any encoding**, not just
+canonical. This is critical for encoding-preserving execution (see examples below).
 
 ### Scheduler
 
@@ -178,227 +169,86 @@ fn execute(bp: &BitPackedArray, ctx: &mut ExecutionCtx) -> VortexResult<Executio
 }
 ```
 
----
+### Cross-step optimization
 
-## Proposal B: Canonical builder execution
-
-### VTable
-
-```rust
-fn reduce(array: &Self::Array) -> VortexResult<Option<ArrayRef>>;
-fn reduce_parent(array: &Self::Array, parent: &ArrayRef, child_idx: usize)
-    -> VortexResult<Option<ArrayRef>>;
-
-fn execute(
-    array: &Self::Array,
-    builder: &mut CanonicalBuilder,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<()>;
-
-fn execute_parent(
-    array: &Self::Array,
-    parent: &ArrayRef,
-    child_idx: usize,
-    builder: &mut CanonicalBuilder,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<bool>;  // true if handled
-```
-
-### CanonicalBuilder
-
-A closed enum mirroring `Canonical` in mutable builder form:
-
-```rust
-pub enum CanonicalBuilder {
-    Null(NullBuilder),
-    Bool(BoolBuilder),
-    Primitive(PrimitiveBuilder),
-    Decimal(DecimalBuilder),
-    VarBinView(VarBinViewBuilder),
-    List(ListViewBuilder),
-    FixedSizeList(FixedSizeListBuilder),
-    Struct(StructBuilder),
-    Extension(ExtensionBuilder),
-}
-```
-
-Because it is an enum (not `dyn`), encodings can match on the concrete variant. This enables
-zero-copy decompression paths impossible with the current `dyn ArrayBuilder`.
-
-### Framework
-
-```rust
-fn canonicalize(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Canonical> {
-    let array = optimize_recursive(array)?;
-    let mut builder = CanonicalBuilder::new(array.dtype());
-
-    // Try execute_parent
-    for child_idx in 0..array.nchildren() {
-        let child = array.child(child_idx);
-        if child.vtable().execute_parent(&child, &array, child_idx, &mut builder, ctx)? {
-            return Ok(builder.finish());
-        }
-    }
-
-    array.vtable().execute(&array, &mut builder, ctx)?;
-    Ok(builder.finish())
-}
-```
-
-Single call. No iteration loop. No MAX_ITERATIONS. Reduce runs once, then one recursive
-descent fills the builder.
-
-### Per-encoding examples
-
-**FSST** — zero-copy push into VarBinViewBuilder:
-
-```rust
-fn execute(fsst: &FSSTArray, builder: &mut CanonicalBuilder, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-    let CanonicalBuilder::VarBinView(vbv) = builder else { unreachable!() };
-    let (buffers, views) = fsst_decompress(fsst, vbv.completed_block_count())?;
-    vbv.push_buffers_and_views(&buffers, &views);
-    Ok(())
-}
-```
-
-**ChunkedArray** — shared builder, no concat:
-
-```rust
-fn execute(chunked: &ChunkedArray, builder: &mut CanonicalBuilder, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-    for chunk in chunked.chunks() {
-        canonicalize_into(chunk, builder, ctx)?;
-    }
-    // All chunks wrote into the same builder. No concatenation needed.
-    Ok(())
-}
-```
-
-**DictArray** — executes codes into sub-builder, then gathers:
-
-```rust
-fn execute(dict: &DictArray, builder: &mut CanonicalBuilder, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-    let mut code_builder = CanonicalBuilder::new(dict.codes().dtype());
-    canonicalize_into(dict.codes(), &mut code_builder, ctx)?;
-    let codes = code_builder.finish().into_primitive();
-    gather_into_builder(dict.values(), &codes, builder, ctx)
-}
-```
-
-**FilterArray** — execute child, apply mask:
-
-```rust
-fn execute(filter: &FilterArray, builder: &mut CanonicalBuilder, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-    let mut sub = CanonicalBuilder::new(filter.child().dtype());
-    canonicalize_into(filter.child(), &mut sub, ctx)?;
-    let canonical = sub.finish();
-    let filtered = filter.mask().apply_to(canonical)?;
-    builder.extend_from_canonical(&filtered);
-    Ok(())
-}
-```
-
-**BitPacked** — unpack directly into PrimitiveBuilder:
-
-```rust
-fn execute(bp: &BitPackedArray, builder: &mut CanonicalBuilder, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-    let CanonicalBuilder::Primitive(pb) = builder else { unreachable!() };
-    unpack_into(bp, pb)?;
-    Ok(())
-}
-```
-
----
-
-## Comparison
-
-### What Proposal A can do that Proposal B cannot
-
-**1. Encoding-preserving execute_parent.**
-
-In A, `execute_parent` returns `Option<ArrayRef>` — the result can be in *any* encoding. In B,
-`execute_parent` pushes into a `CanonicalBuilder` — the result is always canonical.
-
-Concrete example: `Filter(FSST(data), mask)`. FSST's `execute_parent` sees the FilterArray
-parent.
-
-- In A, it can return a filtered FSST array (still FSST-encoded). An exporter driving the
-  scheduler sees FSST on the next iteration and exports it as a DuckDB FSST vector — no
-  decompression.
-- In B, it must push decompressed VarBinView into the builder. The FSST encoding is gone.
-
-Same applies to DictArray for DuckDB dictionary vector export, or any encoding where the
-downstream consumer natively supports the compressed form.
-
-**2. Cross-step optimization.**
-
-In A, the scheduler runs `optimize_recursive` after each child execution. Reduce rules fire on
-the new tree shape. Patterns only visible after partial execution can still be optimized.
+Because `optimize_recursive` runs after each child execution, patterns that only become visible
+after partial execution can still be optimized.
 
 Example: `ScalarFn(upper, [Dict(BitPacked(codes), values)])`. After the scheduler executes
 BitPacked codes to PrimitiveArray, the tree becomes
 `ScalarFn(upper, [Dict(Primitive(codes), values)])`. A reduce_parent rule on Dict pushes
 `upper` into values — this optimization fires between steps.
 
-In B, reduce runs once before the single recursive descent. If a pattern only becomes visible
-after partial execution, it's missed.
+### Encoding-preserving execute_parent
 
-**3. Bounded stack depth.**
+`execute_parent` returns `Option<ArrayRef>` in any encoding. This enables exporters to
+intercept intermediate forms without decompressing.
 
-In A, the scheduler can use an explicit work stack instead of recursion. Stack depth is O(1)
-regardless of encoding depth. In B, `execute` recurses into children — stack depth equals
-encoding tree depth.
+Concrete example: `Filter(FSST(data), mask)`. FSST's `execute_parent` sees the FilterArray
+parent and returns a filtered FSST array (still FSST-encoded). An exporter driving the
+scheduler sees FSST on the next iteration and exports it as a DuckDB FSST vector — no
+decompression needed.
 
-### What Proposal B can do that Proposal A cannot
+Same applies to DictArray for DuckDB dictionary vector export, or any encoding where the
+downstream consumer natively supports the compressed form.
 
-**1. Caller-owned output buffers (decompress-into).**
+### Exporter integration
 
-The builder is created by the caller and passed down. This enables three concrete optimizations:
+Exporters drive the scheduler loop directly and inspect the array after each step:
 
-- **ChunkedArray without concat.** One builder, each chunk writes into it. Single contiguous
-  allocation. In A, each chunk returns its own Columnar; the framework must concat them — an
-  extra copy of the entire column.
+```rust
+fn export_chunk(mut array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DuckDBVector> {
+    let mut array = optimize_recursive(array)?;
 
-- **FSST zero-copy push.** FSST decompresses views and data buffers directly into
-  VarBinViewBuilder's internal storage, adjusting view offsets to account for already-completed
-  blocks. In A, FSST must allocate its own VarBinViewArray.
+    loop {
+        if let Some(dict) = array.as_opt::<DictVTable>() {
+            return export_dict(dict, ctx);
+        }
+        if let Some(fsst) = array.as_opt::<FSSTVTable>() {
+            return export_fsst(fsst, ctx);
+        }
+        if let Some(c) = array.as_columnar() {
+            return export_columnar(c, ctx);
+        }
 
-- **Pre-allocated output.** When output length is known, the builder pre-allocates once. In A,
-  each Done allocates independently.
+        if let Some(rewritten) = try_execute_parent(&array, ctx)? {
+            array = optimize_recursive(rewritten)?;
+            continue;
+        }
 
-**2. No intermediate allocations.**
+        match array.vtable().execute(&array, ctx)? {
+            ExecutionStep::ExecuteChild(i) => {
+                let child = array.child(i);
+                let executed = execute_to_columnar(child, ctx)?;
+                array = array.with_child(i, executed.into_array());
+                array = optimize_recursive(array)?;
+            }
+            ExecutionStep::Done(c) => return export_columnar(c, ctx),
+        }
+    }
+}
+```
 
-Every encoding writes directly into the final output buffer. No temporary array trees between
-steps. For hot paths on large batches, this is measurable.
+If an opaque encoding decodes to DictArray during execution, the exporter discovers it on the
+next iteration and exports it natively. This is impossible in a model that always produces
+canonical output.
 
-**3. No iteration bound.**
+### Decompress-into-buffer
 
-Single recursive descent. No MAX_ITERATIONS. No risk of non-convergence.
+The scheduler-driven model does not natively support caller-owned output buffers (each
+`Done(Columnar)` allocates its own output). The two concrete cases where this matters —
+ChunkedArray concat and FSST zero-copy push — can be addressed at the framework level:
 
-### Summary table
+- **ChunkedArray**: The scheduler special-cases ChunkedArray by pre-allocating a single output
+  buffer and copying each chunk's `Columnar` result into it. One allocation + N memcpys rather
+  than N allocations + one concat. Not zero-copy, but eliminates the extra full-column copy.
 
-| Capability                          | Proposal A | Proposal B |
-|-------------------------------------|------------|------------|
-| Caller-owned output buffers         | No         | **Yes**    |
-| ChunkedArray without concat         | No         | **Yes**    |
-| FSST zero-copy into builder         | No         | **Yes**    |
-| Pre-allocated output                | No         | **Yes**    |
-| No intermediate allocations         | No         | **Yes**    |
-| Encoding-preserving execute_parent  | **Yes**    | No         |
-| Exporter intercepts intermediates   | **Yes**    | No         |
-| Cross-step optimization             | **Yes**    | No         |
-| Bounded stack depth (explicit stack)| **Yes**    | No         |
-| No iteration bound / convergence    | No         | **Yes**    |
+- **FSST**: The extra allocation is the views array (16 bytes per string). The actual string
+  data buffers are shared via `Arc` — they are not copied. The overhead is bounded and small
+  relative to decompression cost.
 
-### The core trade-off
-
-Proposal A optimizes for **flexibility**: intermediate encodings are visible, exporters can
-intercept, reduce rules fire between steps. The cost is that every encoding allocates its own
-output and ChunkedArray must concat.
-
-Proposal B optimizes for **allocation efficiency**: caller-owned buffers, zero-copy
-decompression, no intermediates. The cost is that execution always produces canonical — encodings
-can't preserve themselves through execution, and exporters must use encoding-specific logic
-outside the framework.
+These are framework-level optimizations, not VTable concerns. They don't require encoding
+authors to think about builders.
 
 ## Compatibility
 
@@ -408,19 +258,48 @@ Public API breakage: the `Executable` trait and `execute::<T>()` method are repl
 Third-party encodings must migrate. A default implementation bridging to the old path eases
 migration.
 
+## Alternatives
+
+### Canonical builder model
+
+Instead of returning `ExecutionStep`, `execute` could push results into a caller-owned
+`CanonicalBuilder` (a closed enum mirroring `Canonical` in mutable builder form). Each encoding
+decompresses directly into the builder in a single recursive descent. `execute_parent` would
+also push into the builder.
+
+This model natively supports decompress-into-buffer: ChunkedArray writes all chunks into one
+builder (no concat), FSST pushes views directly into VarBinViewBuilder (zero-copy). No
+iteration loop, no MAX_ITERATIONS.
+
+However, requiring canonical output from `execute` is a structural limitation that cannot be
+worked around:
+
+- **No encoding-preserving execute_parent.** `execute_parent` must push canonical into the
+  builder. FSST can't return a filtered FSST array — the encoding is always lost. Exporters
+  must use encoding-specific logic outside the framework for every format they want to preserve.
+
+- **No cross-step optimization.** Reduce runs once before the single descent. Patterns visible
+  only after partial execution are missed.
+
+- **No exporter intermediate inspection.** Exporters see the tree after reduce, before
+  execution. Encodings hidden behind opaque wrappers are never visible.
+
+- **Stack overflow.** `execute` recurses into children. Stack depth equals encoding tree depth.
+
+The scheduler-driven model's allocation wins (encoding-preserving intermediates, cross-step
+optimization, exporter interception, bounded stack) are structurally unrecoverable in the
+builder model. The builder model's allocation wins (shared builder, zero-copy push) are
+recoverable in the scheduler model via framework-level optimizations. This asymmetry makes the
+scheduler-driven model strictly preferable.
+
 ## Unresolved Questions
 
-- **CanonicalBuilder design (Proposal B):** The exact interface for one-level-deep building,
-  especially for List and Extension types, needs design work. Struct fields are accumulated as
-  `Vec<ArrayRef>` (potentially compressed), not recursively built.
-
-- **Explicit work stack (Proposal A):** The scheduler can be recursive (simple, but same stack
-  overflow risk as today) or use an explicit work stack (bounded depth, but more complex).
-  The RFC assumes an explicit stack is feasible but doesn't specify the implementation.
+- **Explicit work stack:** The scheduler can be recursive (simple, but same stack overflow risk
+  as today) or use an explicit work stack (bounded depth, but more complex). The RFC assumes an
+  explicit stack is feasible but doesn't specify the implementation.
 
 - **Constants:** `ConstantArray` continues to exist. ScalarFnArray special-cases it to avoid
-  expanding constants. The `Columnar` enum (`Canonical | Constant`) is preserved. This is
-  orthogonal to the proposal choice.
+  expanding constants. The `Columnar` enum (`Canonical | Constant`) is preserved.
 
-- **Decompression cache / CSE:** `ExecutionCtx` can hold a pointer-identity cache so that shared
-  sub-arrays (e.g., `x + x`) are only executed once. Orthogonal to the proposal choice.
+- **Decompression cache / CSE:** `ExecutionCtx` can hold a pointer-identity cache so that
+  shared sub-arrays (e.g., `x + x`) are only executed once.
