@@ -67,13 +67,13 @@ fn execute_parent(
     parent: &ArrayRef,
     child_idx: usize,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<Option<ArrayRef>>;
+) -> VortexResult<Option<ExecutionStep>>;
 ```
 
 ```rust
 pub enum ExecutionStep {
-    /// Ask the scheduler to execute the child at this index to columnar,
-    /// replace it, then call execute on this array again.
+    /// Ask the scheduler to execute the child at this index one step,
+    /// replace it, then call execute (or execute_parent) on this array again.
     ExecuteChild(usize),
 
     /// Execution is complete.
@@ -81,43 +81,95 @@ pub enum ExecutionStep {
 }
 ```
 
-The encoding never recurses into children. It yields control back to the scheduler, telling it
-what work is needed. The scheduler maintains the work stack.
+Both `execute` and `execute_parent` return `ExecutionStep`. The encoding never recurses into
+children — it yields control back to the scheduler, telling it what work is needed. The
+scheduler maintains the work stack.
 
-`execute_parent` returns `Option<ArrayRef>` — the result can be in **any encoding**, not just
-canonical. This is critical for encoding-preserving execution (see examples below).
+`execute_parent` returns `Option<ExecutionStep>`:
+- `None` — the child cannot handle this parent, fall through to the parent's own `execute`.
+- `Some(ExecuteChild(i))` — the child needs its own child at index `i` executed one step before
+  it can handle the parent. The scheduler does this, then retries `execute_parent`.
+- `Some(Done(result))` — the child handled the parent, here is the result in **any encoding**
+  (not just canonical). This is critical for encoding-preserving execution.
+
+Making `execute_parent` iterative is necessary because some parent-handling logic requires
+data access to the child's own children. For example, `Slice(RunEnd(ends=PCodec(...)))`:
+RunEnd's `execute_parent` sees the Slice parent and wants to binary-search its `ends` to find
+the physical indices for the slice boundaries. But `ends` is PCodec-compressed — each
+`scalar_at` probe during binary search would decompress the full array. Instead, RunEnd returns
+`ExecuteChild(0)` to request its ends be executed first. The scheduler decompresses PCodec to
+PrimitiveArray, then retries `execute_parent`. RunEnd now binary-searches canonical ends and
+returns an efficiently sliced RunEnd array.
+
+```rust
+// RunEnd's execute_parent for Slice
+fn execute_parent(
+    re: &RunEndArray, parent: &ArrayRef, child_idx: usize, ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ExecutionStep>> {
+    let Some(slice) = parent.as_opt::<SliceVTable>() else { return Ok(None) };
+
+    if !re.ends().is_columnar() {
+        // Need canonical ends for binary search
+        return Ok(Some(ExecutionStep::ExecuteChild(0)));
+    }
+
+    // Ends are canonical — binary search is cheap
+    let physical_start = re.find_physical_index(slice.start())?;
+    let physical_end = re.find_physical_index(slice.end())?;
+    let sliced = RunEndArray::new(
+        re.ends().slice(physical_start..physical_end)?,
+        re.values().slice(physical_start..physical_end)?,
+        slice.start() + re.offset(),
+        slice.len(),
+    )?;
+    Ok(Some(ExecutionStep::Done(Columnar::from(sliced))))
+}
+```
 
 ### Scheduler
 
 ```rust
-fn execute_to_columnar(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Columnar> {
+fn execute_one_step(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
     let mut array = optimize_recursive(array)?;
 
-    loop {
-        if let Some(c) = array.as_columnar() { return Ok(c); }
+    if array.as_columnar().is_some() { return Ok(array); }
 
-        // Try execute_parent (child-driven specialized execution)
-        if let Some(rewritten) = try_execute_parent(&array, ctx)? {
-            array = optimize_recursive(rewritten)?;
-            continue;
-        }
-
-        match array.vtable().execute(&array, ctx)? {
-            ExecutionStep::ExecuteChild(i) => {
-                let child = array.child(i);
-                let executed = execute_to_columnar(child, ctx)?;
-                array = array.with_child(i, executed.into_array());
-                array = optimize_recursive(array)?;
+    // Try execute_parent (child-driven specialized execution)
+    for child_idx in 0..array.nchildren() {
+        let child = array.child(child_idx);
+        match child.vtable().execute_parent(&child, &array, child_idx, ctx)? {
+            None => continue,
+            Some(ExecutionStep::ExecuteChild(i)) => {
+                // Child needs its own child executed first — do one step, retry
+                let grandchild = child.child(i);
+                let stepped = execute_one_step(grandchild, ctx)?;
+                let new_child = child.with_child(i, stepped);
+                array = array.with_child(child_idx, new_child);
+                return Ok(array);
             }
-            ExecutionStep::Done(result) => return Ok(result),
+            Some(ExecutionStep::Done(result)) => {
+                return Ok(result.into_array());
+            }
         }
+    }
+
+    // Fall through to the array's own execute
+    match array.vtable().execute(&array, ctx)? {
+        ExecutionStep::ExecuteChild(i) => {
+            let child = array.child(i);
+            let stepped = execute_one_step(child, ctx)?;
+            array = array.with_child(i, stepped);
+            Ok(array)
+        }
+        ExecutionStep::Done(result) => Ok(result.into_array()),
     }
 }
 ```
 
-After each child execution, `optimize_recursive` runs again — reduce rules can fire on the
-new tree shape. For truly bounded stack depth, an explicit work stack replaces the recursive
-`execute_to_columnar(child)` call.
+Each call to `execute_one_step` makes one unit of progress. The top-level
+`execute_to_columnar` simply loops until the result is columnar. After each step,
+`optimize_recursive` runs again — reduce rules can fire on the new tree shape. For truly
+bounded stack depth, an explicit work stack replaces the recursive calls.
 
 ### Per-encoding examples
 
@@ -250,6 +302,46 @@ ChunkedArray concat and FSST zero-copy push — can be addressed at the framewor
 These are framework-level optimizations, not VTable concerns. They don't require encoding
 authors to think about builders.
 
+### Execution cache in ExecutionCtx
+
+The scheduler executes each child one step at a time, replacing it in the parent tree. This
+means the result of executing an array is only visible to its immediate parent — if the same
+`Arc<dyn Array>` appears as a child of multiple parents (e.g., `a < 10 & a > 5` where `a` is
+the same ArrayRef), it will be executed independently each time.
+
+`ExecutionCtx` holds a cache keyed by the raw pointer of the source array (`Arc::as_ptr()`).
+The cache entry stores a clone of the source `Arc` (to pin the pointer address — preventing
+deallocation and reuse) alongside the one-step execution result.
+
+```rust
+pub struct ExecutionCtx {
+    // ...
+    cache: HashMap<*const dyn Array, CacheEntry>,
+}
+
+struct CacheEntry {
+    /// Holds a strong reference to the source array, preventing the Arc from
+    /// being deallocated and its pointer reused for a different array.
+    _source: ArrayRef,
+    /// The result of executing the source array one step.
+    result: ArrayRef,
+}
+```
+
+**When to cache.** Not every array should be cached — most are executed exactly once, and
+caching adds overhead (HashMap insert + Arc clone). The `Arc::strong_count` is used as a
+heuristic: if `strong_count > 1`, the array is referenced from multiple places and its
+execution result is likely to be reused. This is an imperfect approximation — strong_count is a
+global reference count, not local to the array tree being executed. An array may have
+`strong_count > 1` because the layout reader or scan builder holds a reference, not because it
+appears twice in the expression tree. But it never misses a genuinely shared sub-expression (if
+shared, the count is > 1), and false positives only cost memory, not correctness.
+
+**Scope.** The cache lives in `ExecutionCtx`, not in individual arrays. Users can share an
+`ExecutionCtx` across multiple independent array executions (e.g., multiple columns in a scan),
+so the cache naturally deduplicates work across columns that share sub-arrays (shared
+dictionaries, common filter masks). The cache is dropped when the `ExecutionCtx` is dropped.
+
 ## Compatibility
 
 No file format or wire format changes. All changes are internal to the execution engine.
@@ -300,6 +392,3 @@ scheduler-driven model strictly preferable.
 
 - **Constants:** `ConstantArray` continues to exist. ScalarFnArray special-cases it to avoid
   expanding constants. The `Columnar` enum (`Canonical | Constant`) is preserved.
-
-- **Decompression cache / CSE:** `ExecutionCtx` can hold a pointer-identity cache so that
-  shared sub-arrays (e.g., `x + x`) are only executed once.
