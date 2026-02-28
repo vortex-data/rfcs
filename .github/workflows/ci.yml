@@ -36,5 +36,35 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      - name: Check proposal matches PR number
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          CHANGED_PROPOSALS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'proposals/' \
+            | grep -v '^proposals/0000-template\.md$' || true)
+
+          COUNT=$(echo "$CHANGED_PROPOSALS" | grep -c . || true)
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::PR touches $COUNT proposals. Only one proposal per PR is allowed."
+            echo "$CHANGED_PROPOSALS"
+            exit 1
+          fi
+
+          if [ "$COUNT" -eq 1 ]; then
+            FILE=$(echo "$CHANGED_PROPOSALS" | head -1)
+            FILENAME=$(basename "$FILE")
+            FILE_NUMBER=$(echo "$FILENAME" | grep -oE '^[0-9]+' || true)
+            # Strip leading zeros for comparison
+            FILE_NUM=$((10#$FILE_NUMBER))
+
+            if [ "$FILE_NUM" -ne "$PR_NUMBER" ]; then
+              echo "::error::Proposal number ($FILE_NUM from $FILENAME) does not match PR number ($PR_NUMBER)."
+              exit 1
+            fi
+          fi
+
       - name: Build
         run: bun run build
