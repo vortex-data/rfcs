@@ -1,5 +1,4 @@
 - Start Date: 2026-02-26
-- RFC PR: [vortex-data/rfcs#0021](https://github.com/vortex-data/rfcs/pull/0021)
 - Tracking Issue: [vortex-data/vortex#6719](https://github.com/vortex-data/vortex/issues/6719)
 
 ## Summary
@@ -20,13 +19,13 @@ The key observation is that a list column stored as `(offsets, elements)` is a p
 grouping. Computing `list_sum(list_col)` is a grouped `sum` over the flat elements partitioned
 by offsets. Every aggregate function has a corresponding list scalar function for free:
 
-| Aggregate | List scalar            | Operation                 |
-| --------- | ---------------------- | ------------------------- |
-| `sum`     | `list_sum(list_col)`   | Sum elements per list     |
-| `min`     | `list_min(list_col)`   | Min element per list      |
-| `max`     | `list_max(list_col)`   | Max element per list      |
-| `count`   | `list_count(list_col)` | Count non-null per list   |
-| `mean`    | `list_mean(list_col)`  | Mean of elements per list |
+| Aggregate   | List scalar                | Operation                   |
+| ----------- | -------------------------- | --------------------------- |
+| `sum`       | `list_sum(list_col)`       | Sum elements per list       |
+| `min`       | `list_min(list_col)`       | Min element per list        |
+| `max`       | `list_max(list_col)`       | Max element per list        |
+| `count`     | `list_count(list_col)`     | Count non-null per list     |
+| `mean`      | `list_mean(list_col)`      | Mean of elements per list   |
 | `nan_count` | `list_nan_count(list_col)` | Count NaN elements per list |
 
 Since Vortex does not support shuffling, grouped aggregates only apply to pre-existing groups.
@@ -124,15 +123,15 @@ Each aggregate declares a `state_dtype` — the type of its intermediate accumul
 State is a single `Scalar` whose dtype matches this declaration. For aggregates with multiple
 fields, use a struct dtype:
 
-| Aggregate    | `state_dtype`                            | Example state value                     |
-| ------------ | ---------------------------------------- | --------------------------------------- |
+| Aggregate    | `state_dtype`                            | Example state value                       |
+| ------------ | ---------------------------------------- | ----------------------------------------- |
 | `Sum`        | `i64` (or widened input type)            | `Scalar(42)` — overflow saturates to null |
-| `Count`      | `u64`                                    | `Scalar(7)`                             |
-| `NanCount`   | `u64`                                    | `Scalar(2)`                             |
-| `Min`        | input element type                       | `Scalar(3)`                             |
-| `Mean`       | `Struct { sum: f64, count: u64 }`        | `Scalar({sum: 10.0, count: 5})`         |
-| `IsConstant` | `Struct { value: T, is_constant: bool }` | `Scalar({value: 5, is_constant: true})` |
-| `IsSorted`   | `Struct { last: T, is_sorted: bool }`    | `Scalar({last: 9, is_sorted: true})`    |
+| `Count`      | `u64`                                    | `Scalar(7)`                               |
+| `NanCount`   | `u64`                                    | `Scalar(2)`                               |
+| `Min`        | input element type                       | `Scalar(3)`                               |
+| `Mean`       | `Struct { sum: f64, count: u64 }`        | `Scalar({sum: 10.0, count: 5})`           |
+| `IsConstant` | `Struct { value: T, is_constant: bool }` | `Scalar({value: 5, is_constant: true})`   |
+| `IsSorted`   | `Struct { last: T, is_sorted: bool }`    | `Scalar({last: 9, is_sorted: true})`      |
 
 The `merge` method on `Accumulator` combines a partial state scalar into the currently open
 group. For Sum, this is addition. For IsConstant, this checks whether the incoming value
