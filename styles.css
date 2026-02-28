@@ -8,16 +8,6 @@
   --link-hover: #004499;
   --code-bg: #f5f5f5;
   --accent: #333;
-  --hl-keyword: #a626a4;
-  --hl-string: #50a14f;
-  --hl-comment: #a0a1a7;
-  --hl-function: #4078f2;
-  --hl-number: #986801;
-  --hl-type: #c18401;
-  --hl-built-in: #e45649;
-  --hl-attr: #986801;
-  --hl-symbol: #0184bc;
-  --hl-meta: #a0a1a7;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -31,16 +21,6 @@
     --link-hover: #9acbf7;
     --code-bg: #252525;
     --accent: #ccc;
-    --hl-keyword: #c678dd;
-    --hl-string: #98c379;
-    --hl-comment: #5c6370;
-    --hl-function: #61afef;
-    --hl-number: #d19a66;
-    --hl-type: #e5c07b;
-    --hl-built-in: #e06c75;
-    --hl-attr: #d19a66;
-    --hl-symbol: #56b6c2;
-    --hl-meta: #5c6370;
   }
 }
 
@@ -54,16 +34,6 @@
   --link-hover: #9acbf7;
   --code-bg: #252525;
   --accent: #ccc;
-  --hl-keyword: #c678dd;
-  --hl-string: #98c379;
-  --hl-comment: #5c6370;
-  --hl-function: #61afef;
-  --hl-number: #d19a66;
-  --hl-type: #e5c07b;
-  --hl-built-in: #e06c75;
-  --hl-attr: #d19a66;
-  --hl-symbol: #56b6c2;
-  --hl-meta: #5c6370;
 }
 
 :root[data-theme="light"] {
@@ -76,16 +46,6 @@
   --link-hover: #004499;
   --code-bg: #f5f5f5;
   --accent: #333;
-  --hl-keyword: #a626a4;
-  --hl-string: #50a14f;
-  --hl-comment: #a0a1a7;
-  --hl-function: #4078f2;
-  --hl-number: #986801;
-  --hl-type: #c18401;
-  --hl-built-in: #e45649;
-  --hl-attr: #986801;
-  --hl-symbol: #0184bc;
-  --hl-meta: #a0a1a7;
 }
 
 * {
@@ -499,27 +459,3 @@ footer {
   color: var(--fg-muted);
   font-size: 0.875rem;
 }
-
-/* Syntax highlighting (highlight.js token classes) */
-.hljs { background: var(--code-bg); color: var(--fg); }
-.hljs-keyword,
-.hljs-selector-tag { color: var(--hl-keyword); }
-.hljs-string,
-.hljs-addition { color: var(--hl-string); }
-.hljs-comment,
-.hljs-quote { color: var(--hl-comment); font-style: italic; }
-.hljs-title,
-.hljs-title.function_ { color: var(--hl-function); }
-.hljs-number,
-.hljs-literal { color: var(--hl-number); }
-.hljs-type,
-.hljs-title.class_ { color: var(--hl-type); }
-.hljs-built_in { color: var(--hl-built-in); }
-.hljs-attr,
-.hljs-variable,
-.hljs-template-variable { color: var(--hl-attr); }
-.hljs-symbol,
-.hljs-link { color: var(--hl-symbol); }
-.hljs-meta,
-.hljs-deletion { color: var(--hl-meta); }
-.hljs-punctuation { color: var(--fg-muted); }

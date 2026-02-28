@@ -86,8 +86,6 @@ function baseHTML(title: string, content: string, cssPath: string = "styles.css"
   <link rel="icon" type="image/svg+xml" href="${basePath}vortex_logo.svg">
   <link rel="stylesheet" href="${cssPath}">
   <script>${THEME_SCRIPT}</script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/rust.min.js"></script>
 </head>
 <body>
   <div class="container">
@@ -108,8 +106,7 @@ ${content}
       Vortex RFC Archive
     </footer>
   </div>
-  <script>${TOGGLE_SCRIPT}</script>
-  <script>hljs.highlightAll();</script>${liveReload ? `\n  <script>${LIVE_RELOAD_SCRIPT}</script>` : ""}
+  <script>${TOGGLE_SCRIPT}</script>${liveReload ? `\n  <script>${LIVE_RELOAD_SCRIPT}</script>` : ""}
 </body>
 </html>`;
 }
