@@ -47,9 +47,37 @@ pub trait Accumulator: Send + Sync {
     /// May be called multiple times per group (e.g., chunked elements).
     fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()>;
 
+    /// Merge pre-computed partial state into the currently open group.
+    /// The scalar's dtype must match the aggregate's `state_dtype`.
+    fn merge(&mut self, state: &Scalar) -> VortexResult<()>;
+
+    /// Merge an array of pre-computed states, one per group. Flushes each group.
+    /// The array's dtype must match the aggregate's `state_dtype`.
+    /// Default: scalar_at each element, merge, flush.
+    fn merge_list(&mut self, states: &ArrayRef) -> VortexResult<()> {
+        for i in 0..states.len() {
+            self.merge(&states.scalar_at(i)?)?;
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     /// Finalize the current group: push its result to the output buffer and reset
     /// internal state for the next group.
     fn flush(&mut self) -> VortexResult<()>;
+
+    /// Accumulate all groups defined by a ListView in one call.
+    ///
+    /// Default: slice elements per group, accumulate each, flush each.
+    /// Override for vectorized fast paths (e.g., segmented sum that avoids
+    /// per-group slicing by operating on the flat elements + offsets directly).
+    fn accumulate_list(&mut self, list: &ListViewArray) -> VortexResult<()> {
+        for i in 0..list.len() {
+            self.accumulate(&list.list_elements_at(i)?)?;
+            self.flush()?;
+        }
+        Ok(())
+    }
 
     /// Return all flushed results as a single array. Length = number of flush() calls.
     fn finish(self: Box<Self>) -> VortexResult<ArrayRef>;
@@ -59,12 +87,9 @@ pub trait Accumulator: Send + Sync {
 Usage across all aggregation patterns:
 
 ```rust
-// Grouped (list scalar): one group per list element
+// Grouped (list scalar): fast path processes all groups at once
 let mut acc = aggregate.accumulator(element_dtype)?;
-for i in 0..n_lists {
-    acc.accumulate(&elements.slice(offsets[i]..offsets[i+1])?)?;
-    acc.flush()?;
-}
+acc.accumulate_list(&list_view)?;
 acc.finish()  // ArrayRef of length n_lists
 
 // Ungrouped (full-column): single group, fold across chunks
@@ -78,113 +103,30 @@ acc.finish()  // 1-element ArrayRef
 
 #### Accumulator state
 
-Some aggregates require non-trivial intermediate state to process groups across multiple
-`accumulate` calls. Two good examples:
+Each aggregate declares a `state_dtype` — the type of its intermediate accumulator state.
+State is a single `Scalar` whose dtype matches this declaration. For aggregates with multiple
+fields, use a struct dtype:
 
-**`IsConstant`** — the accumulator must track the value seen so far. If a subsequent batch
-contains a different value, the group is not constant:
+| Aggregate    | `state_dtype`                          | Example state value        |
+|--------------|----------------------------------------|----------------------------|
+| `Sum`        | `i64` (or widened input type)          | `Scalar(42)`               |
+| `Count`      | `u64`                                  | `Scalar(7)`                |
+| `Min`        | input element type                     | `Scalar(3)`                |
+| `Mean`       | `Struct { sum: f64, count: u64 }`      | `Scalar({sum: 10.0, count: 5})` |
+| `IsConstant` | `Struct { value: T, is_constant: bool }` | `Scalar({value: 5, is_constant: true})` |
+| `IsSorted`   | `Struct { last: T, is_sorted: bool }`  | `Scalar({last: 9, is_sorted: true})` |
 
-```rust
-struct IsConstantAccumulator {
-    seen_value: Option<Scalar>,  // None until first non-null element
-    is_constant: bool,
-    output: Vec<bool>,
-}
+The `merge` method on `Accumulator` combines a partial state scalar into the currently open
+group. For Sum, this is addition. For IsConstant, this checks whether the incoming value
+matches the seen value. The `merge_list` method handles multiple groups at once.
 
-impl Accumulator for IsConstantAccumulator {
-    fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()> {
-        if !self.is_constant { return Ok(()); }  // already failed
-        match &self.seen_value {
-            None => {
-                // First batch: record the value if constant
-                if let Some(true) = is_constant(batch.as_ref())? {
-                    self.seen_value = Some(batch.scalar_at(0)?);
-                } else {
-                    self.is_constant = false;
-                }
-            }
-            Some(val) => {
-                // Subsequent batch: check all elements match
-                if let Some(true) = is_constant(batch.as_ref())? {
-                    if &batch.scalar_at(0)? != val {
-                        self.is_constant = false;
-                    }
-                } else {
-                    self.is_constant = false;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> VortexResult<()> {
-        self.output.push(self.is_constant);
-        self.seen_value = None;
-        self.is_constant = true;
-        Ok(())
-    }
-
-    fn finish(self: Box<Self>) -> VortexResult<ArrayRef> {
-        Ok(BoolArray::from_iter(self.output).into_array())
-    }
-}
-```
-
-**`IsSorted`** — the accumulator must track the last value seen to compare against the first
-element of the next batch:
-
-```rust
-struct IsSortedAccumulator {
-    last_value: Option<Scalar>,
-    is_sorted: bool,
-    output: Vec<bool>,
-}
-
-impl Accumulator for IsSortedAccumulator {
-    fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()> {
-        if !self.is_sorted { return Ok(()); }
-        // Check batch is internally sorted
-        if is_sorted(batch.as_ref())? != Some(true) {
-            self.is_sorted = false;
-            return Ok(());
-        }
-        // Check continuity with previous batch
-        if let Some(prev) = &self.last_value {
-            let first = batch.scalar_at(0)?;
-            if first < *prev {
-                self.is_sorted = false;
-                return Ok(());
-            }
-        }
-        self.last_value = Some(batch.scalar_at(batch.len() - 1)?);
-        Ok(())
-    }
-
-    fn flush(&mut self) -> VortexResult<()> {
-        self.output.push(self.is_sorted);
-        self.last_value = None;
-        self.is_sorted = true;
-        Ok(())
-    }
-
-    fn finish(self: Box<Self>) -> VortexResult<ArrayRef> {
-        Ok(BoolArray::from_iter(self.output).into_array())
-    }
-}
-```
-
-These examples show why `accumulate`/`flush`/`finish` is the right decomposition: stateful
-aggregates need to carry intermediate values across chunked input for a single group, then
-reset cleanly at group boundaries. A simpler `execute_grouped(elements, offsets)` one-shot
-API cannot handle chunked elements or streaming input.
-
-Intermediate accumulator state could in the future be stored as typed Vortex arrays or scalars,
-enabling serialization for partial/distributed aggregation (see Future Possibilities).
+This enables encoding-specific optimization (see below) and also lays the groundwork for
+partial/distributed aggregation where intermediate state must be serialized and merged
+across nodes.
 
 ### `AggregateFnVTable`
 
-A new trait parallel to `ScalarFnVTable`. The `accumulator()` method is the required core;
-`execute_grouped` and `execute_scalar` have default implementations built on it:
+A new trait parallel to `ScalarFnVTable`. The only required method is `accumulator()`:
 
 ```rust
 pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
@@ -198,32 +140,23 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
     /// Result dtype per group.
     fn return_dtype(&self, options: &Self::Options, input_dtypes: &[DType]) -> VortexResult<DType>;
 
+    /// DType of the intermediate accumulator state.
+    /// Use a struct dtype when multiple fields are needed (e.g., Mean: {sum: f64, count: u64}).
+    fn state_dtype(&self, options: &Self::Options, input_dtype: &DType) -> VortexResult<DType>;
+
     /// Create an accumulator for streaming aggregation.
     fn accumulator(
         &self,
         options: &Self::Options,
         input_dtype: &DType,
     ) -> VortexResult<Box<dyn Accumulator>>;
-
-    /// One-shot grouped execution over elements + monotonic offsets.
-    /// Default: loop over groups using the accumulator.
-    /// Override for vectorized fast paths (e.g., SIMD segmented reduction).
-    fn execute_grouped(
-        &self,
-        options: &Self::Options,
-        elements: &ArrayRef,
-        offsets: &ArrayRef,
-    ) -> VortexResult<ArrayRef> { /* default impl using accumulator */ }
-
-    /// Ungrouped full-column aggregation returning a scalar.
-    /// Default: single-group execute_grouped with offsets [0, n].
-    fn execute_scalar(
-        &self,
-        options: &Self::Options,
-        input: &ArrayRef,
-    ) -> VortexResult<Scalar> { /* default impl */ }
 }
 ```
+
+All execution flows through the `Accumulator`. Grouped aggregation uses `accumulate_list`;
+ungrouped aggregation uses `accumulate`/`flush`/`finish` directly. There is no need for
+`execute_grouped` or `execute_scalar` methods on the vtable — the accumulator is the single
+entry point, and its `accumulate_list` override is where vectorized fast paths live.
 
 ### Built-in aggregates
 
@@ -239,9 +172,75 @@ pub struct Any;       // logical OR per group (bool input)
 pub struct All;       // logical AND per group (bool input)
 ```
 
-`execute_scalar` replaces standalone `ComputeFn` kernels (e.g., `Sum::execute_scalar` replaces
-`compute::sum()`). Accumulator implementations can start simple (canonicalize + iterate) and
-gain encoding-aware fast paths over time.
+These replace the standalone `ComputeFn` kernels (e.g., `Sum` replaces `compute::sum()`).
+
+### Encoding-specific optimization
+
+Arrays can short-circuit accumulation by producing partial state directly, avoiding
+decompression. This follows the `execute_parent` pattern: the array sees the aggregate
+being applied and returns pre-computed state.
+
+Two new methods on the Array VTable:
+
+```rust
+/// Produce partial accumulator state for the given aggregate, treating the
+/// entire array as a single group.
+/// Returns None to fall back to element-by-element accumulation.
+fn aggregate_parent(
+    &self,
+    array: &Self::Array,
+    aggregate_fn: &AggregateFnRef,
+) -> VortexResult<Option<Scalar>>;
+
+/// Produce partial accumulator state for each group defined by a ListView
+/// over this array. Returns an array of state values (one per group) with
+/// dtype = aggregate_fn.state_dtype() and length = list.len().
+/// Returns None to fall back to per-group accumulation.
+fn aggregate_parent_list(
+    &self,
+    elements: &Self::Array,
+    list: &ListViewArray,
+    aggregate_fn: &AggregateFnRef,
+) -> VortexResult<Option<ArrayRef>>;
+```
+
+**Ungrouped examples** (`aggregate_parent` returns `Option<Scalar>`):
+
+| Encoding           | Aggregate    | Returns                                          |
+|--------------------|--------------|--------------------------------------------------|
+| Constant(5, n=100) | Sum          | `Some(Scalar(500))` — value * len                |
+| Constant(5, n=100) | IsConstant   | `Some({value: 5, is_constant: true})`            |
+| RunEnd([1,5,3], [2,5,8]) | Sum   | `Some(Scalar(26))` — weighted sum                |
+| RunEnd(...)        | Min          | `Some(Scalar(1))` — min of run values            |
+| Primitive          | Sum          | `None` — no shortcut, process elements           |
+
+**Grouped examples** (`aggregate_parent_list` returns `Option<ArrayRef>`):
+
+| Elements encoding  | Aggregate | Optimization                                        |
+|--------------------|-----------|-----------------------------------------------------|
+| Constant(5)        | Sum       | `constant * list.sizes()` — one multiply            |
+| Constant(5)        | IsConstant| All groups constant with same value                 |
+| Dict(codes, values)| Min       | Min code per group → look up value                  |
+| Dict(codes, values)| Max       | Max code per group → look up value                  |
+
+The accumulator wires these into its methods:
+
+```rust
+// In accumulate():
+if let Some(state) = batch.aggregate_parent(&self.aggregate_fn)? {
+    return self.merge(&state);
+}
+// ... fall back to canonical processing
+
+// In accumulate_list() default:
+if let Some(states) = list.elements().aggregate_parent_list(list, &self.aggregate_fn)? {
+    return self.merge_list(&states);
+}
+// ... fall back to per-group slice + accumulate + flush
+```
+
+The encoding doesn't need to know accumulator internals — it produces state matching the
+aggregate's declared `state_dtype`. The accumulator knows how to merge it.
 
 ### `ListAggregate` scalar function
 
@@ -260,10 +259,10 @@ impl ScalarFnVTable for ListAggregate {
     type Options = ListAggregateOptions;
 
     fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
-        let list = args.inputs[0].to_list()?;
-        let elements = list.elements();
-        let offsets = list.offsets();
-        options.aggregate_fn.execute_grouped(elements, offsets)
+        let list = args.inputs[0].to_listview()?;
+        let mut acc = options.aggregate_fn.accumulator(list.elements().dtype())?;
+        acc.accumulate_list(&list)?;
+        acc.finish()
     }
 
     // return_dtype delegates to aggregate_fn.return_dtype over the list element type.
@@ -307,16 +306,17 @@ The details of scan-level push-down are out of scope for this RFC.
 
 ## Migration
 
-`execute_scalar` on each `AggregateFnVTable` replaces the equivalent `ComputeFn` kernel:
+Each `ComputeFn` kernel is replaced by creating an accumulator and driving it directly:
 
-| Current `ComputeFn`       | New `AggregateFnVTable`      |
-|---------------------------|------------------------------|
-| `compute::sum()`          | `Sum::execute_scalar()`      |
-| `compute::min_max()`      | `Min/Max::execute_scalar()`  |
-| `compute::is_constant()`  | `IsConstant::execute_scalar()` |
-| `compute::is_sorted()`    | `IsSorted::execute_scalar()` |
+| Current `ComputeFn`       | New                                                             |
+|---------------------------|-----------------------------------------------------------------|
+| `compute::sum(array)`     | `Sum.accumulator(dtype)` -> accumulate -> flush/finish          |
+| `compute::min_max(array)` | `Min/Max.accumulator(dtype)` -> accumulate -> flush/finish      |
+| `compute::is_constant()`  | `IsConstant.accumulator(dtype)` -> accumulate -> flush/finish   |
+| `compute::is_sorted()`    | `IsSorted.accumulator(dtype)` -> accumulate -> flush/finish     |
 
-Existing `ComputeFn` APIs can be kept as thin wrappers during transition.
+Convenience functions (e.g., `compute::sum()`) can be kept as thin wrappers that create an
+accumulator, feed the array, flush, and extract the scalar result.
 
 ## Compatibility
 
@@ -359,9 +359,9 @@ typed matching without a new array type.
 
 ## Future Possibilities
 
-- **Partial aggregation** (`state()` / `merge()`): serialize intermediate accumulator state
-  for distributed execution. Accumulator state stored as typed Vortex scalars/arrays would
-  enable this naturally.
+- **Partial aggregation** (`state()` / distributed `merge`): the `state_dtype` and `merge`
+  infrastructure enables serializing intermediate state for distributed execution. A
+  `state()` export method on `Accumulator` would complete this.
 
 - **Aggregate push-down in Scan**: using reduce rules to push aggregates into `LayoutReader`,
   computing results during file scan without materializing full columns.
