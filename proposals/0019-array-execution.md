@@ -1,6 +1,5 @@
 - Start Date: 2026-02-25
-- RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
-- Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
+- RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/19)
 
 ## Summary
 
