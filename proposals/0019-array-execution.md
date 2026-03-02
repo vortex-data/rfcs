@@ -36,11 +36,9 @@ fn reduce_parent(
 ) -> VortexResult<Option<ArrayRef>>;
 
 // Execution. May read data buffers.
-fn execute(
-    array: &Self::Array, ctx: &mut ExecutionCtx,
-) -> VortexResult<ExecutionStep>;
+fn execute(array: &Self::Array) -> VortexResult<ExecutionStep>;
 fn execute_parent(
-    array: &Self::Array, parent: &ArrayRef, child_idx: usize, ctx: &mut ExecutionCtx,
+    array: &Self::Array, parent: &ArrayRef, child_idx: usize,
 ) -> VortexResult<Option<ArrayRef>>;
 ```
 
@@ -50,8 +48,13 @@ pub enum ExecutionStep {
     /// then call execute on this array again.
     ExecuteChild(usize),
 
+    /// Columnarize the child at this index (canonicalize without
+    /// cross-step optimization or execute_parent), replace it,
+    /// then call execute on this array again.
+    ColumnarizeChild(usize),
+
     /// Execution is complete.
-    Done(Columnar),
+    Done(ArrayRef),
 }
 ```
 
@@ -65,7 +68,9 @@ control to the scheduler.
 
 - `ExecuteChild(i)` asks the scheduler to execute child `i` to columnar, replace it, and call
   `execute` again.
-- `Done(columnar)` returns the final columnar result.
+- `ColumnarizeChild(i)` asks the scheduler to columnarize child `i` (canonicalize without
+  cross-step optimization or execute_parent), replace it, and call `execute` again.
+- `Done(result)` returns the final result.
 
 **execute_parent** returns `Option<ArrayRef>`. `None` means the child can't handle this parent.
 `Some(result)` means it handled the parent — the result can be in **any encoding**, not just
@@ -115,14 +120,19 @@ fn execute_to_columnar(root: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<C
         }
 
         // Execute
-        match current.vtable().execute(&current, ctx)? {
+        match current.vtable().execute(&current)? {
             ExecutionStep::ExecuteChild(i) => {
                 let child = current.child(i);
                 stack.push((current, i));
                 current = optimize_recursive(child, ctx)?;
             }
+            ExecutionStep::ColumnarizeChild(i) => {
+                let child = current.child(i);
+                stack.push((current, i));
+                current = child;
+            }
             ExecutionStep::Done(result) => {
-                current = result.into_array();
+                current = result;
             }
         }
     }
@@ -179,11 +189,11 @@ We use option 3. The cache is dropped when the `ExecutionCtx` is dropped.
 **DictArray** — execute codes into Primitive, then gather:
 
 ```rust
-fn execute(dict: &DictArray, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionStep> {
+fn execute(dict: &DictArray) -> VortexResult<ExecutionStep> {
     let Some(codes) = dict.codes().as_opt::<PrimitiveVTable>() else {
         return Ok(ExecutionStep::ExecuteChild(0));
     };
-    let gathered = gather(dict.values(), codes, ctx)?;
+    let gathered = gather(dict.values(), codes)?;
     Ok(ExecutionStep::Done(gathered))
 }
 ```
@@ -195,13 +205,13 @@ runs.
 **ScalarFnArray** — columnarize children left-to-right, then evaluate:
 
 ```rust
-fn execute(sfn: &ScalarFnArray, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionStep> {
+fn execute(sfn: &ScalarFnArray) -> VortexResult<ExecutionStep> {
     for (i, child) in sfn.children().iter().enumerate() {
         if child.as_opt::<AnyColumnar>().is_none() {
             return Ok(ExecutionStep::ExecuteChild(i));
         }
     }
-    let result = sfn.scalar_fn().execute(sfn.columnar_children(), ctx)?;
+    let result = sfn.scalar_fn().execute(sfn.columnar_children())?;
     Ok(ExecutionStep::Done(result))
 }
 ```
@@ -212,20 +222,20 @@ when choosing input order — the first input is executed first.
 **FilterArray** — columnarize child, then apply mask:
 
 ```rust
-fn execute(filter: &FilterArray, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionStep> {
+fn execute(filter: &FilterArray) -> VortexResult<ExecutionStep> {
     let Some(child) = filter.child().as_opt::<AnyCanonical>() else {
         return Ok(ExecutionStep::ExecuteChild(0));
     };
     let filtered = filter.mask().apply_to(child.into())?;
-    Ok(ExecutionStep::Done(Columnar::Canonical(filtered)))
+    Ok(ExecutionStep::Done(filtered.into_array()))
 }
 ```
 
 **BitPacked** — leaf, decompresses directly:
 
 ```rust
-fn execute(bp: &BitPackedArray, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionStep> {
-    Ok(ExecutionStep::Done(Columnar::Canonical(Canonical::Primitive(unpack(bp)?))))
+fn execute(bp: &BitPackedArray) -> VortexResult<ExecutionStep> {
+    Ok(ExecutionStep::Done(unpack(bp)?.into_array()))
 }
 ```
 
@@ -246,23 +256,13 @@ inspect the tree after each step. If an encoding the exporter cares about become
 (DictArray for DuckDB dictionary vectors, FSST for DuckDB FSST vectors), the exporter
 intercepts it without decompressing.
 
-### Removing ExecutionCtx from VTable methods
+### No ExecutionCtx in VTable methods
 
-The `execute` and `execute_parent` signatures shown above accept `&mut ExecutionCtx`. This gives
-encodings the ability to recursively execute children, bypassing the scheduler's caching and
-cross-step optimization. Nothing in the type system prevents it.
+`execute` and `execute_parent` do not receive `ExecutionCtx`. The scheduler owns all execution
+state (cache, tracing). The method signature itself communicates "return a step, don't execute
+anything" — encodings cannot recursively execute children because they have no mechanism to do so.
 
-A stronger design: remove `ExecutionCtx` from the VTable method signatures entirely. The
-scheduler owns the execution state (cache, tracing). `execute` receives no context. The method signature itself
-communicates "return a step, don't execute anything."
-
-This also eliminates the current ergonomic friction of
-`let ctx = session.create_execution_ctx(); array.execute(&mut ctx)` — callers just call the
-scheduler directly.
-
-If `execute_parent` also yields `ExecutionStep` (see unresolved questions), the same argument
-applies: it gets resource access but not execution power. The scheduler is the only code that
-drives execution.
+Callers invoke the scheduler directly rather than calling `array.execute(&mut ctx)`.
 
 ### Decompress-into-buffer
 
