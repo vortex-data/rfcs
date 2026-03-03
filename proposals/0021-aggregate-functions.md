@@ -20,7 +20,7 @@ grouping. Computing `list_sum(list_col)` is a grouped `sum` over the flat elemen
 by offsets. Every aggregate function has a corresponding list scalar function for free:
 
 | Aggregate   | List scalar                | Operation                   |
-| ----------- | -------------------------- | --------------------------- |
+|-------------|----------------------------|-----------------------------|
 | `sum`       | `list_sum(list_col)`       | Sum elements per list       |
 | `min`       | `list_min(list_col)`       | Min element per list        |
 | `max`       | `list_max(list_col)`       | Max element per list        |
@@ -124,7 +124,7 @@ State is a single `Scalar` whose dtype matches this declaration. For aggregates 
 fields, use a struct dtype:
 
 | Aggregate    | `state_dtype`                            | Example state value                       |
-| ------------ | ---------------------------------------- | ----------------------------------------- |
+|--------------|------------------------------------------|-------------------------------------------|
 | `Sum`        | `i64` (or widened input type)            | `Scalar(42)` — overflow saturates to null |
 | `Count`      | `u64`                                    | `Scalar(7)`                               |
 | `NanCount`   | `u64`                                    | `Scalar(2)`                               |
@@ -228,7 +228,7 @@ fn aggregate_list(
 **Ungrouped examples** (`aggregate` returns `Option<Scalar>`):
 
 | Encoding                 | Aggregate  | Returns                                |
-| ------------------------ | ---------- | -------------------------------------- |
+|--------------------------|------------|----------------------------------------|
 | Constant(5, n=100)       | Sum        | `Some(Scalar(500))` — value \* len     |
 | Constant(5, n=100)       | IsConstant | `Some({value: 5, is_constant: true})`  |
 | RunEnd([1,5,3], [2,5,8]) | Sum        | `Some(Scalar(26))` — weighted sum      |
@@ -238,7 +238,7 @@ fn aggregate_list(
 **Grouped examples** (`aggregate_list` returns `Option<ArrayRef>`):
 
 | Elements encoding   | Aggregate  | Optimization                             |
-| ------------------- | ---------- | ---------------------------------------- |
+|---------------------|------------|------------------------------------------|
 | Constant(5)         | Sum        | `constant * list.sizes()` — one multiply |
 | Constant(5)         | IsConstant | All groups constant with same value      |
 | Dict(codes, values) | Min        | Min code per group → look up value       |
