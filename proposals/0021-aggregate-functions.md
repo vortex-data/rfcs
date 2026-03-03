@@ -21,7 +21,7 @@ A list column stored as `(offsets, elements)` is a pre-materialized grouping. Co
 aggregate function has a corresponding list scalar function for free:
 
 | Aggregate   | List scalar                | Operation                   |
-|-------------|----------------------------|-----------------------------|
+| ----------- | -------------------------- | --------------------------- |
 | `sum`       | `list_sum(list_col)`       | Sum elements per list       |
 | `min`       | `list_min(list_col)`       | Min element per list        |
 | `max`       | `list_max(list_col)`       | Max element per list        |
@@ -83,7 +83,7 @@ Each aggregate declares a `state_dtype` (Vortex dtype) and a `GroupState` (Rust-
 representation). For multi-field state, use a struct dtype:
 
 | Aggregate    | `state_dtype`                            | `GroupState` example                      |
-|--------------|------------------------------------------|-------------------------------------------|
+| ------------ | ---------------------------------------- | ----------------------------------------- |
 | `Sum`        | `i64` (or widened input type)            | `SumState::I64(Some(42))`                 |
 | `Count`      | `u64`                                    | `u64`                                     |
 | `Min`        | input element type                       | `MinState::I32(Some(3))`                  |
@@ -216,13 +216,13 @@ fn aggregate_list(
 ) -> VortexResult<Option<ArrayRef>>;
 ```
 
-| Encoding / Elements     | Aggregate  | Optimization                           |
-|--------------------------|------------|----------------------------------------|
-| Constant(5, n=100)       | Sum        | `value * len`                          |
-| RunEnd([1,5,3], [2,5,8]) | Sum        | weighted sum of run values             |
-| Primitive (grouped)      | Sum        | segmented sum: one pass over flat buffer + offsets |
-| Constant(5) (grouped)    | Sum        | `value * list.sizes()`                 |
-| Dict(codes, values)      | Min        | min code per group → lookup value      |
+| Encoding / Elements      | Aggregate | Optimization                                       |
+| ------------------------ | --------- | -------------------------------------------------- |
+| Constant(5, n=100)       | Sum       | `value * len`                                      |
+| RunEnd([1,5,3], [2,5,8]) | Sum       | weighted sum of run values                         |
+| Primitive (grouped)      | Sum       | segmented sum: one pass over flat buffer + offsets |
+| Constant(5) (grouped)    | Sum       | `value * list.sizes()`                             |
+| Dict(codes, values)      | Min       | min code per group → lookup value                  |
 
 #### `aggregate_list` kernel dispatch
 
