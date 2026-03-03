@@ -34,10 +34,10 @@ Two binaries in a standalone crate (`vortex-test/compat-gen/`), not a workspace 
                           └────────────┘
 ```
 
-| Binary         | Purpose                                                                          |
-| -------------- | -------------------------------------------------------------------------------- |
-| `compat-gen`   | Write fixture `.vortex` files + a `manifest.json` listing them                   |
-| `compat-test`  | Fetch fixtures from S3, read them, rebuild expected arrays, `assert_arrays_eq!`  |
+| Binary        | Purpose                                                                         |
+| ------------- | ------------------------------------------------------------------------------- |
+| `compat-gen`  | Write fixture `.vortex` files + a `manifest.json` listing them                  |
+| `compat-test` | Fetch fixtures from S3, read them, rebuild expected arrays, `assert_arrays_eq!` |
 
 When cherry-picked onto an old release branch the only thing that changes is a thin API adapter layer (~20 lines that call the version's write/read API). Everything else — fixture definitions, correctness checks — stays identical.
 
@@ -45,24 +45,24 @@ When cherry-picked onto an old release branch the only thing that changes is a t
 
 **Synthetic fixtures** (deterministic, hardcoded values):
 
-| File                   | Schema                                         | Data                                    | Purpose                  |
-| ---------------------- | ---------------------------------------------- | --------------------------------------- | ------------------------ |
-| `primitives.vortex`    | `Struct{u8, u16, u32, u64, i32, i64, f32, f64}` | Boundary values (0, min, max) per type | Primitive type round-trip |
-| `strings.vortex`       | `Struct{Utf8}`                                 | `["", "hello", "こんにちは", "🦀"]`     | String encoding round-trip |
-| `booleans.vortex`      | `Struct{Bool}`                                 | `[true, false, true, true, false]`      | Bool round-trip          |
-| `nullable.vortex`      | `Struct{Nullable<i32>, Nullable<Utf8>}`        | Mix of values and nulls                 | Null handling            |
-| `struct_nested.vortex` | `Struct{Struct{i32, Utf8}, f64}`               | Nested struct                           | Nested type round-trip   |
-| `chunked.vortex`       | Chunked `Struct{u32}`                          | 3 chunks of 1000 rows each             | Multi-chunk files        |
+| File                   | Schema                                          | Data                                   | Purpose                    |
+| ---------------------- | ----------------------------------------------- | -------------------------------------- | -------------------------- |
+| `primitives.vortex`    | `Struct{u8, u16, u32, u64, i32, i64, f32, f64}` | Boundary values (0, min, max) per type | Primitive type round-trip  |
+| `strings.vortex`       | `Struct{Utf8}`                                  | `["", "hello", "こんにちは", "🦀"]`    | String encoding round-trip |
+| `booleans.vortex`      | `Struct{Bool}`                                  | `[true, false, true, true, false]`     | Bool round-trip            |
+| `nullable.vortex`      | `Struct{Nullable<i32>, Nullable<Utf8>}`         | Mix of values and nulls                | Null handling              |
+| `struct_nested.vortex` | `Struct{Struct{i32, Utf8}, f64}`                | Nested struct                          | Nested type round-trip     |
+| `chunked.vortex`       | Chunked `Struct{u32}`                           | 3 chunks of 1000 rows each             | Multi-chunk files          |
 
 Every stable array encoding should also contribute a fixture file — a struct with multiple columns, each using a different encoding of that array type. This ensures that encoding-specific read paths are exercised across versions.
 
 **Realistic fixtures** (real-world schemas and data distributions):
 
-| File                         | Source                              | Rows  | Purpose                                        |
-| ---------------------------- | ----------------------------------- | ----- | ---------------------------------------------- |
-| `tpch_lineitem.vortex`       | TPC-H SF 0.01, `lineitem` table    | ~60K  | Real-world numeric + string schema             |
-| `tpch_orders.vortex`         | TPC-H SF 0.01, `orders` table      | ~15K  | Date + decimal types                           |
-| `clickbench_hits_1k.vortex`  | First 1000 rows of ClickBench `hits` | 1000 | Wide table (105 columns), deep nested types    |
+| File                        | Source                               | Rows | Purpose                                     |
+| --------------------------- | ------------------------------------ | ---- | ------------------------------------------- |
+| `tpch_lineitem.vortex`      | TPC-H SF 0.01, `lineitem` table      | ~60K | Real-world numeric + string schema          |
+| `tpch_orders.vortex`        | TPC-H SF 0.01, `orders` table        | ~15K | Date + decimal types                        |
+| `clickbench_hits_1k.vortex` | First 1000 rows of ClickBench `hits` | 1000 | Wide table (105 columns), deep nested types |
 
 SF 0.01 is used instead of 0.1 to keep fixture file sizes small (~few MB) so downloads in tests are fast.
 
@@ -81,6 +81,7 @@ trait Fixture {
 ```
 
 A single `Fixture` impl is sufficient for both generation and validation:
+
 - `compat-gen` calls `build()` and writes the result to disk
 - `compat-test` calls the same `build()` to produce the expected array and compares it against what was read from the old file via `assert_arrays_eq!`
 
@@ -115,6 +116,7 @@ impl Fixture for TpchLineitemFixture {
 Correctness is validated by **comparing arrays in memory** — no checksums or spot-checks needed.
 
 For every fixture in every version:
+
 1. Download the old `.vortex` file from S3 (written by an older Vortex version)
 2. Read it into an array with the current reader
 3. Call `fixture.build()` to produce the expected array at the current version
@@ -214,6 +216,7 @@ v0.65.0/manifest.json  →  ["primitives.vortex", "strings.vortex", ..., "list.v
 ```
 
 Adding a new fixture:
+
 1. Add the builder function in `fixtures/` (e.g., `build_list_array()`)
 2. Register it in `fixtures/mod.rs` so `compat-gen` includes it
 3. Tag a release — the pre-release CI job generates fixtures including the new one
