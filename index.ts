@@ -442,7 +442,7 @@ async function getHighlighter(): Promise<Highlighter> {
   if (!highlighter) {
     highlighter = await createHighlighter({
       themes: ["github-light", "github-dark"],
-      langs: ["rust", "python", "markdown"],
+      langs: ["rust", "python", "markdown", "cpp", "c"],
     });
   }
   return highlighter;
@@ -552,6 +552,16 @@ async function build(liveReload: boolean = false): Promise<number> {
   const logo = Bun.file("static/vortex_logo.svg");
   if (await logo.exists()) {
     await Bun.write("dist/vortex_logo.svg", await logo.text());
+  }
+
+  // Copy all static assets to dist/static/
+  await $`mkdir -p dist/static`.quiet();
+  const staticGlob = new Bun.Glob("*");
+  for await (const filename of staticGlob.scan("./static")) {
+    const src = Bun.file(`static/${filename}`);
+    const dest = `dist/static/${filename}`;
+    await Bun.write(dest, src);
+    console.log(`Copied static/${filename} -> ${dest}`);
   }
 
   // Generate index page
