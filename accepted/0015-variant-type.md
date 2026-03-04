@@ -28,6 +28,8 @@ Different systems have different variations of this idea, but at its core its a 
 
 Variant types are usually stored in two ways - values that aren't accessed often in some system-specific binary encoding, and some number of "shredded" columns, where a specific key is extracted from the variant and stored in a dense format with a specific type, allowing for much more performant access. This design can make commonly accessed subfields perform like first-class columns, while keeping the overall schema flexible. Shredding policies differ by system, and can be pre-determined or inferred from the data itself or from usage patterns.
 
+This document proposed adding a new `DType` variant named `Variant`, a logical type describing this group of data encodings and behavior, with its own canonical representation (see below).
+
 ### Arrow representation
 
 Arrow now has a new [canonical extension type](https://arrow.apache.org/docs/format/CanonicalExtensions.html#parquet-variant) to represent Parquet's variant type. I think supporting this encoding will be a good start, but it requires supporting Arrow extension types.
@@ -117,7 +119,8 @@ As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type
 ## Unresolved Questions
 
 - Do we want a JSON extension type that automatically compresses as variant?
-- How do variant expressions operate over different variant encodings?
+
+- ~How do variant expressions operate over different variant encodings?~ Resolved this, just had to talk the new execution model with @joseph-isaacs.
 
 ## Future Possibilities
 
