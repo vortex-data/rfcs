@@ -18,12 +18,29 @@ For example, the effort to add `FixedSizeList`
 It is much easier to add wrappers around canonical types (treating the canonical dtype as a
 "storage type") and implement some additional logic than to add a new variant to the `DType` enum.
 
-Vortex provides an `Extension` variant of `DType` to help with this. Currently, implementors can add
-a new extension type by defining an extension ID (for example, `vortex.time` or `vortex.date`) and
-specifying a canonical storage type that behaves like the "physical" type of the extension type.
-For example, the time extension types use a primitive storage type, meaning they wrap the primitive
-scalars or primitive arrays with some extra logic on top (mostly validating that the timestamps are
-valid).
+### Storage DTypes
+
+Extension types work by wrapping an existing canonical `DType`, called the **storage dtype**. The
+storage dtype is itself a logical type (e.g., `Primitive`, `Struct`, `List`), and the extension
+type is a logical wrapper over it that layers on additional semantics such as validation, display
+formatting, and (eventually) custom compute logic.
+
+For example, a `Timestamp` extension type has a `Primitive` storage dtype. Under the hood, a
+timestamp array is just a primitive array of integers, but the extension layer knows that those
+integers represent microseconds since the Unix epoch. Similarly, a `Union` extension type might
+use `Struct` as its storage dtype, wrapping a struct of fields with union-specific dispatch logic.
+
+This separation means that adding a new logical type does not require changes to the core canonical
+type system, the compressor, or the I/O layer. Extension types get compression for free because
+data is always read from and written to disk as the underlying storage dtype.
+
+### Current State
+
+Vortex provides an `Extension` variant of `DType` to help with this. Currently, implementors can
+add a new extension type by defining an extension ID (for example, `vortex.time` or `vortex.date`)
+and specifying a storage dtype. For example, the time extension types use a primitive storage dtype,
+meaning they wrap the primitive scalars or primitive arrays with some extra logic on top (mostly
+validating that the timestamps are valid).
 
 We would like to add many more extension types. Some notable extension types (and their likely
 storage types) include:
@@ -221,7 +238,9 @@ If we can get extension types working well, we can add all of the following type
   [discussion](https://github.com/vortex-data/vortex/discussions/5772#discussioncomment-15279892),
   where we think we can represent this with (`ListView<Utf8>`)
 - `Struct` but with protobuf-style field numbers (`Struct`)
-- **NOT** Variant[^2]
+- **NOT** Variant: see [RFC 0015 (Variant Type)](../accepted/0015-variant-type.md). Variant cannot
+  be an extension type because there is no way to define a storage dtype when the schema is not
+  known ahead of time for each row. Instead, Variant will have its own `DType` variant.
 - And likely more.
 
 [^1]:
@@ -230,7 +249,3 @@ If we can get extension types working well, we can add all of the following type
     effectively be the exact same but with the overhead of tracking indices for each of the child
     fields. In that case, it might just be better to always use a "sparse" union and let the
     compressor decide what to do.
-
-[^2]:
-    We likely cannot implement `Variant` as an extension type because we have no way of defining
-    what the storage type would be (since the schema is not known ahead of time for each row).
