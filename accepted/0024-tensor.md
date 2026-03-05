@@ -1,14 +1,17 @@
 - Start Date: 2026-03-04
 - Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
 
+# Fixed-shape Tensor Extension
+
 ## Summary
 
-We would like to add a `FixedShapeTensor` type to Vortex as an extension over `FixedSizeList`. This
-RFC proposes the design of a fixed-shape tensor with contiguous backing memory.
+We would like to add a `FixedShapeTensor` type to Vortex as an extension type backed by
+`FixedSizeList`. This RFC proposes the design of a fixed-shape tensor with contiguous backing
+memory.
 
 ## Motivation
 
-#### Tensors in the wild
+### Tensors in the wild
 
 Tensors are multi-dimensional (n-dimensional) arrays that generalize vectors (1D) and matrices (2D)
 to arbitrary dimensions. They are quite common in ML/AI and scientific computing applications. To
@@ -18,7 +21,7 @@ name just a few examples:
 - Multi-dimensional sensor or time-series data
 - Embedding vectors from language models and recommendation systems
 
-#### Fixed-shape tensors in Vortex
+### Fixed-shape tensors in Vortex
 
 In the current version of Vortex, there are two ways to represent fixed-shape tensors using the
 `FixedSizeList` `DType`, and neither seems satisfactory.
@@ -63,7 +66,7 @@ for this tensor would be `FixedSizeList<i32, 24>` since `2 x 3 x 4 = 24`.
 
 This is equivalent to the design of Arrow's canonical Fixed Shape Tensor extension type. For
 discussion on why we choose not to represent tensors as nested FSLs (for example
-`FixedSizeList<FixedSizeList<FixedSizeList<i32, 2>, 3>, 4>`), see the [alternatives](#alternatives)
+`FixedSizeList<FixedSizeList<FixedSizeList<i32, 4>, 3>, 2>`), see the [alternatives](#alternatives)
 section.
 
 ### Element Type
@@ -97,8 +100,8 @@ This is a restriction we can relax in the future if a compelling use case arises
 
 Theoretically, we only need the dimensions of the tensor to have a useful Tensor type. However, we
 likely also want two other pieces of information, the dimension names and the permutation order,
-which mimics the [Arrow Fixed Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor)
-type (which is a Canonical Extension type).
+which aligns with Arrow's [Fixed Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor)
+canonical extension type.
 
 Here is what the metadata of the `FixedShapeTensor` extension type in Vortex might look like (in
 Rust):
@@ -240,7 +243,7 @@ elements in a tensor is the product of its shape dimensions, and that the
 
 0D tensors have an empty shape `[]` and contain exactly one element (since the product of no
 dimensions is 1). These represent scalar values wrapped in the tensor type. The storage type is
-`FixedSizeList<p, 1>` (which is identical to a flat `PrimitiveArray`).
+`FixedSizeList<p, 1>` (semantically equivalent to a flat `PrimitiveArray`).
 
 #### Size-0 dimensions
 
@@ -255,7 +258,8 @@ dimensions of size 0 are valid (e.g., `np.zeros((3, 0, 4))`). PyTorch supports 0
 v0.4.0 and also allows size-0 dimensions.
 
 Arrow's Fixed Shape Tensor spec, however, requires at least one dimension (`ndim >= 1`), so 0D
-tensors would need special handling during Arrow conversion (we would likely just panic).
+tensors would need special handling during Arrow conversion (e.g., returning an error or unwrapping
+to a scalar).
 
 ### Compression
 
@@ -376,25 +380,25 @@ _Note: This section was Claude-researched._
 
 ## Future Possibilities
 
-#### Variable-shape tensors
+### Variable-shape tensors
 
 Arrow defines a
 [Variable Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#variable-shape-tensor)
 extension type for arrays where each tensor can have a different shape. This would enable workloads
 like batched sequences of different lengths.
 
-#### Sparse tensors
+### Sparse tensors
 
 A sparse tensor type could use `List` or `ListView` as its storage type to efficiently represent
 tensors with many zero or absent elements.
 
-#### A unified `Tensor` type
+### A unified `Tensor` type
 
 This RFC proposes `FixedShapeTensor` as a single, concrete extension type. However, tensors
 naturally vary along two axes: shape (fixed vs. variable) and density (dense vs. sparse). Both a
 variable-shape tensor (fixed dimensionality, variable shape per element) and a sparse tensor would
-need a different storage type, since it needs to efficiently skip over zero or null regions (and
-for both this would likely be `List` or `ListView`).
+need a different storage type, since it needs to efficiently skip over zero or null regions (and for
+both, this would likely be `List` or `ListView`).
 
 Each combination would be its own extension type (`FixedShapeTensor`, `VariableShapeTensor`,
 `SparseFixedShapeTensor`, etc.), but this proliferates types and fragments any shared tensor logic.
@@ -406,12 +410,12 @@ with and a single place to define tensor operations.
 For now, `FixedShapeTensor` is the only variant we need. The others can be added incrementally
 as use cases arise.
 
-#### Tensor-specific encodings
+### Tensor-specific encodings
 
 Beyond general-purpose compression, encodings tailored to tensor data (e.g., exploiting spatial
 locality across dimensions) could improve compression ratios for specific workloads.
 
-#### ndindex-style compute expressions
+### ndindex-style compute expressions
 
 As the extension type expression system matures, we can implement a rich set of tensor indexing and
 slicing operations inspired by [ndindex](https://quansight-labs.github.io/ndindex/index.html),
