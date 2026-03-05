@@ -3,8 +3,8 @@
 
 ## Summary
 
-We would like to add a Tensor type to Vortex as an extension over `FixedSizeList`. This RFC proposes
-the design of a fixed-shape tensor with contiguous backing memory.
+We would like to add a `FixedShapeTensor` type to Vortex as an extension over `FixedSizeList`. This
+RFC proposes the design of a fixed-shape tensor with contiguous backing memory.
 
 ## Motivation
 
@@ -18,7 +18,7 @@ name just a few examples:
 - Multi-dimensional sensor or time-series data
 - Embedding vectors from language models and recommendation systems
 
-#### Tensors in Vortex
+#### Fixed-shape tensors in Vortex
 
 In the current version of Vortex, there are two ways to represent fixed-shape tensors using the
 `FixedSizeList` `DType`, and neither seems satisfactory.
@@ -54,44 +54,44 @@ fully described here. However, we do know enough that we can present the general
 ### Storage Type
 
 Extension types in Vortex require defining a canonical storage type that represents what the
-extension array looks like when it is canonicalized. For tensors, we will want this storage type to
-be a `FixedSizeList<p, s>`, where `p` is a numeric type (like `u8`, `f64`, or a decimal type), and
-where `s` is the product of all dimensions of the tensor.
+extension array looks like when it is canonicalized. For fixed-shape tensors, we will want this
+storage type to be a `FixedSizeList<p, s>`, where `p` is a primitive type (like `u8`, `f64`, etc.),
+and where `s` is the product of all dimensions of the tensor.
 
 For example, if we want to represent a tensor of `i32` with dimensions `[2, 3, 4]`, the storage type
 for this tensor would be `FixedSizeList<i32, 24>` since `2 x 3 x 4 = 24`.
 
-This is equivalent to the design of Arrow's canonical Tensor extension type. For discussion on why
-we choose not to represent tensors as nested FSLs (for example
+This is equivalent to the design of Arrow's canonical Fixed Shape Tensor extension type. For
+discussion on why we choose not to represent tensors as nested FSLs (for example
 `FixedSizeList<FixedSizeList<FixedSizeList<i32, 2>, 3>, 4>`), see the [alternatives](#alternatives)
 section.
 
 ### Element Type
 
-We restrict tensor element types to `Primitive` and `Decimal`. Tensors are fundamentally about dense
-numeric computation, and operations like transpose, reshape, and slicing rely on uniform, fixed-size
+We restrict tensor element types to `Primitive`. Tensors are fundamentally about dense numeric
+computation, and operations like transpose, reshape, and slicing rely on uniform, fixed-size
 elements whose offsets are computable from strides.
 
-Variable-size types (like strings) would break this model entirely. `Bool` is excluded as well
-because Vortex bit-packs boolean arrays, which conflicts with byte-level stride arithmetic. This
-matches PyTorch, which also restricts tensors to numeric types.
+Variable-size types (like strings) would break this model entirely. `Bool` is excluded because
+Vortex bit-packs boolean arrays, which conflicts with byte-level stride arithmetic. `Decimal` is
+excluded because there are no fast implementations of tensor operations (e.g., matmul) for
+fixed-point types. This matches PyTorch, which also restricts tensors to floating-point and integer
+primitive types.
 
-Theoretically, we could allow more element types in the future, but it should remain a very low
-priority.
+We could allow more element types in the future if a compelling use case arises, but it should
+remain a very low priority.
 
 ### Validity
 
-We define two layers of nullability for tensors: the tensor itself may be null (within a tensor
-array), and individual elements within a tensor may be null. However, we do not support nulling out
-entire sub-dimensions of a tensor (e.g., marking a whole row or slice as null).
+Nullability exists only at the tensor level: within a tensor array, an individual tensor may be
+null, but elements within a tensor may not be. This is because tensor operations like matmul cannot
+be efficiently implemented over nullable elements, and most tensor libraries (e.g., PyTorch) do not
+support per-element nulls either.
 
-The validity bitmap is flat (one bit per element) and follows the same contiguous layout as the
-backing data (just like `FixedSizeList`). This keeps stride-based access straightforward while still
-allowing sparse values within an otherwise dense tensor.
+Since the storage type is `FixedSizeList`, the validity of the tensor array is inherited from the
+`FixedSizeList`'s own validity bitmap (one bit per tensor, not per element).
 
-Note that this design is specifically for a dense tensor. A sparse tensor would likely need to have
-a different representation (or different storage type) in order to compress better (likely `List` or
-`ListView` since it can compress runs of nulls very well).
+This is a restriction we can relax in the future if a compelling use case arises.
 
 ### Metadata
 
@@ -100,12 +100,13 @@ likely also want two other pieces of information, the dimension names and the pe
 which mimics the [Arrow Fixed Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor)
 type (which is a Canonical Extension type).
 
-Here is what the metadata of an extension Tensor type in Vortex will look like (in Rust):
+Here is what the metadata of the `FixedShapeTensor` extension type in Vortex will look like (in
+Rust):
 
 ```rust
-/// Metadata for a [`Tensor`] extension type.
+/// Metadata for a [`FixedShapeTensor`] extension type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TensorMetadata {
+pub struct FixedShapeTensorMetadata {
     /// The shape of the tensor.
     ///
     /// The shape is always defined over row-major storage. May be empty (0D scalar tensor) or
@@ -156,8 +157,8 @@ contiguous in memory without copying any data.
 
 Since our storage type and metadata are designed to match Arrow's Fixed Shape Tensor canonical
 extension type, conversion to and from Arrow is zero-copy (for tensors with at least one dimension).
-The `FixedSizeList` backing memory, shape, dimension names, and permutation all map directly between
-the two representations.
+The `FixedSizeList` backing memory, shape, dimension names, and permutation all map directly
+between the two representations.
 
 #### NumPy and PyTorch
 
@@ -169,13 +170,13 @@ memory with the original without copying. However, this means that non-contiguou
 anywhere, and kernels must handle arbitrary stride patterns. PyTorch supposedly requires many
 operations to call `.contiguous()` before proceeding.
 
-Since Vortex tensors are always contiguous, we can always zero-copy _to_ NumPy and PyTorch since
-both libraries can construct a view from a pointer, shape, and strides. Going the other direction,
-we can only zero-copy _from_ NumPy/PyTorch tensors that are already contiguous.
+Since Vortex fixed-shape tensors are always contiguous, we can always zero-copy _to_ NumPy and
+PyTorch since both libraries can construct a view from a pointer, shape, and strides. Going the
+other direction, we can only zero-copy _from_ NumPy/PyTorch tensors that are already contiguous.
 
-Our proposed design for Vortex Tensors will handle non-contiguous operations differently than the
-Python libraries. Rather than mutating strides to create non-contiguous views, operations like
-slicing, indexing, and `.contiguous()` (after a permutation) would be expressed as lazy
+Our proposed design for Vortex `FixedShapeTensor` will handle non-contiguous operations differently
+than the Python libraries. Rather than mutating strides to create non-contiguous views, operations
+like slicing, indexing, and `.contiguous()` (after a permutation) would be expressed as lazy
 `Expression`s over the tensor.
 
 These expressions describe the operation without materializing it, and when evaluated, they produce
@@ -197,7 +198,7 @@ elements in a tensor is the product of its shape dimensions, and that the
 
 0D tensors have an empty shape `[]` and contain exactly one element (since the product of no
 dimensions is 1). These represent scalar values wrapped in the tensor type. The storage type is
-`FixedSizeList<p, 1>` (which is identical to a flat `PrimitiveArray` or `DecimalArray`).
+`FixedSizeList<p, 1>` (which is identical to a flat `PrimitiveArray`).
 
 #### Size-0 dimensions
 
@@ -225,12 +226,12 @@ leave this as an open question.
 ### Scalar Representation
 
 Once we add the `ScalarValue::Array` variant (see tracking issue
-[vortex#6771](https://github.com/vortex-data/vortex/issues/6771)), we can easily pass around tensors
-as `ArrayRef` scalars as well as lazily computed slices.
+[vortex#6771](https://github.com/vortex-data/vortex/issues/6771)), we can easily pass around
+fixed-shape tensors as `ArrayRef` scalars as well as lazily computed slices.
 
 The `ExtVTable` also requires specifying an associated `NativeValue<'a>` Rust type that an extension
-scalar can be unpacked into. We will want a `NativeTensor<'a>` type that references the backing
-memory of the Tensor, and we can add useful operations to that type.
+scalar can be unpacked into. We will want a `NativeFixedShapeTensor<'a>` type that references the
+backing memory of the tensor, and we can add useful operations to that type.
 
 ## Compatibility
 
@@ -242,8 +243,8 @@ compatibility concerns.
 - **Fixed shape only**: This design only supports tensors where every element in the array has the
   same shape. Variable-shape tensors (ragged arrays) are out of scope and would require a different
   type entirely.
-- **Yet another crate**: We will likely implement this in a `vortex-tensor` crate, which means even
-  more surface area than we already have.
+- **Yet another crate**: We will likely implement this in a `vortex-tensor` crate, which means
+  even more surface area than we already have.
 
 ## Alternatives
 
@@ -301,6 +302,12 @@ _Note: This section was Claude-researched._
   shape and stride metadata. Our design is a subset of this model — we always require contiguous
   memory and derive strides from shape and permutation, as discussed in the
   [conversions](#conversions) section.
+- **[xarray](https://docs.xarray.dev/en/stable/)** extends NumPy with named dimensions and
+  coordinate labels. Its
+  [data model](https://docs.xarray.dev/en/stable/user-guide/terminology.html) attaches names to each
+  dimension and associates "coordinate" arrays along those dimensions (e.g., latitude and longitude
+  values for the rows and columns of a temperature matrix). Our `dim_names` metadata is a subset of
+  xarray's model; coordinate arrays could be a future extension.
 - **[ndindex](https://quansight-labs.github.io/ndindex/index.html)** is a Python library that
   provides a unified interface for representing and manipulating NumPy array indices (slices,
   integers, ellipses, boolean arrays, etc.). It supports operations like canonicalization, shape
@@ -312,8 +319,8 @@ _Note: This section was Claude-researched._
 
 - **TACO (Tensor Algebra Compiler)** separates the tensor storage format from the tensor program.
   Each dimension can independently be specified as dense or sparse, and dimensions can be reordered.
-  The Vortex approach of storing tensors as flat contiguous memory with a permutation is one specific
-  point in TACO's format space (all dimensions dense, with a specific dimension ordering).
+  The Vortex approach of storing tensors as flat contiguous memory with a permutation is one
+  specific point in TACO's format space (all dimensions dense, with a specific dimension ordering).
 
 ## Unresolved Questions
 
@@ -333,8 +340,26 @@ like batched sequences of different lengths.
 
 #### Sparse tensors
 
-A similar Sparse Tensor type could use `List` or `ListView` as its storage type to efficiently
-represent tensors with many null or zero elements, as noted in the [validity](#validity) section.
+A sparse tensor type could use `List` or `ListView` as its storage type to efficiently represent
+tensors with many zero or absent elements.
+
+#### A unified `Tensor` type
+
+This RFC proposes `FixedShapeTensor` as a single, concrete extension type. However, tensors
+naturally vary along two axes: shape (fixed vs. variable) and density (dense vs. sparse). Both a
+variable-shape tensor (fixed dimensionality, variable shape per element) and a sparse tensor would
+need a different storage type, since it needs to efficiently skip over zero or null regions (and
+for both this would likely be `List` or `ListView`).
+
+Each combination would be its own extension type (`FixedShapeTensor`, `VariableShapeTensor`,
+`SparseFixedShapeTensor`, etc.), but this proliferates types and fragments any shared tensor logic.
+With the matching system on extension types, we could instead define a single unified `Tensor` type
+that covers all combinations, dispatching to the appropriate storage type and metadata based on the
+specific variant. This would be more complex to implement but would give users a single type to work
+with and a single place to define tensor operations.
+
+For now, `FixedShapeTensor` is the only variant we need. The others can be added incrementally
+as use cases arise.
 
 #### Tensor-specific encodings
 
