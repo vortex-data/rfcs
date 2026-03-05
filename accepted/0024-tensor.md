@@ -104,25 +104,29 @@ Here is what the metadata of the `FixedShapeTensor` extension type in Vortex wil
 Rust):
 
 ```rust
-/// Metadata for a [`FixedShapeTensor`] extension type.
+/// Metadata for a `FixedShapeTensor` extension type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FixedShapeTensorMetadata {
-    /// The shape of the tensor.
+    /// The logical shape of the tensor.
     ///
-    /// The shape is always defined over row-major storage. May be empty (0D scalar tensor) or
-    /// contain dimensions of size 0 (degenerate tensor).
-    shape: Vec<usize>,
+    /// `logical_shape[i]` is the size of the `i`-th logical dimension. When a `permutation` is
+    /// present, the physical shape (i.e., the row-major memory layout) is derived as
+    /// `physical_shape[permutation[i]] = logical_shape[i]`.
+    ///
+    /// May be empty (0D scalar tensor) or contain dimensions of size 0 (degenerate tensor).
+    logical_shape: Vec<usize>,
 
-    /// Optional names for each dimension. Each name corresponds to a dimension in the `shape`.
+    /// Optional names for each logical dimension. Each name corresponds to an entry in
+    /// `logical_shape`.
     ///
-    /// If names exist, there must be an equal number of names to dimensions.
+    /// If names exist, there must be an equal number of names to logical dimensions.
     dim_names: Option<Vec<String>>,
 
-    /// The permutation of the tensor's dimensions, mapping each logical dimension to its
-    /// corresponding physical dimension: `permutation[logical] = physical`.
+    /// The permutation of the tensor's dimensions. `permutation[i]` is the physical dimension
+    /// index that logical dimension `i` maps to.
     ///
-    /// If this is `None`, then the logical and physical layout are equal, and the permutation is
-    /// in-order `[0, 1, ..., N-1]`.
+    /// If this is `None`, then the logical and physical layouts are identical, equivalent to
+    /// the identity permutation `[0, 1, ..., N-1]`.
     permutation: Option<Vec<usize>>,
 }
 ```
