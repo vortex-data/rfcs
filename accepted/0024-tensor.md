@@ -100,7 +100,7 @@ likely also want two other pieces of information, the dimension names and the pe
 which mimics the [Arrow Fixed Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor)
 type (which is a Canonical Extension type).
 
-Here is what the metadata of the `FixedShapeTensor` extension type in Vortex will look like (in
+Here is what the metadata of the `FixedShapeTensor` extension type in Vortex might look like (in
 Rust):
 
 ```rust
@@ -131,6 +131,9 @@ pub struct FixedShapeTensorMetadata {
 }
 ```
 
+Note that this metadata would store the _logical_ shape of the tensor, not the physical shape. For
+more info on this, see the [physical vs. logical shape](#physical-vs-logical-shape) discussion.
+
 ### Stride
 
 The stride of a tensor defines the number of elements to skip in memory to move one step along each
@@ -152,37 +155,30 @@ The element at index `[i, j, k]` is located at memory offset `12*i + 4*j + k`.
 
 ### Physical vs. logical shape
 
-When a permutation is present, stride derivation depends on whether `shape` is stored as physical
-or logical (see [unresolved questions](#unresolved-questions)). If `shape` is **physical**
-(matching Arrow's convention), the process is straightforward: compute row-major strides over the
-stored shape, then permute them to get logical strides
-(`logical_stride[i] = physical_stride[perm[i]]`).
+When a permutation is present, stride derivation depends on whether `logical_shape` stores logical
+or physical dimensions. We lean towards storing **logical** dimensions (matching NumPy/PyTorch and
+Vortex's logical type system), though this is not yet finalized (see
+[unresolved questions](#unresolved-questions)).
 
-Continuing the example with physical shape `[2, 3, 4]` and permutation `[2, 0, 1]`, the physical
-strides are `[12, 4, 1]` and the logical strides are
-`[physical_stride[2], physical_stride[0], physical_stride[1]]` = `[1, 12, 4]`.
+With logical shape, we first invert the permutation to recover the physical shape
+(`physical_shape[perm[i]] = logical_shape[i]`), compute row-major strides over that, then map them
+back to logical order.
 
-If `shape` is **logical**, we must first invert the permutation to recover the physical shape
-(`physical_shape[perm[l]] = shape[l]`), compute row-major strides over that, then map them back to
-logical order.
+For example, with logical shape `[4, 2, 3]` and permutation `[2, 0, 1]`: the physical shape is
+`[2, 3, 4]`, physical strides are `[12, 4, 1]`, and logical strides are `[1, 12, 4]`.
 
-For the same example with logical shape `[4, 2, 3]` and permutation `[2, 0, 1]`:
-the physical shape is `[2, 3, 4]`, physical strides are `[12, 4, 1]`, and logical strides are
-`[1, 12, 4]`.
+Alternatively, if we stored **physical** dimensions instead (matching Arrow's convention), stride
+derivation would be simpler: compute row-major strides directly over the stored shape, then permute
+them (`logical_stride[i] = physical_stride[perm[i]]`). For the same tensor with physical shape
+`[2, 3, 4]` and permutation `[2, 0, 1]`, the result is the same: `[1, 12, 4]`.
 
-We want to emphasize that this is the same result, but with an extra inversion step. In either case,
-logical strides are always a permutation of the physical strides.
-
-The choice of whether `shape` stores physical or logical dimensions also affects interoperability
-with [Arrow](#arrow) and [NumPy/PyTorch](#numpy-and-pytorch) (see those sections for details), as
-well as stride derivation complexity.
+In either case, logical strides are always a permutation of the physical strides. The cost of
+conversion between conventions is a cheap O(ndim) permutation at the boundary, so the difference is
+more about convention than performance.
 
 Physical shape favors Arrow compatibility and simpler stride math. Logical shape favors
-NumPy/PyTorch compatibility and is arguably more intuitive for our users since Vortex has a logical
-type system.
-
-The cost of conversion in either direction is a cheap O(ndim) permutation at the boundary, so the
-difference is more about convention than performance.
+NumPy/PyTorch compatibility and is arguably more intuitive for users since Vortex has a logical type
+system.
 
 ### Conversions
 
@@ -192,11 +188,10 @@ Our storage type and metadata are designed to closely match Arrow's Fixed Shape 
 extension type. The `FixedSizeList` backing buffer, dimension names, and permutation pass through
 unchanged, making the data conversion itself zero-copy (for tensors with at least one dimension).
 
-Arrow stores `shape` as **physical** (the dimensions of the row-major layout). Whether the `shape`
-field passes through directly depends on the outcome of the
-[physical vs. logical shape](#physical-vs-logical-shape) open question. If Vortex adopts the same
-convention, shape maps directly. If Vortex stores logical shape instead, conversion requires a
-cheap O(ndim) scatter: `arrow_shape[perm[i]] = vortex_shape[i]`.
+Arrow stores `shape` as **physical** (the dimensions of the row-major layout). Since we lean towards
+storing logical shape in Vortex, Arrow conversion will require a cheap O(ndim) scatter:
+`arrow_shape[perm[i]] = vortex_shape[i]`. If we instead adopt physical shape, the field would pass
+through directly.
 
 #### NumPy and PyTorch
 
@@ -208,10 +203,9 @@ memory with the original without copying. However, this means that non-contiguou
 anywhere, and kernels must handle arbitrary stride patterns. PyTorch supposedly requires many
 operations to call `.contiguous()` before proceeding.
 
-NumPy and PyTorch store `shape` as **logical** (the dimensions the user indexes with). If Vortex
-also stores logical shape, the shape field passes through unchanged. If Vortex stores physical
-shape, a cheap O(ndim) permutation is needed at the boundary (see
-[physical vs. logical shape](#physical-vs-logical-shape)).
+NumPy and PyTorch store `shape` as **logical** (the dimensions the user indexes with). Since we lean
+towards storing logical shape in Vortex, the shape field would pass through unchanged. If we instead
+adopt physical shape, a cheap O(ndim) permutation would be needed at the boundary.
 
 Since Vortex fixed-shape tensors always have dense backing memory, we can always zero-copy _to_
 NumPy and PyTorch by passing the buffer pointer, logical shape, and logical strides. A permuted
@@ -372,9 +366,9 @@ _Note: This section was Claude-researched._
 
 ## Unresolved Questions
 
-- Should `shape` store physical dimensions (matching Arrow) or logical dimensions (matching
-  NumPy/PyTorch)? See the [physical vs. logical shape](#physical-vs-logical-shape) discussion in
-  the stride section. The current RFC assumes physical shape, but this is not finalized.
+- Should `logical_shape` store logical dimensions (matching NumPy/PyTorch) or physical dimensions
+  (matching Arrow)? The RFC currently leans towards logical shape, but this is not finalized. See
+  the [physical vs. logical shape](#physical-vs-logical-shape) discussion in the stride section.
 - Are two tensors with different permutations but the same logical values considered equal? This
   affects deduplication and comparisons. The type metadata might be different but the entire tensor
   value might be equal, so it seems strange to say that they are not actually equal?
