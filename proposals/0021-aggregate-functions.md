@@ -82,13 +82,13 @@ so aggregate authors never deal with encoding dispatch or decompression.
 Each aggregate declares a `state_dtype` (Vortex dtype) and a `GroupState` (Rust-native
 representation). For multi-field state, use a struct dtype:
 
-| Aggregate    | `state_dtype`                            | `GroupState` example                      |
-| ------------ | ---------------------------------------- | ----------------------------------------- |
-| `Sum`        | `i64` (or widened input type)            | `SumState::I64(Some(42))`                 |
-| `Count`      | `u64`                                    | `u64`                                     |
-| `Min`        | input element type                       | `MinState::I32(Some(3))`                  |
-| `Mean`       | `Struct { sum: f64, count: u64 }`        | `MeanState { sum: 10.0, count: 5 }`       |
-| `IsConstant` | `Struct { value: T, is_constant: bool }` | `IsConstantState { value: .., is: true }` |
+| Aggregate    | `state_dtype`                                    | `GroupState` example                      |
+|--------------|--------------------------------------------------|-------------------------------------------|
+| `Sum`        | `Option<i64>` (None on overflow)                 | `SumState::I64(Some(42))`                 |
+| `Count`      | `u64`                                            | `u64`                                     |
+| `Min`        | `Option<T>`                                      | `MinState::I32(Some(3))`                  |
+| `Mean`       | `Struct { sum: Option<f64>, count: u64 }`        | `MeanState { sum: Some(10.0), count: 5 }` |
+| `IsConstant` | `Struct { value: Option<T>, is_constant: bool }` | `IsConstantState { value: .., is: true }` |
 
 The `merge` method combines a partial state `Scalar` (produced by encoding-specific
 shortcuts) into the current `GroupState`. This also lays the groundwork for
@@ -100,13 +100,13 @@ partial/distributed aggregation where intermediate state must be serialized and 
 
 ```rust
 pub trait DynAccumulator: Send {
-    fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()>;
-    fn accumulate_list(&mut self, list: &ListViewArray) -> VortexResult<()>;
-    fn merge(&mut self, state: &Scalar) -> VortexResult<()>;
-    fn merge_list(&mut self, states: &ArrayRef) -> VortexResult<()>;
-    fn is_saturated(&self) -> bool;
-    fn flush(&mut self) -> VortexResult<()>;
-    fn finish(self: Box<Self>) -> VortexResult<ArrayRef>;
+  fn accumulate(&mut self, batch: &ArrayRef) -> VortexResult<()>;
+  fn accumulate_groups(&mut self, list: &ListViewArray) -> VortexResult<()>;
+  fn merge(&mut self, state: &Scalar) -> VortexResult<()>;
+  fn merge_groups(&mut self, states: &ArrayRef) -> VortexResult<()>;
+  fn is_saturated(&self) -> bool;
+  fn finish_group(&mut self) -> VortexResult<()>;
+  fn finish(self: Box<Self>) -> VortexResult<ArrayRef>;
 }
 ```
 
@@ -144,27 +144,27 @@ impl<V: AggregateFnVTable> DynAccumulator for Accumulator<V> {
         self.vtable.accumulate(&self.options, &mut self.current, &batch.to_canonical()?)
     }
 
-    fn accumulate_list(&mut self, list: &ListViewArray) -> VortexResult<()> {
+    fn accumulate_groups(&mut self, list: &ListViewArray) -> VortexResult<()> {
         // Try encoding-specific grouped kernel on elements
         if let Some(states) = list.elements().aggregate_list(list, &self.agg_fn_ref)? {
-            return self.merge_list(&states);
+            return self.merge_groups(&states);
         }
         // Per-group fallback
         for i in 0..list.len() {
             self.accumulate(&list.list_elements_at(i)?)?;
-            self.flush()?;
+            self.finish_group()?;
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> VortexResult<()> {
+    fn finish_group(&mut self) -> VortexResult<()> {
         let identity = self.vtable.identity(&self.options, &self.input_dtype)?;
         let state = std::mem::replace(&mut self.current, identity);
         self.results.push(state);
         Ok(())
     }
 
-    // merge, merge_list, is_saturated, finish delegate to vtable
+    // merge, merge_groups, is_saturated, finish delegate to vtable
 }
 ```
 
@@ -173,7 +173,7 @@ Usage:
 ```rust
 // Grouped
 let mut acc = aggregate.accumulator(element_dtype)?;
-acc.accumulate_list(&list_view)?;
+acc.accumulate_groups(&list_view)?;
 acc.finish()
 
 // Ungrouped
@@ -182,7 +182,7 @@ for chunk in chunks {
     if acc.is_saturated() { break; }
     acc.accumulate(&chunk)?;
 }
-acc.flush()?;
+acc.finish_group()?;
 acc.finish()
 ```
 
@@ -244,7 +244,7 @@ segmented sum/min/max, `ConstantVTable` registers algebraic shortcuts).
 
 #### Selectivity trade-offs
 
-`accumulate_list` intentionally does **not** canonicalize the entire elements array. A
+`accumulate_groups` intentionally does **not** canonicalize the entire elements array. A
 ListView can reference a sparse subset of a large elements array (e.g., after filtering
 groups). The dispatch:
 
@@ -274,7 +274,7 @@ impl ScalarFnVTable for ListAggregate {
     fn execute(&self, options: &Self::Options, args: ExecutionArgs) -> VortexResult<ArrayRef> {
         let list = args.inputs[0].to_listview()?;
         let mut acc = options.aggregate_fn.accumulator(list.elements().dtype())?;
-        acc.accumulate_list(&list)?;
+        acc.accumulate_groups(&list)?;
         acc.finish()
     }
 }
