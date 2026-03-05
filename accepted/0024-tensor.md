@@ -1,14 +1,17 @@
 - Start Date: 2026-03-04
 - Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
 
+# Fixed-shape Tensor Extension
+
 ## Summary
 
-We would like to add a `FixedShapeTensor` type to Vortex as an extension over `FixedSizeList`. This
-RFC proposes the design of a fixed-shape tensor with contiguous backing memory.
+We would like to add a `FixedShapeTensor` type to Vortex as an extension type backed by
+`FixedSizeList`. This RFC proposes the design of a fixed-shape tensor with contiguous backing
+memory.
 
 ## Motivation
 
-#### Tensors in the wild
+### Tensors in the wild
 
 Tensors are multi-dimensional (n-dimensional) arrays that generalize vectors (1D) and matrices (2D)
 to arbitrary dimensions. They are quite common in ML/AI and scientific computing applications. To
@@ -18,7 +21,7 @@ name just a few examples:
 - Multi-dimensional sensor or time-series data
 - Embedding vectors from language models and recommendation systems
 
-#### Fixed-shape tensors in Vortex
+### Fixed-shape tensors in Vortex
 
 In the current version of Vortex, there are two ways to represent fixed-shape tensors using the
 `FixedSizeList` `DType`, and neither seems satisfactory.
@@ -63,7 +66,7 @@ for this tensor would be `FixedSizeList<i32, 24>` since `2 x 3 x 4 = 24`.
 
 This is equivalent to the design of Arrow's canonical Fixed Shape Tensor extension type. For
 discussion on why we choose not to represent tensors as nested FSLs (for example
-`FixedSizeList<FixedSizeList<FixedSizeList<i32, 2>, 3>, 4>`), see the [alternatives](#alternatives)
+`FixedSizeList<FixedSizeList<FixedSizeList<i32, 4>, 3>, 2>`), see the [alternatives](#alternatives)
 section.
 
 ### Element Type
@@ -97,35 +100,42 @@ This is a restriction we can relax in the future if a compelling use case arises
 
 Theoretically, we only need the dimensions of the tensor to have a useful Tensor type. However, we
 likely also want two other pieces of information, the dimension names and the permutation order,
-which mimics the [Arrow Fixed Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor)
-type (which is a Canonical Extension type).
+which aligns with Arrow's [Fixed Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#fixed-shape-tensor)
+canonical extension type.
 
-Here is what the metadata of the `FixedShapeTensor` extension type in Vortex will look like (in
+Here is what the metadata of the `FixedShapeTensor` extension type in Vortex might look like (in
 Rust):
 
 ```rust
-/// Metadata for a [`FixedShapeTensor`] extension type.
+/// Metadata for a `FixedShapeTensor` extension type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FixedShapeTensorMetadata {
-    /// The shape of the tensor.
+    /// The logical shape of the tensor.
     ///
-    /// The shape is always defined over row-major storage. May be empty (0D scalar tensor) or
-    /// contain dimensions of size 0 (degenerate tensor).
-    shape: Vec<usize>,
+    /// `logical_shape[i]` is the size of the `i`-th logical dimension. When a `permutation` is
+    /// present, the physical shape (i.e., the row-major memory layout) is derived as
+    /// `physical_shape[permutation[i]] = logical_shape[i]`.
+    ///
+    /// May be empty (0D scalar tensor) or contain dimensions of size 0 (degenerate tensor).
+    logical_shape: Vec<usize>,
 
-    /// Optional names for each dimension. Each name corresponds to a dimension in the `shape`.
+    /// Optional names for each logical dimension. Each name corresponds to an entry in
+    /// `logical_shape`.
     ///
-    /// If names exist, there must be an equal number of names to dimensions.
+    /// If names exist, there must be an equal number of names to logical dimensions.
     dim_names: Option<Vec<String>>,
 
-    /// The permutation of the tensor's dimensions, mapping each logical dimension to its
-    /// corresponding physical dimension: `permutation[logical] = physical`.
+    /// The permutation of the tensor's dimensions. `permutation[i]` is the physical dimension
+    /// index that logical dimension `i` maps to.
     ///
-    /// If this is `None`, then the logical and physical layout are equal, and the permutation is
-    /// in-order `[0, 1, ..., N-1]`.
+    /// If this is `None`, then the logical and physical layouts are identical, equivalent to
+    /// the identity permutation `[0, 1, ..., N-1]`.
     permutation: Option<Vec<usize>>,
 }
 ```
+
+Note that this metadata would store the _logical_ shape of the tensor, not the physical shape. For
+more info on this, see the [physical vs. logical shape](#physical-vs-logical-shape) discussion.
 
 ### Stride
 
@@ -148,37 +158,30 @@ The element at index `[i, j, k]` is located at memory offset `12*i + 4*j + k`.
 
 ### Physical vs. logical shape
 
-When a permutation is present, stride derivation depends on whether `shape` is stored as physical
-or logical (see [unresolved questions](#unresolved-questions)). If `shape` is **physical**
-(matching Arrow's convention), the process is straightforward: compute row-major strides over the
-stored shape, then permute them to get logical strides
-(`logical_stride[i] = physical_stride[perm[i]]`).
+When a permutation is present, stride derivation depends on whether `logical_shape` stores logical
+or physical dimensions. We lean towards storing **logical** dimensions (matching NumPy/PyTorch and
+Vortex's logical type system), though this is not yet finalized (see
+[unresolved questions](#unresolved-questions)).
 
-Continuing the example with physical shape `[2, 3, 4]` and permutation `[2, 0, 1]`, the physical
-strides are `[12, 4, 1]` and the logical strides are
-`[physical_stride[2], physical_stride[0], physical_stride[1]]` = `[1, 12, 4]`.
+With logical shape, we first invert the permutation to recover the physical shape
+(`physical_shape[perm[i]] = logical_shape[i]`), compute row-major strides over that, then map them
+back to logical order.
 
-If `shape` is **logical**, we must first invert the permutation to recover the physical shape
-(`physical_shape[perm[l]] = shape[l]`), compute row-major strides over that, then map them back to
-logical order.
+For example, with logical shape `[4, 2, 3]` and permutation `[2, 0, 1]`: the physical shape is
+`[2, 3, 4]`, physical strides are `[12, 4, 1]`, and logical strides are `[1, 12, 4]`.
 
-For the same example with logical shape `[4, 2, 3]` and permutation `[2, 0, 1]`:
-the physical shape is `[2, 3, 4]`, physical strides are `[12, 4, 1]`, and logical strides are
-`[1, 12, 4]`.
+Alternatively, if we stored **physical** dimensions instead (matching Arrow's convention), stride
+derivation would be simpler: compute row-major strides directly over the stored shape, then permute
+them (`logical_stride[i] = physical_stride[perm[i]]`). For the same tensor with physical shape
+`[2, 3, 4]` and permutation `[2, 0, 1]`, the result is the same: `[1, 12, 4]`.
 
-We want to emphasize that this is the same result, but with an extra inversion step. In either case,
-logical strides are always a permutation of the physical strides.
-
-The choice of whether `shape` stores physical or logical dimensions also affects interoperability
-with [Arrow](#arrow) and [NumPy/PyTorch](#numpy-and-pytorch) (see those sections for details), as
-well as stride derivation complexity.
+In either case, logical strides are always a permutation of the physical strides. The cost of
+conversion between conventions is a cheap O(ndim) permutation at the boundary, so the difference is
+more about convention than performance.
 
 Physical shape favors Arrow compatibility and simpler stride math. Logical shape favors
-NumPy/PyTorch compatibility and is arguably more intuitive for our users since Vortex has a logical
-type system.
-
-The cost of conversion in either direction is a cheap O(ndim) permutation at the boundary, so the
-difference is more about convention than performance.
+NumPy/PyTorch compatibility and is arguably more intuitive for users since Vortex has a logical type
+system.
 
 ### Conversions
 
@@ -188,11 +191,10 @@ Our storage type and metadata are designed to closely match Arrow's Fixed Shape 
 extension type. The `FixedSizeList` backing buffer, dimension names, and permutation pass through
 unchanged, making the data conversion itself zero-copy (for tensors with at least one dimension).
 
-Arrow stores `shape` as **physical** (the dimensions of the row-major layout). Whether the `shape`
-field passes through directly depends on the outcome of the
-[physical vs. logical shape](#physical-vs-logical-shape) open question. If Vortex adopts the same
-convention, shape maps directly. If Vortex stores logical shape instead, conversion requires a
-cheap O(ndim) scatter: `arrow_shape[perm[i]] = vortex_shape[i]`.
+Arrow stores `shape` as **physical** (the dimensions of the row-major layout). Since we lean towards
+storing logical shape in Vortex, Arrow conversion will require a cheap O(ndim) scatter:
+`arrow_shape[perm[i]] = vortex_shape[i]`. If we instead adopt physical shape, the field would pass
+through directly.
 
 #### NumPy and PyTorch
 
@@ -204,10 +206,9 @@ memory with the original without copying. However, this means that non-contiguou
 anywhere, and kernels must handle arbitrary stride patterns. PyTorch supposedly requires many
 operations to call `.contiguous()` before proceeding.
 
-NumPy and PyTorch store `shape` as **logical** (the dimensions the user indexes with). If Vortex
-also stores logical shape, the shape field passes through unchanged. If Vortex stores physical
-shape, a cheap O(ndim) permutation is needed at the boundary (see
-[physical vs. logical shape](#physical-vs-logical-shape)).
+NumPy and PyTorch store `shape` as **logical** (the dimensions the user indexes with). Since we lean
+towards storing logical shape in Vortex, the shape field would pass through unchanged. If we instead
+adopt physical shape, a cheap O(ndim) permutation would be needed at the boundary.
 
 Since Vortex fixed-shape tensors always have dense backing memory, we can always zero-copy _to_
 NumPy and PyTorch by passing the buffer pointer, logical shape, and logical strides. A permuted
@@ -242,7 +243,7 @@ elements in a tensor is the product of its shape dimensions, and that the
 
 0D tensors have an empty shape `[]` and contain exactly one element (since the product of no
 dimensions is 1). These represent scalar values wrapped in the tensor type. The storage type is
-`FixedSizeList<p, 1>` (which is identical to a flat `PrimitiveArray`).
+`FixedSizeList<p, 1>` (semantically equivalent to a flat `PrimitiveArray`).
 
 #### Size-0 dimensions
 
@@ -257,7 +258,8 @@ dimensions of size 0 are valid (e.g., `np.zeros((3, 0, 4))`). PyTorch supports 0
 v0.4.0 and also allows size-0 dimensions.
 
 Arrow's Fixed Shape Tensor spec, however, requires at least one dimension (`ndim >= 1`), so 0D
-tensors would need special handling during Arrow conversion (we would likely just panic).
+tensors would need special handling during Arrow conversion (e.g., returning an error or unwrapping
+to a scalar).
 
 ### Compression
 
@@ -368,9 +370,9 @@ _Note: This section was Claude-researched._
 
 ## Unresolved Questions
 
-- Should `shape` store physical dimensions (matching Arrow) or logical dimensions (matching
-  NumPy/PyTorch)? See the [physical vs. logical shape](#physical-vs-logical-shape) discussion in
-  the stride section. The current RFC assumes physical shape, but this is not finalized.
+- Should `logical_shape` store logical dimensions (matching NumPy/PyTorch) or physical dimensions
+  (matching Arrow)? The RFC currently leans towards logical shape, but this is not finalized. See
+  the [physical vs. logical shape](#physical-vs-logical-shape) discussion in the stride section.
 - Are two tensors with different permutations but the same logical values considered equal? This
   affects deduplication and comparisons. The type metadata might be different but the entire tensor
   value might be equal, so it seems strange to say that they are not actually equal?
@@ -378,25 +380,25 @@ _Note: This section was Claude-researched._
 
 ## Future Possibilities
 
-#### Variable-shape tensors
+### Variable-shape tensors
 
 Arrow defines a
 [Variable Shape Tensor](https://arrow.apache.org/docs/format/CanonicalExtensions.html#variable-shape-tensor)
 extension type for arrays where each tensor can have a different shape. This would enable workloads
 like batched sequences of different lengths.
 
-#### Sparse tensors
+### Sparse tensors
 
 A sparse tensor type could use `List` or `ListView` as its storage type to efficiently represent
 tensors with many zero or absent elements.
 
-#### A unified `Tensor` type
+### A unified `Tensor` type
 
 This RFC proposes `FixedShapeTensor` as a single, concrete extension type. However, tensors
 naturally vary along two axes: shape (fixed vs. variable) and density (dense vs. sparse). Both a
 variable-shape tensor (fixed dimensionality, variable shape per element) and a sparse tensor would
-need a different storage type, since it needs to efficiently skip over zero or null regions (and
-for both this would likely be `List` or `ListView`).
+need a different storage type, since it needs to efficiently skip over zero or null regions (and for
+both, this would likely be `List` or `ListView`).
 
 Each combination would be its own extension type (`FixedShapeTensor`, `VariableShapeTensor`,
 `SparseFixedShapeTensor`, etc.), but this proliferates types and fragments any shared tensor logic.
@@ -408,12 +410,12 @@ with and a single place to define tensor operations.
 For now, `FixedShapeTensor` is the only variant we need. The others can be added incrementally
 as use cases arise.
 
-#### Tensor-specific encodings
+### Tensor-specific encodings
 
 Beyond general-purpose compression, encodings tailored to tensor data (e.g., exploiting spatial
 locality across dimensions) could improve compression ratios for specific workloads.
 
-#### ndindex-style compute expressions
+### ndindex-style compute expressions
 
 As the extension type expression system matures, we can implement a rich set of tensor indexing and
 slicing operations inspired by [ndindex](https://quansight-labs.github.io/ndindex/index.html),
