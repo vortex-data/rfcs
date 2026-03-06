@@ -3,8 +3,6 @@
 Make a backwards compatible change to the serialization format for `Patches` used by the FastLanes-derived encodings:
 
 * BitPacked
-* Delta
-* RLE
 * ALP
 * ALP-RD
 
@@ -12,7 +10,7 @@ Make a backwards compatible change to the serialization format for `Patches` use
 
 ## Data Layout
 
-Patches have a new layout, influenced by the G-ALP paper from CWI.
+Patches have a new layout, influenced by the [G-ALP paper](https://ir.cwi.nl/pub/35205/35205.pdf) from CWI.
 
 The key insight of the paper is that instead of holding the patches sorted by their global offset, instead
 
