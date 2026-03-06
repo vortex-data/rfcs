@@ -1,5 +1,5 @@
 - Start Date: 2026-03-04
-- Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
+- RFC PR: [vortex-data/rfcs#24](https://github.com/vortex-data/rfcs/pull/24)
 
 # Fixed-shape Tensor Extension
 
