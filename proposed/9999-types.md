@@ -1,7 +1,7 @@
 - Start Date: 2026-03-06
 - RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
 
-# Formalize the Vortex Type System
+# Vortex Type System
 
 ## Summary
 
@@ -159,7 +159,7 @@ approach is to define **separate reduction relations**, each of which is interna
 
 For example, instead of one global set of reduction rules, you define two strategies: strategy A
 always reduces to normal form X, and strategy B always reduces to normal form Y. Each strategy
-satisfies Church-Rosser independently, the only difference is which normal form they target. 
+satisfies Church-Rosser independently, the only difference is which normal form they target.
 
 In Vortex, a similar scenario would be defining multiple strategies of canonicalization, where one
 strategy could target `List` as a canonical target (normal form) for list data, and another strategy
@@ -345,27 +345,29 @@ For `DType`s where the distinction does not apply (e.g., `Primitive`, `Bool`, `N
 produce the same canonical form. The parameterization only has an effect where multiple valid
 canonical forms exist.
 
+TODO wrap everything up and explain how the type theory helps justify this.
+
 ## Compatibility
 
-- Does this change the file format or wire format? Is it backward/forward compatible?
-- Does this break any public APIs? If so, what is the migration path?
-- Are there performance implications?
-
-If there are no compatibility concerns, briefly state why.
+There shouldn't be any compatibility concerns here because even under a specific `DType`, the array
+tree is fully serialized, and consumers can always convert back and forth between `List` and
+`ListView` if they really need to.
 
 ## Drawbacks
 
-- Why should we _not_ do this?
-- What is the maintenance cost of this change?
-- Does this add complexity that could be avoided?
+The drawback is extra complexity in supporting multiple canonical targets. However, we've also had
+to spend time making optimizations and fixes (`is_zero_copy_to_list` for `ListView`, see
+[vortex#5129](https://github.com/vortex-data/vortex/pull/5129)) because we were forced to always
+canonicalize into a single target. So there is an obvious tradeoff here.
 
 ## Alternatives
 
-- What other designs were considered and why were they rejected?
-- What is the cost of **not** doing this?
-- Is there a simpler approach that gets us most of the way there?
+The alternative is to just not do this. We continue to find workarounds when canonical encodings do
+not fit the use case.
 
 ## Prior Art
+
+TODO
 
 How have other systems solved this or similar problems? Consider:
 
@@ -379,11 +381,16 @@ This section helps frame the design in a broader context. If there is no relevan
 
 - Should `FixedSizeBinary<n>` be a `DType` variant (refinement type) or extension type metadata?
   See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against.
+
+TODO
+
 - What parts of the design need to be resolved during the RFC process?
 - What is explicitly out of scope for this RFC?
 - Are there open questions that can be deferred to implementation?
 
 ## Future Possibilities
+
+TODO
 
 What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
 
