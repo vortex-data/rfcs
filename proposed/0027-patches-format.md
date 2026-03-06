@@ -1,3 +1,7 @@
+- Start Date: 2026-03-02
+- Tracking Issue: TBD
+- Draft PR: https://github.com/vortex-data/vortex/pull/6815
+
 ## Summary
 
 Make a backwards compatible change to the serialization format for `Patches` used by the FastLanes-derived encodings:
