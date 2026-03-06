@@ -277,26 +277,73 @@ Many of our consumers (particularly Arrow FFI boundaries and consumers of DataFu
 because Arrow has is adding support for `ListView` slowly. Other consumers prefer `ListView` because
 some operations (namely random access and potentially dependent operations) are faster.
 
-TODO
+It is highly unfortunate that we cannot canonicalize into different targets, and we are forced to
+always decompress into `ListView`. We have the same constraint on `VarBinView` vs `VarBin`, and
+while we haven't seen as many performance problems, it feels like a constraint that is too
+restrictive in Vortex.
 
 ## Design
 
-Describe the proposed design in enough detail that someone familiar with Vortex could implement it. This should cover:
-
-- New or modified APIs, traits, or vtable entries.
-- How this interacts with existing components (encodings, layouts, scan, file format, etc.).
-- Key implementation details and corner cases.
-- Why is this the best approach in the space of possible designs?
-- Which crates are affected and how the dependency graph changes, if at all.
-
-Use code examples and diagrams where they might help, like this:
+The proposal is to add a new `to_canonical_target` function that accepts a `CanonicalTarget`
+parameter, while keeping the existing `to_canonical` as a convenience that uses the default target.
+This minimizes breaking changes.
 
 ```rust
-pub fn main() {
-    let x = f32::to_bits(100.0f32);
-    dbg!(x);
+/// Canonicalize using the default target. Existing behavior, no breaking change.
+fn to_canonical(array: &Array) -> VortexResult<Canonical> {
+    to_canonical_target(array, CanonicalTarget::Default)
+}
+
+/// Canonicalize into a specific target.
+fn to_canonical_target(array: &Array, target: CanonicalTarget) -> VortexResult<Canonical>;
+```
+
+Where `CanonicalTarget` selects from a family of valid canonical forms:
+
+```rust
+/// A canonicalization target (selects which section to use).
+enum CanonicalTarget {
+    /// The default canonical forms. This is what the current system uses.
+    /// For lists: ListView. For strings: VarBinView.
+    Default,
+    /// Contiguous canonical forms, motivated by Arrow FFI boundaries and
+    /// consumers that need stronger structural guarantees.
+    /// For lists: List (monotonic offsets). For strings: VarBin (contiguous data).
+    Contiguous,
 }
 ```
+
+The `Canonical` enum would use inner enums for the types where multiple canonical forms exist:
+
+```rust
+pub enum CanonicalList {
+    List(ListArray),
+    ListView(ListViewArray),
+}
+
+pub enum CanonicalVarBin {
+    VarBin(VarBinArray),
+    VarBinView(VarBinViewArray),
+}
+
+pub enum Canonical {
+    ...
+    VarBin(CanonicalVarBin),     // Maps to both Utf8 and Binary DTypes.
+    List(CanonicalList),         // Maps to List DType.
+    ...
+}
+
+array.to_canonical()?.scalar_at(i) == array.to_canonical_target(target)?.scalar_at(i)
+```
+
+Each target defines an internally confluent reduction strategy. Within `CanonicalTarget::Default`,
+all paths converge to `ListView`/`VarBinView`. Within `CanonicalTarget::Contiguous`, all paths
+converge to `List`/`VarBin`. The choice of target is thus made by the consumer (query engine,
+FFI boundary, serializer), not by the encoded array.
+
+For `DType`s where the distinction does not apply (e.g., `Primitive`, `Bool`, `Null`), both targets
+produce the same canonical form. The parameterization only has an effect where multiple valid
+canonical forms exist.
 
 ## Compatibility
 
