@@ -1,6 +1,5 @@
 - Start Date: 2025-02-25
 - RFC PR: [vortex-data/rfcs#15](https://github.com/vortex-data/rfcs/pull/15)
-- Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
 
 # Variant Type
 

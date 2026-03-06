@@ -1,5 +1,7 @@
-- Start Date: (today's date, YYYY-MM-DD)
-- Tracking Issue: [vortex-data/vortex#0000](https://github.com/vortex-data/vortex/issues/0000)
+- Start Date: YYYY-MM-DD (today's date)
+- RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
+
+# RFC Template
 
 ## Summary
 

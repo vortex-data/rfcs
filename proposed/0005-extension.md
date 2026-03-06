@@ -1,6 +1,7 @@
-- Start Date: (2026-02-27)
+- Start Date: 2026-02-27
 - RFC PR: [vortex-data/rfcs#5](https://github.com/vortex-data/rfcs/pull/5)
-- Tracking Issue: [vortex-data/vortex#6547](https://github.com/vortex-data/vortex/issues/6547)
+
+# Extension Types
 
 ## Summary
 
