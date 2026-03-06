@@ -34,6 +34,58 @@ The second proposal is to relax (or extend) the concept of a "canonical" type fr
 physical encoding for every logical type (a unique normal form) to allowing many possible canonical
 targets (multiple normal forms).
 
+# Type Theory Background
+
+This section introduces the type-theoretic concepts that underpin Vortex's `DType` system and its
+relationship to physical encodings. To reiterate, most of the maintainers understand these concepts
+intuitively, but there is value in mapping these implicit concepts to explicit theory.
+
+Note that this section made heavy use of LLMs to help research and identify terms and definitions,
+as the author of this RFC is notably _not_ a type theory expert.
+
+## Equivalence Classes and `DType` as a Quotient Type
+
+### In Theory
+
+An **equivalence relation** `~` on a set `S` is a relation that is reflexive (`a ~ a`), symmetric
+(`a ~ b` implies `b ~ a`), and transitive (`a ~ b` and `b ~ c` implies `a ~ c`). An equivalence
+relation partitions `S` into disjoint subsets called **equivalence classes**, where each class
+contains all elements that are equivalent to one another.
+
+A **quotient type** is a data type that falls under the general class of algebraic data types.
+Formally, a quotient type `A / ~` is formed by taking a type `A` and collapsing it by an equivalence
+relation `~`. The elements of the quotient type are the equivalence classes themselves: not
+individual values, but entire groups of values that are considered "the same."
+
+The critical property of a quotient type is that operations on it must be **well-defined**: they
+must produce the same result regardless of which member of the class you operate on. Formally, if
+`f : A → B` respects the equivalence relation (`a ~ a'` implies `f(a) = f(a')`), then `f` descends
+to a well-defined function on the quotient `f' : A/~ → B`.
+
+### In Vortex
+
+Consider the set of all physical array representations / encodings in Vortex: a dictionary-encoded
+`i32` array, a run-end-encoded `i32` array, a bitpacked `i32` array, a flat Arrow `i32` buffer,
+etc.
+
+Two physical encodings are logically equivalent if and only if they produce the same logical
+sequence of values when decoded / decompressed. This equivalence relation partitions the space of
+all physical encodings into equivalence classes, where each class corresponds to a single logical
+column of data.
+
+A Vortex `DType` like `Primitive(I32, NonNullable)` **names** one of these equivalence classes. It
+tells us what logical data we are working with, but says nothing about which physical encoding is
+representing it. Thus, we can say that logical types in Vortex form equivalence classes, and `DType`
+is the set of equivalence classes. More formally, `DType` is the quotient type over the space of
+physical encodings, collapsed by decoded / decompressed equivalence relation.
+
+This quotient structure imposes a concrete requirement: any operation defined on `DType` must
+produce the same result regardless of which physical encoding backs the data.
+
+For example, operations like `filter`, `take`, and `scalar_at` all satisfy this: they depend only on
+the logical values, not on how those values are stored. However, an operation like "return the
+`ends` buffer" is not well-defined on the quotient type as that only exists for run-end encoding.
+
 ## Design
 
 Describe the proposed design in enough detail that someone familiar with Vortex could implement it. This should cover:
@@ -92,3 +144,30 @@ This section helps frame the design in a broader context. If there is no relevan
 ## Future Possibilities
 
 What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
+
+## Further Reading
+
+- **Equivalence classes and partitions.**
+  [Wikipedia: Equivalence class](https://en.wikipedia.org/wiki/Equivalence_class).
+- **Quotient types in type theory.**
+  [nLab: quotient type](https://ncatlab.org/nlab/show/quotient+type).
+  Altenkirch, Anberree, Li, "Quotient Types for Programmers"
+  ([arXiv:1901.01006](https://arxiv.org/abs/1901.01006)).
+- **Sections in category theory.**
+  [Wikipedia: Section (category theory)](<https://en.wikipedia.org/wiki/Section_(category_theory)>).
+- **Church-Rosser property and confluence.**
+  [Wikipedia: Church-Rosser theorem](https://en.wikipedia.org/wiki/Church%E2%80%93Rosser_theorem).
+  [Wikipedia: Confluence](<https://en.wikipedia.org/wiki/Confluence_(abstract_rewriting)>).
+  Baader & Nipkow, _Term Rewriting and All That_ (Cambridge University Press, 1998).
+- **Refinement types.**
+  [Wikipedia: Refinement type](https://en.wikipedia.org/wiki/Refinement_type).
+  Rondon, Kawaguci, Jhala, "Liquid Types"
+  ([DOI:10.1145/1375581.1375602](https://doi.org/10.1145/1375581.1375602)).
+- **Abstract types and existential quantification.**
+  Mitchell & Plotkin, "Abstract Types Have Existential Type"
+  ([DOI:10.1145/44501.45065](https://doi.org/10.1145/44501.45065)).
+- **Type theory textbook.**
+  Pierce, _Types and Programming Languages_ (MIT Press, 2002). Chapters on existential types,
+  subtyping, and type equivalence.
+- **Arrow columnar format.**
+  [Apache Arrow Columnar Format](https://arrow.apache.org/docs/format/Columnar.html).
