@@ -86,6 +86,61 @@ For example, operations like `filter`, `take`, and `scalar_at` all satisfy this:
 the logical values, not on how those values are stored. However, an operation like "return the
 `ends` buffer" is not well-defined on the quotient type as that only exists for run-end encoding.
 
+## Sections and Canonicalization
+
+Observe that every physical array (a specific encoding combined with actual data) maps back to a
+`DType`. A run-end-encoded `i32` array maps to `Primitive(I32)`, as does a dictionary-encoded `i32`
+array. A `VarBinView` array can map to either `Utf8` or `Binary`, depending on whether its contents
+are valid UTF-8. Call this projection `π : Array → DType`.
+
+A **section** is a function going the other direction: `s : DType → Encoding`, that picks one
+specific physical encoding for each logical type, such that projecting back gives you the original
+`DType` (`π(s(d)) = d`). In other words, a section answers the question: "given a logical type,
+which physical encoding should I use to represent it?"
+
+**In Vortex**, the current `to_canonical` function is a section. For each `DType`, it selects
+exactly one canonical physical form. Observe how the `Canonical` enum is essentially identical to
+`DType` enum (with the exception of `VarBinView` with `Utf8` and `Binary`):
+
+```rust
+/// The different logical types in Vortex (the different equivalence classes).
+/// This is the quotient type!
+pub enum DType {
+    Null,
+    Bool(Nullability),
+    Primitive(PType, Nullability),
+    Decimal(DecimalDType, Nullability),
+    Utf8(Nullability),
+    Binary(Nullability),
+    List(Arc<DType>, Nullability),
+    FixedSizeList(Arc<DType>, u32, Nullability),
+    Struct(StructFields, Nullability),
+    Extension(ExtDTypeRef),
+}
+
+/// We "choose" the set of representatives of each of the logical types.
+/// This is the image/result of the `to_canonical` function (where `to_canonical` is the section).
+pub enum Canonical {
+    Null(NullArray),
+    Bool(BoolArray),
+    Primitive(PrimitiveArray),
+    Decimal(DecimalArray),
+    VarBinView(VarBinViewArray), // Note that `VarBinView` maps to both `Utf8` and `Binary`.
+    List(ListViewArray),
+    FixedSizeList(FixedSizeListArray),
+    Struct(StructArray),
+    Extension(ExtensionArray),
+}
+```
+
+More formally, `Canonical` enumerates the **image** of the section function `to_canonical`.
+
+The critical insight is that `Canonical` represents several arbitrary **choices**. For example,
+nothing in the theory privileges `ListView` over `List` as the canonical representative for
+variable-length list data. Both are valid sections (since both pick a representative from the same
+equivalence class), and both satisfy `π(s(d)) = d`. The current system in Vortex simply hardcodes
+one particular section. The second proposal in this RFC is to allow _multiple sections_.
+
 ## Design
 
 Describe the proposed design in enough detail that someone familiar with Vortex could implement it. This should cover:
