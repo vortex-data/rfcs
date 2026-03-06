@@ -141,6 +141,30 @@ variable-length list data. Both are valid sections (since both pick a representa
 equivalence class), and both satisfy `π(s(d)) = d`. The current system in Vortex simply hardcodes
 one particular section. The second proposal in this RFC is to allow _multiple sections_.
 
+## The Church-Rosser Property (Confluence)
+
+A rewriting system has the **Church-Rosser property** (or is **confluent**) if, whenever a term can
+be reduced in two different ways, both reduction paths can be continued to reach the same final
+result (called a **normal form**). For example, the expression `(2 + 3) * (1 + 1)` can be reduced
+by evaluating the left subexpression first (`5 * (1 + 1)`) or the right first (`(2 + 3) * 2`), but
+both paths arrive at `10`.
+
+**In current Vortex**, `to_canonical` is confluent by construction. Applying `take`, `filter`, or
+`scalar_at` before or after canonicalization produces the same logical values. There is one normal
+form per `DType`, and every reduction path reaches it.
+
+A **non-confluent** rewriting system is one where two reduction paths from the same starting point
+can arrive at different normal forms. Non-confluent systems are well-studied, and the standard
+approach is to define **separate reduction relations**, each of which is internally confluent.
+
+For example, instead of one global set of reduction rules, you define two strategies: strategy A
+always reduces to normal form X, and strategy B always reduces to normal form Y. Each strategy
+satisfies Church-Rosser independently, the only difference is which normal form they target. 
+
+In Vortex, a similar scenario would be defining multiple strategies of canonicalization, where one
+strategy could target `List` as a canonical target (normal form) for list data, and another strategy
+could target `ListView`. See the [`List` vs. `ListView`](#list-vs-listview) section for more info.
+
 ## Design
 
 Describe the proposed design in enough detail that someone familiar with Vortex could implement it. This should cover:
