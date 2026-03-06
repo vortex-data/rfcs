@@ -1,7 +1,7 @@
-- Start Date: YYYY-MM-DD (today's date)
+- Start Date: 2026-03-06
 - RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
 
-# RFC Template
+# Formalize the Vortex Type System
 
 ## Summary
 
@@ -9,10 +9,30 @@ One paragraph explanation of the proposed change.
 
 ## Motivation
 
-What problem does this solve? Include concrete use cases where possible.
+Many of the Vortex maintainers have a good understanding of how the Vortex type system works: we
+define a set of logical types, each of which can represent many physical data encodings. We
+additionally define a set of `Canonical` encodings that represent the different targets that arrays
+can decompress into.
 
-- What specific use cases does this enable or improve?
-- What workflows or operations are painful, slow, or impossible today?
+This definition has mostly worked well for us. However, several recent discussions have revealed
+that this loose definition may be insufficient.
+
+For example, we would like to add a `FixedSizeBinary<n>` type, but it is unclear if this is
+necessary when it is mostly equivalent to `FixedSizeList<u8, n>`. Are these actually different
+logical types? What does a "different" logical type even mean?
+
+Another discussion we have had is if the choice of a canonical `ListView` is better or worse than a
+canonical `List` ([vortex#4699](https://github.com/vortex-data/vortex/issues/4699)). Both have the
+exact same logical type (same domain of values), but we are stuck choosing a single "canonical"
+encoding that we force every array of type `List` to decompress into. Is forcing everyone to
+decompress into the same physical encoding really what we want?
+
+This RFC makes 2 proposals. The first is a more formalized definition of the Vortex type system, and
+this serves to justify the second proposal.
+
+The second proposal is to relax (or extend) the concept of a "canonical" type from choosing a unique
+physical encoding for every logical type (a unique normal form) to allowing many possible canonical
+targets (multiple normal forms).
 
 ## Design
 
