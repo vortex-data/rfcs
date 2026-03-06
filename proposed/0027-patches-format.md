@@ -2,9 +2,9 @@
 
 Make a backwards compatible change to the serialization format for `Patches` used by the FastLanes-derived encodings:
 
-* BitPacked
-* ALP
-* ALP-RD
+- BitPacked
+- ALP
+- ALP-RD
 
 enabling fully data-parallel patch application inside of the CUDA bit-unpacking kernels, while not impacting
 CPU performance.
@@ -24,32 +24,34 @@ The key insight of the paper is that instead of holding the patches sorted by th
 - Further group the patches within each chunk by their "lanes", where the lane is w/e the lane of the underlying operation you're patching over aligns to
 
 For example, let's say that we have an array of 5,000 elements, with 32 lanes.
+
 - We'd have $\left\lceil\frac{5,000}{1024}\right\rceil = 5$ chunks, each chunk has 32 lanes. Each lane can have up to 32 patch values
 - Indices and values are aligned. Indices are indices within a chunk, so they can be stored as u16. Values are whatever the underlying values type is.
 
 ```text
 
-                 chunk 0      chunk 0      chunk 0     chunk 0       chunk 0     chunk 0         
-                 lane  0      lane 1       lane  2     lane 3        lane  4     lane  5         
-             ┌────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐     
+                 chunk 0      chunk 0      chunk 0     chunk 0       chunk 0     chunk 0
+                 lane  0      lane 1       lane  2     lane 3        lane  4     lane  5
+             ┌────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐
 lane_offsets │     0      │     0      │     2      │     2      │     3      │     5      │  ...
-             └─────┬──────┴─────┬──────┴─────┬──────┴──────┬─────┴──────┬─────┴──────┬─────┘     
-                   │            │            │             │            │            │           
-                   │            │            │             │            │            │           
-             ┌─────┴────────────┘            └──────┬──────┘     ┌──────┘            └─────┐     
-             │                                      │            │                         │     
-             │                                      │            │                         │     
-             │                                      │            │                         │     
-             ▼────────────┬────────────┬────────────▼────────────▼────────────┬────────────▼     
-   indices   │            │            │            │            │            │            │     
-             │            │            │            │            │            │            │     
-             ├────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤     
-   values    │            │            │            │            │            │            │     
-             │            │            │            │            │            │            │     
-             └────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘     
+             └─────┬──────┴─────┬──────┴─────┬──────┴──────┬─────┴──────┬─────┴──────┬─────┘
+                   │            │            │             │            │            │
+                   │            │            │             │            │            │
+             ┌─────┴────────────┘            └──────┬──────┘     ┌──────┘            └─────┐
+             │                                      │            │                         │
+             │                                      │            │                         │
+             │                                      │            │                         │
+             ▼────────────┬────────────┬────────────▼────────────▼────────────┬────────────▼
+   indices   │            │            │            │            │            │            │
+             │            │            │            │            │            │            │
+             ├────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
+   values    │            │            │            │            │            │            │
+             │            │            │            │            │            │            │
+             └────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘
 ```
 
 This layout has a few benefits
+
 - For GPU operations, each warp handles a single chunk, and each thread handles a single lane. Through the `lane_offsets`, each thread of execution can have quick random access to an iterator of values
 - Patches can be trivially sliced to a specific chunk range simply by slicing into the `lane_offsets`
 - Bulk operations can be executed efficiently per-chunk by loading all patches for a chunk and applying them in a loop, as before
@@ -60,37 +62,37 @@ This layout has a few benefits
 ## Array Structure
 
 ```rust
-/// An array that partially "patches" another array with new values.  
-///  
-/// Patched arrays implement the set of nodes that do this instead here...I think?  
-#[derive(Debug, Clone)]  
-pub struct PatchedArray {  
-    /// The inner array that is being patched. This is the zeroth child.  
-    pub(super) inner: ArrayRef,  
-  
-    /// Number of 1024-element chunks. Pre-computed for convenience.  
-    pub(super) n_chunks: usize,  
-  
-    /// Number of lanes the patch indices and values have been split into. Each of the `n_chunks`  
+/// An array that partially "patches" another array with new values.
+///
+/// Patched arrays implement the set of nodes that do this instead here...I think?
+#[derive(Debug, Clone)]
+pub struct PatchedArray {
+    /// The inner array that is being patched. This is the zeroth child.
+    pub(super) inner: ArrayRef,
+
+    /// Number of 1024-element chunks. Pre-computed for convenience.
+    pub(super) n_chunks: usize,
+
+    /// Number of lanes the patch indices and values have been split into. Each of the `n_chunks`
     /// of 1024 values is split into `n_lanes` lanes horizontally, each lane having 1024 / n_lanes
     /// values that might be patched.
     pub(super) n_lanes: usize,
-  
-    /// Offset into the first chunk  
+
+    /// Offset into the first chunk
     pub(super) offset: usize,
     /// Total length.
     pub(super) len: usize,
-  
-    /// lane offsets. The PType of these MUST be u32  
-    pub(super) lane_offsets: BufferHandle,  
-    /// indices within a 1024-element chunk. The PType of these MUST be u16  
-    pub(super) indices: BufferHandle,  
-    /// patch values corresponding to the indices. The ptype is specified by `values_ptype`.  
-    pub(super) values: BufferHandle,  
-    /// PType of the scalars in `values`. Can be any native type.  
-    pub(super) values_ptype: PType,  
-  
-    pub(super) stats_set: ArrayStats,  
+
+    /// lane offsets. The PType of these MUST be u32
+    pub(super) lane_offsets: BufferHandle,
+    /// indices within a 1024-element chunk. The PType of these MUST be u16
+    pub(super) indices: BufferHandle,
+    /// patch values corresponding to the indices. The ptype is specified by `values_ptype`.
+    pub(super) values: BufferHandle,
+    /// PType of the scalars in `values`. Can be any native type.
+    pub(super) values_ptype: PType,
+
+    pub(super) stats_set: ArrayStats,
 }
 ```
 
@@ -113,17 +115,16 @@ We look at the slice indices, align them to chunk boundaries, then slice both th
 Filter / Take operations can arbitrarily break and reconstruct new chunks, so they cannot be done metadata-only and thus must be a Kernel rather than a Reduce rule.
 
 In practice, we perform the operation by
+
 - Executing the filter on the child, then executing it
 - Intersecting the filter with our patches, ideally in a chunk-at-a-time way so we can write a vectorized version.
 - Applying the filtered patches over the executed child
-
 
 ## ScalarFns
 
 We do not reduce any ScalarFns through the operation, instead they only run at execution time.
 
 This matches the current behavior of BitPackedArrays.
-
 
 ---
 
