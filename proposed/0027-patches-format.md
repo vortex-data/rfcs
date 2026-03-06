@@ -6,6 +6,12 @@ Make a backwards compatible change to the serialization format for `Patches` use
 * ALP
 * ALP-RD
 
+enabling fully data-parallel patch application inside of the CUDA bit-unpacking kernels, while not impacting
+CPU performance.
+
+This relies on introducing a new encoding to represent exception patching, which would be a forward-compatibility break
+as is always the case when adding a new default encoding.
+
 ---
 
 ## Data Layout
@@ -88,7 +94,11 @@ pub struct PatchedArray {
 }
 ```
 
-The PatchedArray holds two buffer handles and 3 buffers for access.
+The PatchedArray holds buffer handles for the `lane_offsets` which provides chunk/lane-level random indexing
+into the patch `indices` and `values`, so these values can live equivalently in device or host memory.
+
+The only operation performed at planning time is slicing, which means that all of its reduce rules would run
+without issue in CUDA or on CPU.
 
 ---
 
@@ -103,8 +113,9 @@ We look at the slice indices, align them to chunk boundaries, then slice both th
 Filter / Take operations can arbitrarily break and reconstruct new chunks, so they cannot be done metadata-only and thus must be a Kernel rather than a Reduce rule.
 
 In practice, we perform the operation by
-- Pushing the filter into the child
+- Executing the filter on the child, then executing it
 - Intersecting the filter with our patches, ideally in a chunk-at-a-time way so we can write a vectorized version.
+- Applying the filtered patches over the executed child
 
 
 ## ScalarFns
@@ -114,30 +125,8 @@ We do not reduce any ScalarFns through the operation, instead they only run at e
 This matches the current behavior of BitPackedArrays.
 
 
-```text
-                 chunk 0      chunk 0      chunk 0     chunk 0       chunk 0     chunk 0         
-                 lane  0      lane 1       lane  2     lane 3        lane  4     lane  5         
-             ┌────────────┬────────────┬────────────┬────────────┬────────────┬────────────┐     
-lane_offsets │     0      │     0      │     2      │     2      │     3      │     5      │  ...
-             └─────┬──────┴─────┬──────┴─────┬──────┴──────┬─────┴──────┬─────┴──────┬─────┘     
-                   │            │            │             │            │            │           
-                   │            │            │             │            │            │           
-             ┌─────┴────────────┘            └──────┬──────┘     ┌──────┘            └─────┐     
-             │                                      │            │                         │     
-             │                                      │            │                         │     
-             │                                      │            │                         │     
-             ▼────────────┬────────────┬────────────▼────────────▼────────────┬────────────▼     
-   indices   │            │            │            │            │            │            │     
-             │            │            │            │            │            │            │     
-             ├────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤     
-   values    │            │            │            │            │            │            │     
-             │            │            │            │            │            │            │     
-             └────────────┴────────────┴────────────┴────────────┴────────────┴────────────┘     
-
-```
-
-
 ---
+
 ## Compatibility
 
 BitPackedArray and ALPArray both hold a `Patches` internally, which we'd like to replace by wrapping them in a `PatchedArray`.
@@ -145,3 +134,48 @@ BitPackedArray and ALPArray both hold a `Patches` internally, which we'd like to
 To do this without breaking backward compatibility, we modify the `VTable::build` function to return `ArrayRef`. This makes it easy to do encoding migrations on read in the future. The alternative is adding a new BitPackedArray and ALPArray that gets migrated to on write.
 
 This requires executing the Patches at read time. From scanning a handful of our tables, this is unlikely to cause any issues as patches are generally not compressed. We only apply constant compression for patch values, and I would expect that to be rare in practice.
+
+## Drawbacks
+
+This will be a forward-compatibility break. Old clients will not be able to read files written with the new encoding.
+However, the potential break surface is huge given how ubiquitous bitpacked arrays and patches are in our encoding trees.
+This will cause friction as users of Vortex who have separate writer/reader pipelines will need to upgrade their Vortex
+clients across both in lockstep.
+
+> Does this add complexity that could be avoided?
+
+IMO this centralizes some complexity that previously was shared across multiple encodings.
+
+## Alternatives
+
+> Transpose the patches within GPU execution
+
+This was found to be not very performant. The time spent D2H copy, transpose patches, H2D copy far exceeded the cost of executing the bitpacking kernel, which puts a serious
+limit on our GPU scan performance. Combined with how ubiquitous `BitPackedArray`s with patches are in our encoding trees, would be a permanent bottleneck on throughput.
+
+> What is the cost of **not** doing this?
+
+Our GPU scan performance would be permanently limited by patching overhead, which in TPC-H lineitem scans was shown to be the biggest bottleneck after string decoding.
+
+> Is there a simpler approach that gets us most of the way there?
+
+I don't think so
+
+## Prior Art
+
+The original FastLanes GPU paper did not attempt to implement data-parallel patching within the FastLanes unpacking
+kernels.
+
+The G-ALP paper was published later on, and implemented patching for ALP values _after_ unpacking.
+
+We use a data layout that closely matches the one described in _G-ALP_ and apply it to bit-unpacking as well.
+
+## Unresolved Questions
+
+- What parts of the design need to be resolved during the RFC process?
+- What is explicitly out of scope for this RFC?
+- Are there open questions that can be deferred to implementation?
+
+## Future Possibilities
+
+What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
