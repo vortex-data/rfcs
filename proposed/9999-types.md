@@ -165,6 +165,120 @@ In Vortex, a similar scenario would be defining multiple strategies of canonical
 strategy could target `List` as a canonical target (normal form) for list data, and another strategy
 could target `ListView`. See the [`List` vs. `ListView`](#list-vs-listview) section for more info.
 
+## Refinement Types and the DType Decision Framework
+
+A **refinement type** `{ x : T | P(x) }` is a type `T` restricted to values satisfying a predicate
+`P`. Refinement types express subtypes without changing the underlying representation, instead they
+add constraints that gate operations or impose invariants.
+
+For example in Vortex, `Utf8` is a refinement of `Binary`:
+
+```
+Utf8  ~=  { b : Binary | valid_utf8(b) }
+```
+
+Every `Utf8` value is a valid `Binary` value, but not every `Binary` value is valid `Utf8`. The
+predicate `valid_utf8` is what justifies the separate `DType` variant: it gates string operations
+(like substring, regex matching, case conversion) that are not meaningful on arbitrary binary data.
+Without this predicate, `Utf8` and `Binary` would be the same type, and maintaining both would be
+redundant.
+
+This gives us a concrete decision tree for whether a new `DType` variant is justified:
+
+```
+                        Does it gate different query operations?
+                                    │
+                          Yes ──────┼────── No
+                           │                │
+                     Add to DType     Is it structurally distinct
+                   (refinement type)  from an existing DType?
+                                            │
+                                  Yes ──────┼────── No
+                                   │                │
+                             Add to DType     Model as canonical form
+                          (new structure)     or encoding
+```
+
+## Should `FixedSizeBinary` Be a `DType`?
+
+Applying the decision framework above to `FixedSizeBinary<n>` vs. `FixedSizeList<u8, n>`:
+
+### The Case For (Refinement / Nominal Argument)
+
+`FixedSizeBinary<n>` could be justified as a refinement type if it carries semantic distinctions
+that `FixedSizeList<u8, n>` does not:
+
+- **Intent signaling.** `FixedSizeBinary<n>` says "this is opaque binary data" (UUIDs, hashes, IP
+  addresses), while `FixedSizeList<u8, n>` says "this is a list of bytes that happens to have a
+  fixed length."
+- **Schema compatibility.** Arrow, Parquet, and other formats distinguish these types. A
+  `FixedSizeBinary` `DType` makes round-tripping schemas lossless.
+- **Potential invariant.** `FixedSizeBinary` could carry the invariant that elements are not
+  individually addressable or meaningful. This is weaker than `valid_utf8` but still semantic.
+
+Under this reading, `FixedSizeBinary` is a lightweight refinement type, and the nominal distinction
+earns its place in `DType`.
+
+### The Case Against (Canonical Form / Section Argument)
+
+`FixedSizeBinary` could instead be modeled as a canonical form (section target) of
+`FixedSizeList<u8, n>`, or as extension type metadata:
+
+- **No gating predicate.** If no operations are meaningful on `FixedSizeBinary` that are not also
+  meaningful on `FixedSizeList<u8, n>`, then the predicate is empty and the refinement is trivial.
+- **Leaky abstraction risk.** Every query engine function that handles list types would need to
+  additionally handle `FixedSizeBinary`, or we would need coercion rules. If the handling is always
+  identical, the `DType` distinction adds complexity without semantic payoff.
+- **Schema mapping as metadata.** The information "this came from a Parquet `FixedSizeBinary`
+  column" could live in extension type metadata rather than in the core `DType` enum, keeping the
+  logical layer minimal.
+- **Complexity.** Adding yet another variant to the `DType` enum has a large surface area of change.
+
+Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a logical type.
+
+### Decision
+
+It is somewhat hard to decide which is the right way to go. However, this section provides some more
+structure to the discussions we have been holding.
+
+## List vs. ListView
+
+There is also a separate question about whether the current `Canonical` system is the most ideal.
+The relationship between `List` and `ListView` ties all of the above concepts together and most
+directly motivates a multi-section (multiple normal form) proposal.
+
+`List` and `ListView` represent exactly the same logical data: a sequence of variable-length
+sub-arrays. Given an array of type `List(Int32)`, element `i` is a variable-length sequence of
+`Int32` values. This is true regardless of the physical layout.
+
+The distinction is entirely in the buffer layout:
+
+- **`List`** stores a single offsets buffer where `offsets[i]..offsets[i+1]` defines the range for
+  element `i`. Offsets are monotonically increasing. The child values buffer is contiguous and
+  non-overlapping, and every byte belongs to exactly one logical element.
+- **`ListView`** stores separate offsets and sizes buffers, where
+  `offsets[i]..offsets[i] + sizes[i]` defines the range for element `i`. This allows overlapping
+  views (two logical elements can share backing data) and gaps (regions of the values buffer that
+  belong to no element).
+
+This is a purely physical distinction, as no query operation can observe the difference.
+For example, `scalar_at(i)` will always returns the same list, and `filter`, `take`, and `slice` all
+produce logically identical results.
+
+However, this physical distinction has massive performance implications. Converting from `ListView`
+to `List` requires rebuilding the entire array to eliminate overlaps and gaps. On the other hand,
+converting from `List` to `ListView` is trivial (sizes are just offset deltas).
+
+This asymmetry is notable: the section that targets `List` is more expensive to compute but produces
+a form with stronger structural guarantees (no aliasing, no gaps). The section that targets
+`ListView` is cheaper and permits aliasing and faster random access.
+
+Many of our consumers (particularly Arrow FFI boundaries and consumers of DataFusion) prefer `List`
+because Arrow has is adding support for `ListView` slowly. Other consumers prefer `ListView` because
+some operations (namely random access and potentially dependent operations) are faster.
+
+TODO
+
 ## Design
 
 Describe the proposed design in enough detail that someone familiar with Vortex could implement it. This should cover:
@@ -216,6 +330,8 @@ This section helps frame the design in a broader context. If there is no relevan
 
 ## Unresolved Questions
 
+- Should `FixedSizeBinary<n>` be a `DType` variant (refinement type) or extension type metadata?
+  See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against.
 - What parts of the design need to be resolved during the RFC process?
 - What is explicitly out of scope for this RFC?
 - Are there open questions that can be deferred to implementation?
