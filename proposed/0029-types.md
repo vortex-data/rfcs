@@ -1,5 +1,5 @@
 - Start Date: 2026-03-06
-- RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
+- RFC PR: [vortex-data/rfcs#29](https://github.com/vortex-data/rfcs/pull/29)
 
 # Vortex Type System
 
