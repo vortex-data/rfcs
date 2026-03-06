@@ -5,7 +5,11 @@
 
 ## Summary
 
-One paragraph explanation of the proposed change.
+This RFC formalizes the Vortex type system by grounding `DType` as a quotient type over physical
+encodings and establishes a decision framework (based on refinement types) for when new `DType`
+variants are justified. It additionally proposes extending canonicalization from a single target
+(one canonical "normal form" per `DType`) to parameterized "sections" via `to_canonical_target`,
+allowing consumers to choose among multiple valid canonical targets (e.g., `List` vs. `ListView`).
 
 ## Motivation
 
@@ -34,7 +38,7 @@ The second proposal is to relax (or extend) the concept of a "canonical" type fr
 physical encoding for every logical type (a unique normal form) to allowing many possible canonical
 targets (multiple normal forms).
 
-# Type Theory Background
+## Type Theory Background
 
 This section introduces the type-theoretic concepts that underpin Vortex's `DType` system and its
 relationship to physical encodings. To reiterate, most of the maintainers understand these concepts
@@ -43,9 +47,9 @@ intuitively, but there is value in mapping these implicit concepts to explicit t
 Note that this section made heavy use of LLMs to help research and identify terms and definitions,
 as the author of this RFC is notably _not_ a type theory expert.
 
-## Equivalence Classes and `DType` as a Quotient Type
+### Equivalence Classes and `DType` as a Quotient Type
 
-### In Theory
+#### In Theory
 
 An **equivalence relation** `~` on a set `S` is a relation that is reflexive (`a ~ a`), symmetric
 (`a ~ b` implies `b ~ a`), and transitive (`a ~ b` and `b ~ c` implies `a ~ c`). An equivalence
@@ -62,7 +66,7 @@ must produce the same result regardless of which member of the class you operate
 `f : A → B` respects the equivalence relation (`a ~ a'` implies `f(a) = f(a')`), then `f` descends
 to a well-defined function on the quotient `f' : A/~ → B`.
 
-### In Vortex
+#### In Vortex
 
 Consider the set of all physical array representations / encodings in Vortex: a dictionary-encoded
 `i32` array, a run-end-encoded `i32` array, a bitpacked `i32` array, a flat Arrow `i32` buffer,
@@ -77,7 +81,7 @@ A Vortex `DType` like `Primitive(I32, NonNullable)` **names** one of these equiv
 tells us what logical data we are working with, but says nothing about which physical encoding is
 representing it. Thus, we can say that logical types in Vortex form equivalence classes, and `DType`
 is the set of equivalence classes. More formally, `DType` is the quotient type over the space of
-physical encodings, collapsed by decoded / decompressed equivalence relation.
+physical encodings, collapsed by the decoded / decompressed equivalence relation.
 
 This quotient structure imposes a concrete requirement: any operation defined on `DType` must
 produce the same result regardless of which physical encoding backs the data.
@@ -86,7 +90,7 @@ For example, operations like `filter`, `take`, and `scalar_at` all satisfy this:
 the logical values, not on how those values are stored. However, an operation like "return the
 `ends` buffer" is not well-defined on the quotient type as that only exists for run-end encoding.
 
-## Sections and Canonicalization
+### Sections and Canonicalization
 
 Observe that every physical array (a specific encoding combined with actual data) maps back to a
 `DType`. A run-end-encoded `i32` array maps to `Primitive(I32)`, as does a dictionary-encoded `i32`
@@ -100,7 +104,7 @@ which physical encoding should I use to represent it?"
 
 **In Vortex**, the current `to_canonical` function is a section. For each `DType`, it selects
 exactly one canonical physical form. Observe how the `Canonical` enum is essentially identical to
-`DType` enum (with the exception of `VarBinView` with `Utf8` and `Binary`):
+the `DType` enum (with the exception of `VarBinView` with `Utf8` and `Binary`):
 
 ```rust
 /// The different logical types in Vortex (the different equivalence classes).
@@ -141,7 +145,7 @@ variable-length list data. Both are valid sections (since both pick a representa
 equivalence class), and both satisfy `π(s(d)) = d`. The current system in Vortex simply hardcodes
 one particular section. The second proposal in this RFC is to allow _multiple sections_.
 
-## The Church-Rosser Property (Confluence)
+### The Church-Rosser Property (Confluence)
 
 A rewriting system has the **Church-Rosser property** (or is **confluent**) if, whenever a term can
 be reduced in two different ways, both reduction paths can be continued to reach the same final
@@ -165,13 +169,13 @@ In Vortex, a similar scenario would be defining multiple strategies of canonical
 strategy could target `List` as a canonical target (normal form) for list data, and another strategy
 could target `ListView`. See the [`List` vs. `ListView`](#list-vs-listview) section for more info.
 
-## Refinement Types and the DType Decision Framework
+### Refinement Types and the DType Decision Framework
 
 A **refinement type** `{ x : T | P(x) }` is a type `T` restricted to values satisfying a predicate
 `P`. Refinement types express subtypes without changing the underlying representation, instead they
 add constraints that gate operations or impose invariants.
 
-For example in Vortex, `Utf8` is a refinement of `Binary`:
+For example, in Vortex, `Utf8` is a refinement of `Binary`:
 
 ```
 Utf8  ~=  { b : Binary | valid_utf8(b) }
@@ -236,11 +240,6 @@ earns its place in `DType`.
 
 Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a logical type.
 
-### Decision
-
-It is somewhat hard to decide which is the right way to go. However, this section provides some more
-structure to the discussions we have been holding.
-
 ## List vs. ListView
 
 There is also a separate question about whether the current `Canonical` system is the most ideal.
@@ -262,7 +261,7 @@ The distinction is entirely in the buffer layout:
   belong to no element).
 
 This is a purely physical distinction, as no query operation can observe the difference.
-For example, `scalar_at(i)` will always returns the same list, and `filter`, `take`, and `slice` all
+For example, `scalar_at(i)` will always return the same list, and `filter`, `take`, and `slice` all
 produce logically identical results.
 
 However, this physical distinction has massive performance implications. Converting from `ListView`
@@ -274,7 +273,7 @@ a form with stronger structural guarantees (no aliasing, no gaps). The section t
 `ListView` is cheaper and permits aliasing and faster random access.
 
 Many of our consumers (particularly Arrow FFI boundaries and consumers of DataFusion) prefer `List`
-because Arrow has is adding support for `ListView` slowly. Other consumers prefer `ListView` because
+because Arrow is adding support for `ListView` slowly. Other consumers prefer `ListView` because
 some operations (namely random access and potentially dependent operations) are faster.
 
 It is highly unfortunate that we cannot canonicalize into different targets, and we are forced to
@@ -345,7 +344,26 @@ For `DType`s where the distinction does not apply (e.g., `Primitive`, `Bool`, `N
 produce the same canonical form. The parameterization only has an effect where multiple valid
 canonical forms exist.
 
-TODO wrap everything up and explain how the type theory helps justify this.
+Because `DType` is a quotient type and canonicalization is a section on that quotient, supporting
+multiple canonical targets is theoretically sound (adding this feature will not weaken any invariant
+of the Vortex type system). Because each `CanonicalTarget` defines an internally confluent reduction
+strategy, the quotient structure of `DType` guarantees that all well-defined operations produce
+the same logical results regardless of which target is chosen.
+
+```
+Logical type        (DType: purely semantic, not physical)
+        ▲
+        │  section 1: Default    (ListView, VarBinView)
+        │  section 2: Contiguous (List, VarBin)
+        │  section n: ...        (future targets)
+        ▼
+Canonical form      (a specific "normal form" encoding chosen by the section)
+        ▲
+        │  encode
+        │  decode
+        ▼
+Physical encoding   (dictionary, REE, bitpacked, etc.)
+```
 
 ## Compatibility
 
@@ -367,32 +385,32 @@ not fit the use case.
 
 ## Prior Art
 
-TODO
-
-How have other systems solved this or similar problems? Consider:
-
-- Other columnar formats (Parquet, Arrow, etc.).
-- Database internals (DuckDB, DataFusion, Velox, etc.).
-- Relevant academic papers or blog posts.
-
-This section helps frame the design in a broader context. If there is no relevant prior art, that is fine.
+- **Arrow** defines both `List` and `ListView` (and `LargeList`/`LargeListView`) as separate type
+  IDs in its columnar format. Arrow's canonical layout uses monotonic offsets (`List`), and
+  `ListView` support is being added incrementally across implementations. Arrow also distinguishes
+  `FixedSizeBinary` from `FixedSizeList<uint8>` at the type level.
+- **Parquet** has `FIXED_LEN_BYTE_ARRAY` as a distinct primitive type, separate from repeated
+  groups. This is a nominal distinction similar to the `FixedSizeBinary` question.
+- **DuckDB** uses a single canonical form per logical type and does not support multiple
+  canonicalization targets.
 
 ## Unresolved Questions
 
 - Should `FixedSizeBinary<n>` be a `DType` variant (refinement type) or extension type metadata?
   See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against.
-
-TODO
-
-- What parts of the design need to be resolved during the RFC process?
-- What is explicitly out of scope for this RFC?
-- Are there open questions that can be deferred to implementation?
+- What is the concrete set of `CanonicalTarget` variants? This RFC proposes `Default` and
+  `Contiguous`, but there may be other useful targets. Theoretically, we could have a target that
+  would allow us to return compressed arrays as a `Canonical` type!
 
 ## Future Possibilities
 
-TODO
-
-What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
+- We can have extension types be a generalization of the refinement type pattern: for example we
+  could enforce user-defined predicates that gate custom operations on existing `DType`s.
+- User-defined or plugin-defined canonical targets for custom FFI boundaries or serialization
+  formats.
+- Using the decision framework to audit existing `DType` variants and determine if any should be
+  consolidated or split, as well as to make decisions about logical types we want to add (namely
+  `FixedSizeBinary` and `Variant`).
 
 ## Further Reading
 
