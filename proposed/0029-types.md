@@ -281,7 +281,11 @@ always decompress into `ListView`. We have the same constraint on `VarBinView` v
 while we haven't seen as many performance problems, it feels like a constraint that is too
 restrictive in Vortex.
 
-## Design
+## Non-confluent Rewriting Design
+
+As a reminder, Vortex (maybe unintentionally) currently has a confluent rewriting system, where we
+"rewrite" (`to_canonical`) everything under an equivalence class (`DType`) into a singular normal
+form (`Canonical`). This part of the RFC proposes a design of a non-conflunet rewriting system.
 
 The proposal is to add a new `to_canonical_target` function that accepts a `CanonicalTarget`
 parameter, while keeping the existing `to_canonical` as a convenience that uses the default target.
