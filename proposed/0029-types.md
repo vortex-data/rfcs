@@ -57,8 +57,7 @@ logical types? What does a "different" logical type even mean?
 Another discussion we have had is if the choice of a canonical `ListView` is better or worse than a
 canonical `List` ([vortex#4699](https://github.com/vortex-data/vortex/issues/4699)). Both have the
 exact same logical type (same domain of values), but we are stuck choosing a single "canonical"
-encoding that we force every array of type `List` to decompress into. This question is explored
-further in a companion RFC ([RFC 9999](./9999-canonical-targets.md)).
+encoding that we force every array of type `List` to decompress into.
 
 This RFC formalizes the Vortex type system definitions, and this formalization serves as the
 foundation for reasoning about questions like these.
@@ -224,7 +223,7 @@ This gives us a concrete decision tree for whether a new `DType` variant is just
        (refinement type)      type        (new structure)   form or encoding
 ```
 
-As described in the [motivation](#why-extension-types), the "Yes" branch distinguishes between
+As described in the [overview](#extension-types), the "Yes" branch distinguishes between
 first-class `DType` variants and extension types based on who owns the gated operations. If Vortex
 core provides kernels that require the predicate, it belongs in `DType`. If only external consumers
 need it, an extension type suffices (see [RFC 0005](./0005-extension.md)).
