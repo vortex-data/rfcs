@@ -9,14 +9,10 @@ This RFC formalizes the Vortex type system by grounding `DType` as a quotient ty
 encodings and establishes a decision framework (based on refinement types) for when new `DType`
 variants are justified.
 
-## Motivation
-
-Many of the Vortex maintainers have a good understanding of how the Vortex type system works: we
-define a set of logical types, each of which can represent many physical data encodings. We
-additionally define a set of `Canonical` encodings that represent the different targets that arrays
-can decompress into.
-
 ## Overview
+
+Vortex defines a set of logical types, each of which can represent many physical data encodings, and
+a set of `Canonical` encodings that represent the different targets that arrays can decompress into.
 
 ### Logical vs. Physical Types
 
@@ -45,7 +41,7 @@ Vortex's built-in set of logical types will not cover every use case. Extension 
 consumers to define their own logical types on top of existing `DType`s without modifying the core
 type system. See [RFC 0005](./0005-extension.md) for the full design.
 
-### Formalization
+## Motivation
 
 This definition has mostly worked well for us. However, several recent discussions have revealed
 that this loose definition may be insufficient.
@@ -169,6 +165,10 @@ variable-length list data. Both are valid sections (since both pick a representa
 equivalence class), and both satisfy `π(s(d)) = d`. The current system in Vortex simply hardcodes
 one particular section.
 
+Note that even dictionary encoding or run-end encoding are theoretically valid sections (they
+satisfy `π(s(d)) = d`). The fact that we choose flat, uncompressed forms as canonical is a design
+choice optimized for compute, not a theoretical requirement.
+
 ### The Church-Rosser Property (Confluence)
 
 A rewriting system has the **Church-Rosser property** (or is **confluent**) if, whenever a term can
@@ -187,9 +187,11 @@ approach is to define **separate reduction relations**, each of which is interna
 
 For example, instead of one global set of reduction rules, you define two strategies: strategy A
 always reduces to normal form X, and strategy B always reduces to normal form Y. Each strategy
-satisfies Church-Rosser independently, the only difference is which normal form they target.
+satisfies Church-Rosser independently, the only difference is which normal form they target. This
+is relevant for future work: if Vortex were to support multiple canonical targets (e.g., both `List`
+and `ListView`), each target would define an internally confluent reduction strategy.
 
-### Refinement Types and the DType Decision Framework
+### Refinement Types
 
 A **refinement type** `{ x : T | P(x) }` is a type `T` restricted to values satisfying a predicate
 `P`. Refinement types express subtypes without changing the underlying representation, instead they
@@ -207,65 +209,67 @@ predicate `valid_utf8` is what justifies the separate `DType` variant: it gates 
 Without this predicate, `Utf8` and `Binary` would be the same type, and maintaining both would be
 redundant.
 
-This gives us a concrete decision tree for whether a new `DType` variant is justified:
+## What justifies a new type?
 
-```
-                    Does it gate different query operations?
-                                        │
-                     Yes ───────────────┼─────────────── No
-                      │                                  │
-                Does Vortex core              Is it structurally distinct
-                own those ops?                  from an existing DType?
-                       │                                 │
-             Yes ──────┼────── No              Yes ──────┼────── No
-              │                │                │                │
-          Add to DType      Extension      Add to DType    Model as canonical
-       (refinement type)      type        (new structure)   form or encoding
-```
+With the formalizations above, we have a framework that gives us a set of questions to guide whether
+a new `DType` variant is justified:
 
-As described in the [overview](#extension-types), the "Yes" branch distinguishes between
-first-class `DType` variants and extension types based on who owns the gated operations. If Vortex
-core provides kernels that require the predicate, it belongs in `DType`. If only external consumers
-need it, an extension type suffices (see [RFC 0005](./0005-extension.md)).
+1. **Does it gate different query operations?** If yes, does Vortex core own those operations? If
+   so, it should be a first-class `DType` (refinement type). If only external consumers need them,
+   an extension type suffices (see [RFC 0005](./0005-extension.md)).
+2. **Is it structurally distinct from an existing `DType`?** If yes, there may be a case for a new
+   `DType` variant. However, this depends on whether the structural difference provides enough
+   practical benefit to justify the added complexity.
+3. If neither, it should just be a new physical encoding.
 
-## Should `FixedSizeBinary` Be a `DType`?
+These decisions are mostly design choices rather than strict theoretical requirements. For example,
+`Utf8` could theoretically be an extension type over `Binary` with a `valid_utf8` predicate. The
+main reason it is a first-class `DType` is because we want to have optimized string kernels in the
+core Vortex library.
 
-Applying the decision framework above to `FixedSizeBinary<n>` vs. `FixedSizeList<u8, n>`:
+### Should `FixedSizeList` be a type?
 
-### The Case For (Refinement / Nominal Argument)
+We can apply this framework to an existing type, `FixedSizeList`:
 
-`FixedSizeBinary<n>` could be justified as a refinement type if it carries semantic distinctions
-that `FixedSizeList<u8, n>` does not:
+**Does it gate different query operations?** No. A fixed-size list is a list with the additional
+constraint that every element has the same length `n`, but `scalar_at`, `filter`, `take`, etc. all
+behave identically regardless of whether the list is fixed-size.
 
-- **Intent signaling.** `FixedSizeBinary<n>` says "this is opaque binary data" (UUIDs, hashes, IP
-  addresses), while `FixedSizeList<u8, n>` says "this is a list of bytes that happens to have a
-  fixed length."
-- **Schema compatibility.** Arrow, Parquet, and other formats distinguish these types. A
-  `FixedSizeBinary` `DType` makes round-tripping schemas lossless.
-- **Potential invariant.** `FixedSizeBinary` could carry the invariant that elements are not
-  individually addressable or meaningful. This is weaker than `valid_utf8` but still semantic.
+**Is it structurally distinct from an existing `DType`?** Yes. `FixedSizeList` has a different
+physical layout (no offsets buffer, since all elements have the same size). However, this does not
+automatically justify a new `DType` variant. A `List` whose offsets are a constant stride would
+compress extremely well (a `SequenceArray`), and encodings in Vortex are designed to exploit exactly
+this kind of redundancy.
 
-Under this reading, `FixedSizeBinary` is a lightweight refinement type, and the nominal distinction
-earns its place in `DType`.
+The argument for keeping `FixedSizeList` as its own `DType` is that it makes the fixed-size
+invariant explicit at the type level, which simplifies downstream consumers that want to rely on
+it (e.g., fixed-shape tensors). The argument against is that it adds a variant to the `DType` enum
+that is logically equivalent to `List` with a constraint.
 
-### The Case Against (Canonical Form / Section Argument)
+Ultimately, we decided in the past that the structural difference merits its own `DType` variant,
+but an argument can be made that it does not warrant one.
 
-`FixedSizeBinary` could instead be modeled as a canonical form (section target) of
-`FixedSizeList<u8, n>`, or as extension type metadata:
+### Should `FixedSizeBinary` be a type?
 
-- **No gating predicate.** If no operations are meaningful on `FixedSizeBinary` that are not also
-  meaningful on `FixedSizeList<u8, n>`, then the predicate is empty and the refinement is trivial.
-- **Leaky abstraction risk.** Every query engine function that handles list types would need to
-  additionally handle `FixedSizeBinary`, or we would need coercion rules. If the handling is always
-  identical, the `DType` distinction adds complexity without semantic payoff.
-- **Schema mapping as metadata.** The information "this came from a Parquet `FixedSizeBinary`
-  column" could live in extension type metadata rather than in the core `DType` enum, keeping the
-  logical layer minimal.
-- **Complexity.** Adding yet another variant to the `DType` enum has a large surface area of change.
+A similar question applies to `FixedSizeBinary<n>` vs. `FixedSizeList<u8, n>`:
 
-Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a logical type.
+**Does it gate different query operations?** This is unclear. `FixedSizeBinary<n>` signals "opaque
+binary data" (UUIDs, hashes, IP addresses) whereas `FixedSizeList<u8, n>` signals "a list of bytes
+that happens to have a fixed length." One could argue that `FixedSizeBinary` carries the invariant
+that individual bytes are not independently meaningful, which would gate byte-level list operations.
+However, this invariant is weaker than something like `valid_utf8`, and it is not obvious that the
+core Vortex library would ship any operations gated by it.
 
+If the answer is **yes** (it gates operations), then the next question is whether Vortex core owns
+those operations. If so, `FixedSizeBinary` is a first-class refinement type. If not, it should be
+an extension type.
 
+If the answer is **no** (it does not gate operations), then: **is it structurally distinct from an
+existing `DType`?** `FixedSizeBinary<n>` has the same physical layout as `FixedSizeList<u8, n>` (a
+flat buffer of `n`-byte elements), so the answer is no. By the decision framework, this means it
+should be modeled as a canonical form or extension type metadata rather than a new `DType` variant.
+
+This question remains unresolved. See [Unresolved Questions](#unresolved-questions).
 
 ## Prior Art
 
@@ -279,7 +283,7 @@ Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a lo
 ## Unresolved Questions
 
 - Should `FixedSizeBinary<n>` be a `DType` variant (refinement type) or extension type metadata?
-  See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against. It is
+  See the [analysis above](#should-fixedsizebinary-be-a-type) for the case for and against. It is
   not so easy to claim one argument here is better than the other. Comments would be appreciated!
 
 ## Future Possibilities
