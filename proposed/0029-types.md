@@ -16,6 +16,37 @@ define a set of logical types, each of which can represent many physical data en
 additionally define a set of `Canonical` encodings that represent the different targets that arrays
 can decompress into.
 
+## Overview
+
+### Logical vs. Physical Types
+
+A **logical type** (`DType`) describes what the data means, independent of how it is stored (e.g.,
+`Primitive(I32)`, `Utf8`, `List(Primitive(I32))`). A **physical encoding** describes how data is
+laid out in memory or on disk (e.g., flat buffer, dictionary-encoded, run-end-encoded, bitpacked).
+Many physical encodings can represent the same logical type.
+
+Vortex separates these two concepts so that encodings and compute can evolve independently. Without
+this separation, implementing `M` operations across `N` encodings requires `N * M` implementations.
+With it, each encoding only needs to decompress itself and each operation only needs to target
+decompressed forms, reducing the cost to `N + M`. See this
+[blog post](https://spiraldb.com/post/logical-vs-physical-data-types) for more information.
+
+### What is a `Canonical` encoding?
+
+The `N + M` argument relies on a common decompression target that operations are implemented
+against. A **canonical encoding** is a physical encoding chosen as this representative for a logical
+type (e.g., `VarBinView` for `Utf8`, `ListView` for `List`). The choice is deliberate and
+optimized for the common compute case, but not fundamental: nothing in theory privileges `ListView`
+over `List` for list data, for example.
+
+### Extension Types
+
+Vortex's built-in set of logical types will not cover every use case. Extension types allow external
+consumers to define their own logical types on top of existing `DType`s without modifying the core
+type system. See [RFC 0005](./0005-extension.md) for the full design.
+
+### Formalization
+
 This definition has mostly worked well for us. However, several recent discussions have revealed
 that this loose definition may be insufficient.
 
@@ -180,18 +211,23 @@ redundant.
 This gives us a concrete decision tree for whether a new `DType` variant is justified:
 
 ```
-                        Does it gate different query operations?
-                                    │
-                          Yes ──────┼────── No
-                           │                │
-                     Add to DType     Is it structurally distinct
-                   (refinement type)  from an existing DType?
-                                            │
-                                  Yes ──────┼────── No
-                                   │                │
-                             Add to DType     Model as canonical form
-                          (new structure)     or encoding
+                    Does it gate different query operations?
+                                        │
+                     Yes ───────────────┼─────────────── No
+                      │                                  │
+                Does Vortex core              Is it structurally distinct
+                own those ops?                  from an existing DType?
+                       │                                 │
+             Yes ──────┼────── No              Yes ──────┼────── No
+              │                │                │                │
+          Add to DType      Extension      Add to DType    Model as canonical
+       (refinement type)      type        (new structure)   form or encoding
 ```
+
+As described in the [motivation](#why-extension-types), the "Yes" branch distinguishes between
+first-class `DType` variants and extension types based on who owns the gated operations. If Vortex
+core provides kernels that require the predicate, it belongs in `DType`. If only external consumers
+need it, an extension type suffices (see [RFC 0005](./0005-extension.md)).
 
 ## Should `FixedSizeBinary` Be a `DType`?
 
@@ -230,6 +266,8 @@ earns its place in `DType`.
 
 Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a logical type.
 
+
+
 ## Prior Art
 
 - **Arrow** has a physical type system, defining both `List` and `ListView` (and
@@ -242,7 +280,8 @@ Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a lo
 ## Unresolved Questions
 
 - Should `FixedSizeBinary<n>` be a `DType` variant (refinement type) or extension type metadata?
-  See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against.
+  See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against. It is
+  not so easy to claim one argument here is better than the other. Comments would be appreciated!
 
 ## Future Possibilities
 
