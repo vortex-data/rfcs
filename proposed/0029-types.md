@@ -7,9 +7,7 @@
 
 This RFC formalizes the Vortex type system by grounding `DType` as a quotient type over physical
 encodings and establishes a decision framework (based on refinement types) for when new `DType`
-variants are justified. It additionally proposes extending canonicalization from a single target
-(one canonical "normal form" per `DType`) to parameterized "sections" via `to_canonical_target`,
-allowing consumers to choose among multiple valid canonical targets (e.g., `List` vs. `ListView`).
+variants are justified.
 
 ## Motivation
 
@@ -28,15 +26,11 @@ logical types? What does a "different" logical type even mean?
 Another discussion we have had is if the choice of a canonical `ListView` is better or worse than a
 canonical `List` ([vortex#4699](https://github.com/vortex-data/vortex/issues/4699)). Both have the
 exact same logical type (same domain of values), but we are stuck choosing a single "canonical"
-encoding that we force every array of type `List` to decompress into. Is forcing everyone to
-decompress into the same physical encoding really what we want?
+encoding that we force every array of type `List` to decompress into. This question is explored
+further in a companion RFC ([RFC 9999](./9999-canonical-targets.md)).
 
-This RFC makes 2 proposals. The first is a more formalized definition of the Vortex type system, and
-this serves to justify the second proposal.
-
-The second proposal is to relax (or extend) the concept of a "canonical" type from choosing a unique
-physical encoding for every logical type (a unique normal form) to allowing many possible canonical
-targets (multiple normal forms).
+This RFC formalizes the Vortex type system definitions, and this formalization serves as the
+foundation for reasoning about questions like these.
 
 ## Type Theory Background
 
@@ -143,7 +137,7 @@ The critical insight is that `Canonical` represents several arbitrary **choices*
 nothing in the theory privileges `ListView` over `List` as the canonical representative for
 variable-length list data. Both are valid sections (since both pick a representative from the same
 equivalence class), and both satisfy `π(s(d)) = d`. The current system in Vortex simply hardcodes
-one particular section. The second proposal in this RFC is to allow _multiple sections_.
+one particular section.
 
 ### The Church-Rosser Property (Confluence)
 
@@ -164,10 +158,6 @@ approach is to define **separate reduction relations**, each of which is interna
 For example, instead of one global set of reduction rules, you define two strategies: strategy A
 always reduces to normal form X, and strategy B always reduces to normal form Y. Each strategy
 satisfies Church-Rosser independently, the only difference is which normal form they target.
-
-In Vortex, a similar scenario would be defining multiple strategies of canonicalization, where one
-strategy could target `List` as a canonical target (normal form) for list data, and another strategy
-could target `ListView`. See the [`List` vs. `ListView`](#list-vs-listview) section for more info.
 
 ### Refinement Types and the DType Decision Framework
 
@@ -240,178 +230,24 @@ earns its place in `DType`.
 
 Under this reading, `FixedSizeBinary` is an encoding or canonical form, not a logical type.
 
-## List vs. ListView
-
-There is also a separate question about whether the current `Canonical` system is the most ideal.
-The relationship between `List` and `ListView` ties all of the above concepts together and most
-directly motivates a multi-section (multiple normal form) proposal.
-
-`List` and `ListView` represent exactly the same logical data: a sequence of variable-length
-sub-arrays. Given an array of type `List(Int32)`, element `i` is a variable-length sequence of
-`Int32` values. This is true regardless of the physical layout.
-
-The distinction is entirely in the buffer layout:
-
-- **`List`** stores a single offsets buffer where `offsets[i]..offsets[i+1]` defines the range for
-  element `i`. Offsets are monotonically increasing. The child values buffer is contiguous and
-  non-overlapping, and every byte belongs to exactly one logical element.
-- **`ListView`** stores separate offsets and sizes buffers, where
-  `offsets[i]..offsets[i] + sizes[i]` defines the range for element `i`. This allows overlapping
-  views (two logical elements can share backing data) and gaps (regions of the values buffer that
-  belong to no element).
-
-This is a purely physical distinction, as no query operation can observe the difference.
-For example, `scalar_at(i)` will always return the same list, and `filter`, `take`, and `slice` all
-produce logically identical results.
-
-However, this physical distinction has massive performance implications. Converting from `ListView`
-to `List` requires rebuilding the entire array to eliminate overlaps and gaps. On the other hand,
-converting from `List` to `ListView` is trivial (sizes are just offset deltas).
-
-This asymmetry is notable: the section that targets `List` is more expensive to compute but produces
-a form with stronger structural guarantees (no aliasing, no gaps). The section that targets
-`ListView` is cheaper and permits aliasing and faster random access.
-
-Many of our consumers (particularly Arrow FFI boundaries and consumers of DataFusion) prefer `List`
-because Arrow is adding support for `ListView` slowly. Other consumers prefer `ListView` because
-some operations (namely random access and potentially dependent operations) are faster.
-
-It is highly unfortunate that we cannot canonicalize into different targets, and we are forced to
-always decompress into `ListView`. We have the same constraint on `VarBinView` vs `VarBin`, and
-while we haven't seen as many performance problems, it feels like a constraint that is too
-restrictive in Vortex.
-
-## Non-confluent Rewriting Design
-
-As a reminder, Vortex (maybe unintentionally) currently has a confluent rewriting system, where we
-"rewrite" (`to_canonical`) everything under an equivalence class (`DType`) into a singular normal
-form (`Canonical`). This part of the RFC proposes a design of a non-conflunet rewriting system.
-
-The proposal is to add a new `to_canonical_target` function that accepts a `CanonicalTarget`
-parameter, while keeping the existing `to_canonical` as a convenience that uses the default target.
-This minimizes breaking changes.
-
-```rust
-/// Canonicalize using the default target. Existing behavior, no breaking change.
-fn to_canonical(array: &Array) -> VortexResult<Canonical> {
-    to_canonical_target(array, CanonicalTarget::Default)
-}
-
-/// Canonicalize into a specific target.
-fn to_canonical_target(array: &Array, target: CanonicalTarget) -> VortexResult<Canonical>;
-```
-
-Where `CanonicalTarget` selects from a family of valid canonical forms:
-
-```rust
-/// A canonicalization target (selects which section to use).
-enum CanonicalTarget {
-    /// The default canonical forms. This is what the current system uses.
-    /// For lists: ListView. For strings: VarBinView.
-    Default,
-    /// Contiguous canonical forms, motivated by Arrow FFI boundaries and
-    /// consumers that need stronger structural guarantees.
-    /// For lists: List (monotonic offsets). For strings: VarBin (contiguous data).
-    Contiguous,
-}
-```
-
-The `Canonical` enum would use inner enums for the types where multiple canonical forms exist:
-
-```rust
-pub enum CanonicalList {
-    List(ListArray),
-    ListView(ListViewArray),
-}
-
-pub enum CanonicalVarBin {
-    VarBin(VarBinArray),
-    VarBinView(VarBinViewArray),
-}
-
-pub enum Canonical {
-    ...
-    VarBin(CanonicalVarBin),     // Maps to both Utf8 and Binary DTypes.
-    List(CanonicalList),         // Maps to List DType.
-    ...
-}
-
-array.to_canonical()?.scalar_at(i) == array.to_canonical_target(target)?.scalar_at(i)
-```
-
-Each target defines an internally confluent reduction strategy. Within `CanonicalTarget::Default`,
-all paths converge to `ListView`/`VarBinView`. Within `CanonicalTarget::Contiguous`, all paths
-converge to `List`/`VarBin`. The choice of target is thus made by the consumer (query engine,
-FFI boundary, serializer), not by the encoded array.
-
-For `DType`s where the distinction does not apply (e.g., `Primitive`, `Bool`, `Null`), both targets
-produce the same canonical form. The parameterization only has an effect where multiple valid
-canonical forms exist.
-
-Because `DType` is a quotient type and canonicalization is a section on that quotient, supporting
-multiple canonical targets is theoretically sound (adding this feature will not weaken any invariant
-of the Vortex type system). Because each `CanonicalTarget` defines an internally confluent reduction
-strategy, the quotient structure of `DType` guarantees that all well-defined operations produce
-the same logical results regardless of which target is chosen.
-
-```
-Logical type        (DType: purely semantic, not physical)
-        ▲
-        │  section 1: Default    (ListView, VarBinView)
-        │  section 2: Contiguous (List, VarBin)
-        │  section n: ...        (future targets)
-        ▼
-Canonical form      (a specific "normal form" encoding chosen by the section)
-        ▲
-        │  encode
-        │  decode
-        ▼
-Physical encoding   (dictionary, REE, bitpacked, etc.)
-```
-
-## Compatibility
-
-There shouldn't be any compatibility concerns here because even under a specific `DType`, the array
-tree is fully serialized, and consumers can always convert back and forth between `List` and
-`ListView` if they really need to.
-
-## Drawbacks
-
-The drawback is extra complexity in supporting multiple canonical targets. However, we've also had
-to spend time making optimizations and fixes (`is_zero_copy_to_list` for `ListView`, see
-[vortex#5129](https://github.com/vortex-data/vortex/pull/5129)) because we were forced to always
-canonicalize into a single target. So there is an obvious tradeoff here.
-
-## Alternatives
-
-The alternative is to just not do this. We continue to find workarounds when canonical encodings do
-not fit the use case.
-
 ## Prior Art
 
-- **Arrow** defines both `List` and `ListView` (and `LargeList`/`LargeListView`) as separate type
-  IDs in its columnar format. Arrow's canonical layout uses monotonic offsets (`List`), and
-  `ListView` support is being added incrementally across implementations. Arrow also distinguishes
-  `FixedSizeBinary` from `FixedSizeList<uint8>` at the type level.
-- **Parquet** has `FIXED_LEN_BYTE_ARRAY` as a distinct primitive type, separate from repeated
-  groups. This is a nominal distinction similar to the `FixedSizeBinary` question.
-- **DuckDB** uses a single canonical form per logical type and does not support multiple
-  canonicalization targets.
+- **Arrow** has a physical type system, defining both `List` and `ListView` (and
+  `LargeList`/`LargeListView`) as separate type IDs in its columnar format. Arrow also
+  distinguishes `FixedSizeBinary` from `FixedSizeList<uint8>` at the type level.
+- **Parquet** also has a physical type system, with `FIXED_LEN_BYTE_ARRAY` as a distinct primitive
+  type separate from repeated groups. This is a nominal distinction similar to the
+  `FixedSizeBinary` question.
 
 ## Unresolved Questions
 
 - Should `FixedSizeBinary<n>` be a `DType` variant (refinement type) or extension type metadata?
   See the [analysis above](#should-fixedsizebinary-be-a-dtype) for the case for and against.
-- What is the concrete set of `CanonicalTarget` variants? This RFC proposes `Default` and
-  `Contiguous`, but there may be other useful targets. Theoretically, we could have a target that
-  would allow us to return compressed arrays as a `Canonical` type!
 
 ## Future Possibilities
 
 - We can have extension types be a generalization of the refinement type pattern: for example we
   could enforce user-defined predicates that gate custom operations on existing `DType`s.
-- User-defined or plugin-defined canonical targets for custom FFI boundaries or serialization
-  formats.
 - Using the decision framework to audit existing `DType` variants and determine if any should be
   consolidated or split, as well as to make decisions about logical types we want to add (namely
   `FixedSizeBinary` and `Variant`).
