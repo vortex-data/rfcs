@@ -1,4 +1,5 @@
 - Start Date: 2026-03-04
+- Authors: Connor Tsui
 - RFC PR: [vortex-data/rfcs#24](https://github.com/vortex-data/rfcs/pull/24)
 
 # Fixed-shape Tensor Extension
