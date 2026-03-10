@@ -1,4 +1,5 @@
 - Start Date: 2026-02-27
+- Authors: Connor Tsui
 - RFC PR: [vortex-data/rfcs#5](https://github.com/vortex-data/rfcs/pull/5)
 
 # Extension Types

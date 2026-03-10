@@ -1,4 +1,5 @@
 - Start Date: YYYY-MM-DD (today's date)
+- Authors: John Smith, Foo Bar
 - RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
 
 # RFC Template
@@ -16,7 +17,8 @@ What problem does this solve? Include concrete use cases where possible.
 
 ## Design
 
-Describe the proposed design in enough detail that someone familiar with Vortex could implement it. This should cover:
+Describe the proposed design in enough detail that someone familiar with Vortex could implement it.
+This should cover:
 
 - New or modified APIs, traits, or vtable entries.
 - How this interacts with existing components (encodings, layouts, scan, file format, etc.).
@@ -61,7 +63,8 @@ How have other systems solved this or similar problems? Consider:
 - Database internals (DuckDB, DataFusion, Velox, etc.).
 - Relevant academic papers or blog posts.
 
-This section helps frame the design in a broader context. If there is no relevant prior art, that is fine.
+This section helps frame the design in a broader context.
+If there is no relevant prior art, that is fine.
 
 ## Unresolved Questions
 
@@ -71,4 +74,5 @@ This section helps frame the design in a broader context. If there is no relevan
 
 ## Future Possibilities
 
-What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
+What natural extensions or follow-on work does this enable? This is a good place to note related
+ideas that are out of scope for this RFC but worth capturing.

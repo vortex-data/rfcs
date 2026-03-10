@@ -1,4 +1,5 @@
 - Start Date: 2025-02-25
+- Authors: Adam Gutlick
 - RFC PR: [vortex-data/rfcs#15](https://github.com/vortex-data/rfcs/pull/15)
 
 # Variant Type
