@@ -31,7 +31,7 @@ decompressed forms, reducing the cost to `N + M`. See this
 ### What is a `Canonical` encoding?
 
 The `N + M` argument relies on a common decompression target that operations are implemented
-against. A **canonical encoding** is a physical encoding chosen as this representative for a logical
+against. A **canonical encoding** is a physical encoding chosen as the representation for a logical
 type (e.g., `VarBinView` for `Utf8`, `ListView` for `List`). The choice is deliberate and
 optimized for the common compute case, but not fundamental: nothing in theory privileges `ListView`
 over `List` for list data, for example.
@@ -44,8 +44,9 @@ type system. See [RFC 0005](./0005-extension.md) for the full design.
 
 ## Motivation
 
-This definition has mostly worked well for us. However, several recent discussions have revealed
-that this loose definition may be insufficient.
+The separation between logical types and physical encodings described above has mostly worked well
+for us. However, several recent discussions have revealed that this loose definition may be
+insufficient.
 
 For example, we would like to add a `FixedSizeBinary<n>` type, but it is unclear if this is
 necessary when it is mostly equivalent to `FixedSizeList<u8, n>`. Are these actually different
@@ -77,8 +78,7 @@ An **equivalence relation** `~` on a set `S` is a relation that is reflexive (`a
 relation partitions `S` into disjoint subsets called **equivalence classes**, where each class
 contains all elements that are equivalent to one another.
 
-A **quotient type** is a data type that falls under the general class of algebraic data types.
-Formally, a quotient type `A / ~` is formed by taking a type `A` and collapsing it by an equivalence
+A **quotient type** `A / ~` is formed by taking a type `A` and collapsing it by an equivalence
 relation `~`. The elements of the quotient type are the equivalence classes themselves: not
 individual values, but entire groups of values that are considered "the same."
 
@@ -118,14 +118,13 @@ Observe that every physical array (a specific encoding combined with actual data
 array. A `VarBinView` array can map to either `Utf8` or `Binary`, depending on whether its contents
 are valid UTF-8. Call this projection `π : Array → DType`.
 
-A **section** is a function going the other direction: `s : DType → Encoding`, that picks one
-specific physical encoding for each logical type, such that projecting back gives you the original
-`DType` (`π(s(d)) = d`). In other words, a section answers the question: "given a logical type,
-which physical encoding should I use to represent it?"
+A **section** is a right-inverse of this projection: a function `s : DType → Encoding` that injects
+each logical type back into the space of physical encodings, such that projecting back recovers the
+original `DType` (`π(s(d)) = d`). In other words, a section answers the question: "given a logical
+type, which physical encoding should I use to represent it?"
 
 **In Vortex**, the current `to_canonical` function is a section. For each `DType`, it selects
-exactly one canonical physical form. Observe how the `Canonical` enum is essentially identical to
-the `DType` enum (with the exception of `VarBinView` with `Utf8` and `Binary`):
+exactly one canonical physical form:
 
 ```rust
 /// The different logical types in Vortex (the different equivalence classes).
@@ -143,14 +142,14 @@ pub enum DType {
     Extension(ExtDTypeRef),
 }
 
-/// We "choose" the set of representatives of each of the logical types.
+/// We "choose" the set of representations for each of the logical types.
 /// This is the image/result of the `to_canonical` function (where `to_canonical` is the section).
 pub enum Canonical {
     Null(NullArray),
     Bool(BoolArray),
     Primitive(PrimitiveArray),
     Decimal(DecimalArray),
-    VarBinView(VarBinViewArray), // Note that `VarBinView` maps to both `Utf8` and `Binary`.
+    VarBinView(VarBinViewArray), // Note that both `Utf8` and `Binary` map to `VarBinView`.
     List(ListViewArray),
     FixedSizeList(FixedSizeListArray),
     Struct(StructArray),
@@ -158,17 +157,25 @@ pub enum Canonical {
 }
 ```
 
-More formally, `Canonical` enumerates the **image** of the section function `to_canonical`.
+More formally, `Canonical` enumerates the **image** of the section `to_canonical`. Note that the
+section is _not_ a bijection between `DType` and `Canonical`: multiple logical types can share the
+same canonical form. For example, both `Utf8` and `Binary` canonicalize to `VarBinView`.
 
-The critical insight is that `Canonical` represents several arbitrary **choices**. For example,
-nothing in the theory privileges `ListView` over `List` as the canonical representative for
-variable-length list data. Both are valid sections (since both pick a representative from the same
-equivalence class), and both satisfy `π(s(d)) = d`. The current system in Vortex simply hardcodes
-one particular section.
+This non-bijection is deliberate. If `DType` and `Canonical` were in bijection, the physical type
+system would "leak" into the logical types.
 
-Note that even dictionary encoding or run-end encoding are theoretically valid sections (they
-satisfy `π(s(d)) = d`). The fact that we choose flat, uncompressed forms as canonical is a design
-choice optimized for compute, not a theoretical requirement.
+For example, if two logically distinct types coincidentally share the same physical layout, a
+bijective section would conflict with having both as separate logical `DType`s since "there is no
+physical reason for the second." But this reasoning is backwards: logical types are justified by
+their _semantics_ (the operations they gate and the refinement predicates they carry), not by
+whether they coincidentally share a physical representation.
+
+`Canonical` also represents several arbitrary **choices**. Nothing in the theory privileges
+`ListView` over `List` as the canonical representation for variable-length list data. Both are valid
+sections (both pick a representation from the same equivalence class), and both satisfy
+`π(s(d)) = d`. Even dictionary encoding or run-end encoding are theoretically valid sections. The
+fact that we choose flat, uncompressed forms as canonical is a design choice optimized for compute,
+not a theoretical requirement.
 
 ### The Church-Rosser Property (Confluence)
 
@@ -210,67 +217,133 @@ predicate `valid_utf8` is what justifies the separate `DType` variant: it gates 
 Without this predicate, `Utf8` and `Binary` would be the same type, and maintaining both would be
 redundant.
 
-## What justifies a new type?
+Similarly, `FixedSizeList` is a refinement of `List`:
 
-With the formalizations above, we have a framework that gives us a set of questions to guide whether
-a new `DType` variant is justified:
+```
+FixedSizeList<T, n>  ~=  { l : List<T> | len(l) = n }
+```
 
-1. **Does it gate different query operations?** If yes, does Vortex core own those operations? If
-   so, it should be a first-class `DType` (refinement type). If only external consumers need them,
-   an extension type suffices (see [RFC 0005](./0005-extension.md)).
-2. **Is it structurally distinct from an existing `DType`?** If yes, there may be a case for a new
-   `DType` variant. However, this depends on whether the structural difference provides enough
-   practical benefit to justify the added complexity.
-3. If neither, it should just be a new physical encoding.
+The predicate `len(l) = n` constrains the domain of values, and it does gate certain operations:
+knowing the size at the type level enables static indexing, fixed-shape tensor operations, and
+reshaping without runtime length checks. These two examples (`Utf8` and `FixedSizeList`) illustrate
+how refinement predicates can justify new logical types through operation gating, which is central
+to the decision framework detailed in the next section.
 
-These decisions are mostly design choices rather than strict theoretical requirements. For example,
-`Utf8` could theoretically be an extension type over `Binary` with a `valid_utf8` predicate. The
-main reason it is a first-class `DType` is because we want to have optimized string kernels in the
-core Vortex library.
+## What justifies a new logical type?
+
+The formalizations above give us a two-step decision framework. The first step decides whether a new
+logical type is justified at all, and the second decides whether it should be a core type (a new
+variant of `DType`) or an extension type.
+
+**Step 1: Is a new logical type justified?** A new logical type is justified when it is
+distinguishable from existing types by one of the following criteria:
+
+1. **Is it semantically distinct?** (Quotient type criterion.) The values must form a genuinely
+   different equivalence class, not merely a different physical layout.
+2. **Does it have a refinement predicate that gates different operations?** (Refinement type
+   criterion.) A predicate that restricts the domain of values _and_ enables or disables specific
+   operations justifies a new logical type. For example, `valid_utf8` gates string operations that
+   are not meaningful on arbitrary binary data, so `Utf8` is a distinct logical type from `Binary`.
+
+If neither criterion applies, the difference is purely physical and belongs in the encoding layer.
+
+**Step 2: Core type or extension type?** Once a new logical type is justified, the question is
+whether it belongs in the core `DType` enum or as an extension type (see
+[RFC 0005](./0005-extension.md)).
+
+This must be a pragmatic decision: if the operations gated by the type are owned by core Vortex
+(e.g., string kernels for `Utf8`), it should be a first-class `DType`. If the gated operations are
+specific to external consumers (e.g., UUID-specific operations), an extension type suffices (see the
+comparison to programming language built-in types below).
+
+### Pragmatic Choices: Core Types in Programming Languages
+
+Every programming language must decide which types are built-in primitives and which are
+user-defined. This is a universal design decision, and different languages draw the boundary in
+different places:
+
+- **OCaml**: `int`, `float`, `char`, `string`, `bool`, `unit`, `list`, `array`, `option`, `ref`,
+  and tuples are built-in. Notably, `char` is not a refinement of `int` at the language level even
+  though it is represented as one.
+- **Haskell**: `Int`, `Integer`, `Float`, `Double`, `Char`, `Bool`, tuples, lists, `Maybe`,
+  `Either`, `IO`. `String` is defined as `[Char]` (a type alias, not a built-in), yet it is
+  pervasive in the language ecosystem.
+- **Rust**: `i8` through `i128`, `u8` through `u128`, `f32`, `f64`, `bool`, `char`, `str`, tuples,
+  arrays, slices, and references. Rust distinguishes each integer width as a separate type rather
+  than having a single `Integer` type parameterized by bit-width.
+- **Agda, Coq, Lean**: Proof assistants based on dependent type theory with essentially no built-in
+  data types. `Nat`, `Bool`, `List`, and everything else are defined inductively in standard
+  libraries. However, even these systems pragmatically add primitive types for performance: Coq
+  added `Int63` and `Float64` as kernel primitives, and Lean has opaque runtime types (`Nat`,
+  `UInt8`-`UInt64`, `Float`, `String`) that bypass the inductive definitions. The type theory is
+  maximally minimal, but practical implementations end up adding built-in representations anyway.
+
+Several observations are relevant to the Vortex type system:
+
+- Numeric types are universally built-in (even the proof assistants add them back), even though they
+  are derivable from more primitive constructs. The justification is performance and ergonomics.
+  This parallels Vortex having `Primitive(PType)` as a first-class `DType` rather than encoding
+  integers as `List<u8>` with a width constraint.
+- String types are almost universally built-in, even though they are refinements of byte sequences.
+  Haskell's `String` is `[Char]`, and Rust's `str` is `[u8]` with a UTF-8 invariant. The
+  justification is the same as Vortex's `Utf8` over `Binary`: the `valid_utf8` predicate gates
+  enough core operations to warrant a dedicated type.
+- Rust has separate types for `i8`, `i16`, `i32`, `i64`, and `i128` rather than a single `Integer`
+  type with a bit-width refinement. This is analogous to Vortex having separate `PType` variants for
+  each primitive width: each width gates different operations (e.g., SIMD lanes, overflow behavior)
+  and has different performance characteristics.
+
+The takeaway is that _every_ type system could in principle be collapsed to a minimal core (as the
+proof assistants demonstrate), but no practical system does this.
+
+The question of "should X be a core type or a user-defined type?" is always answered by pragmatics:
+does the type gate enough core operations and is it central enough to the system's compute model to
+justify built-in support? Vortex's decision framework above is how we answer this question for
+`DType` variants.
 
 ### Should `FixedSizeList` be a type?
 
 We can apply this framework to an existing type, `FixedSizeList`:
 
-**Does it gate different query operations?** No. A fixed-size list is a list with the additional
-constraint that every element has the same length `n`, but `scalar_at`, `filter`, `take`, etc. all
-behave identically regardless of whether the list is fixed-size.
+**Is it semantically distinct from an existing `DType`?** No. `FixedSizeList` has a different
+_physical_ layout (no offsets buffer), but this is a physical difference, not a logical one.
+Logically, it is a refinement type over `List` (as shown in the Refinement Types section above).
 
-**Is it structurally distinct from an existing `DType`?** Yes. `FixedSizeList` has a different
-physical layout (no offsets buffer, since all elements have the same size). However, this does not
-automatically justify a new `DType` variant. A `List` whose offsets are a constant stride would
-compress extremely well (a `SequenceArray`), and encodings in Vortex are designed to exploit exactly
-this kind of redundancy.
+**Does it gate different query operations?** Yes. Knowing the size at the type level enables
+operations like static indexing, fixed-shape tensor reshaping, and compile-time size checks that are
+not available on variable-size lists.
 
-The argument for keeping `FixedSizeList` as its own `DType` is that it makes the fixed-size
-invariant explicit at the type level, which simplifies downstream consumers that want to rely on
-it (e.g., fixed-shape tensors). The argument against is that it adds a variant to the `DType` enum
-that is logically equivalent to `List` with a constraint.
+By the decision framework, `FixedSizeList` is a justified logical type (it has a refinement
+predicate that gates operations).
 
-Ultimately, we decided in the past that the structural difference merits its own `DType` variant,
-but an argument can be made that it does not warrant one.
+The remaining question is Step 2: should it be a core `DType` or an extension type? The argument for
+a core type (which is what we decided in the past) is that the fixed-size invariant is such a
+pervasive feature in types (for example, fixed-shape tensors like vectors and matrices) that it
+doesn't make sense to ship `FixedSizeList` as a second-class extension type.
 
 ### Should `FixedSizeBinary` be a type?
 
 A similar question applies to `FixedSizeBinary<n>` vs. `FixedSizeList<u8, n>`:
 
-**Does it gate different query operations?** This is unclear. `FixedSizeBinary<n>` signals "opaque
-binary data" (UUIDs, hashes, IP addresses) whereas `FixedSizeList<u8, n>` signals "a list of bytes
-that happens to have a fixed length." One could argue that `FixedSizeBinary` carries the invariant
-that individual bytes are not independently meaningful, which would gate byte-level list operations.
-However, this invariant is weaker than something like `valid_utf8`, and it is not obvious that the
-core Vortex library would ship any operations gated by it.
+**Is it semantically distinct from an existing `DType`?** This is debatable. `FixedSizeBinary<n>`
+and `FixedSizeList<u8, n>` have the same physical layout (a flat buffer of `n`-byte elements), but
+semantically a "4-byte opaque blob" (e.g., a UUID prefix or hash) is arguably different from "a list
+of 4 individual bytes." Whether this semantic distinction is strong enough to constitute a different
+equivalence class is not obvious.
 
-If the answer is **yes** (it gates operations), then the next question is whether Vortex core owns
-those operations. If so, `FixedSizeBinary` is a first-class refinement type. If not, it should be
-an extension type.
+**Does it have a refinement predicate that gates different operations?** This is unclear.
+`FixedSizeBinary<n>` signals "opaque binary data" (UUIDs, hashes, IP addresses) whereas
+`FixedSizeList<u8, n>` signals "a list of bytes that happens to have a fixed length." One could
+argue that `FixedSizeBinary` carries the invariant that individual bytes are not independently
+meaningful, which would gate byte-level list operations. However, this invariant is weaker than
+something like `valid_utf8`, and it is not obvious that the core Vortex library would ship any
+operations gated by it.
 
-If the answer is **no** (it does not gate operations), then: **is it structurally distinct from an
-existing `DType`?** `FixedSizeBinary<n>` has the same physical layout as `FixedSizeList<u8, n>` (a
-flat buffer of `n`-byte elements), so the answer is no. By the decision framework, this means it
-should be modeled as a canonical form or extension type metadata rather than a new `DType` variant.
-
-This question remains unresolved. See [Unresolved Questions](#unresolved-questions).
+Both Step 1 criteria are inconclusive for `FixedSizeBinary`. There is a plausible semantic
+distinction and a plausible (but weak) refinement predicate, but neither is clear-cut. If the answer
+to either is **yes**, then we move to Step 2: does Vortex core own enough operations gated by this
+type to justify a first-class `DType`, or should it be an extension type? This question remains
+unresolved. See [Unresolved Questions](#unresolved-questions).
 
 ## Prior Art
 
