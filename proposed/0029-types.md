@@ -6,9 +6,19 @@
 
 ## Summary
 
+Vortex separates logical types (`DType`) from physical encodings, but the boundary between them has
+been defined informally. This has led to recurring debates, such as whether `FixedSizeBinary<n>`
+warrants a new `DType` variant or is merely `FixedSizeList<u8, n>` under a different name. More
+fundamentally, we lack a shared vocabulary for reasoning about what makes two types "different" at
+the logical level.
+
 This RFC formalizes the Vortex type system by grounding `DType` as a quotient type over physical
-encodings and establishes a decision framework (based on refinement types) for when new `DType`
-variants are justified.
+encodings: each `DType` variant names an equivalence class of encodings that decode to the same
+logical values. It then uses refinement types to establish a decision framework for when new `DType`
+variants are justified. A new logical type requires either semantic distinctness (a genuinely
+different equivalence class) or a refinement predicate that gates operations unavailable on the
+parent type. If justified, a second step determines whether the type belongs in core `DType` or as
+an extension type.
 
 ## Overview
 
