@@ -47,12 +47,10 @@ array slot itself to be absent. A non-nullable variant guarantees that the slot 
 does **not** guarantee that extracted paths will be non-null.
 
 This is distinct from the semantic null value inside the variant payload, which I'll call
-`variantnull` here to match the implementation discussion in
-[vortex-data/vortex#6912](https://github.com/vortex-data/vortex/pull/6912). A `variantnull` is a
-present variant value whose payload is `null`, while an outer null is the absence of the variant
-value itself. In scalar form this is the difference between
-`Scalar::null(DType::Variant(Nullability::Nullable))` and
-`Scalar::variant(Scalar::null(DType::Null))`.
+`variantnull`. A `variantnull` is a present variant value whose payload is
+`null`, while an outer null is the absence of the variant value itself.
+In scalar form this is the difference between `Scalar::null(DType::Variant(Nullability::Nullable))`gst
+and `Scalar::variant(Scalar::null(DType::Null))`.
 
 Typed extraction from a variant should therefore still return nullable arrays even when the source
 variant column is non-nullable. A path can be missing in a given row, have an unexpected type, or
@@ -142,7 +140,7 @@ As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type
 - Iceberg seems to support the variant type (as described in [this](https://docs.google.com/document/d/1sq70XDiWJ2DemWyA5dVB80gKzwi0CWoM0LOWM7VJVd8/edit?tab=t.0) proposal), but the docs are minimal.
 - Datafusion's variant support is being developed [here](https://github.com/datafusion-contrib/datafusion-variant), its unclear to me how much effort is going into it and whether its going to be merged upstream.
 - DuckDB doesn't support a variant type. It does have a [Union](https://duckdb.org/docs/stable/sql/data_types/union) type, but its basically a struct. It also seems to have support for Parquet's shredding, but I can't find any docs and seems like PRs are being merged as I'm looking through their issues.
-- Databricks supports some specialized [variant functions](https://docs.databricks.com/gcp/en/sql/language-manual/sql-ref-functions-builtin#variant-functions).
+- Databricks supports some specialized [variant functions](https://docs.databricks.com/gcp/en/sql/language-manual/sql-ref-functions-builtin#variant-functions), and their docs show a [good example](https://docs.databricks.com/aws/en/sql/language-manual/functions/is_variant_null) of null vs variant null.
 
 ## Unresolved Questions
 
