@@ -23,7 +23,7 @@ enum Variant {
 }
 ```
 
-Here the semantic `null` value inside the variant payload is represented as
+Here `variantnull` value inside the variant payload is represented as
 `Scalar::null(DType::Null)`. That is distinct from the outer nullability of the
 `Variant` dtype itself.
 
@@ -49,7 +49,7 @@ does **not** guarantee that extracted paths will be non-null.
 This is distinct from the semantic null value inside the variant payload, which I'll call
 `variantnull`. A `variantnull` is a present variant value whose payload is
 `null`, while an outer null is the absence of the variant value itself.
-In scalar form this is the difference between `Scalar::null(DType::Variant(Nullability::Nullable))`gst
+In scalar form this is the difference between `Scalar::null(DType::Variant(Nullability::Nullable))`
 and `Scalar::variant(Scalar::null(DType::Null))`.
 
 Typed extraction from a variant should therefore still return nullable arrays even when the source
