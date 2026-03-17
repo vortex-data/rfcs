@@ -23,11 +23,15 @@ enum Variant {
 }
 ```
 
+Here the semantic `null` value inside the variant payload is represented as
+`Scalar::null(DType::Null)`. That is distinct from the outer nullability of the
+`Variant` dtype itself.
+
 Different systems have different variations of this idea, but at its core its a type that can hold nested data with either a flexible or no schema.
 
 Variant types are usually stored in two ways - values that aren't accessed often in some system-specific binary encoding, and some number of "shredded" columns, where a specific key is extracted from the variant and stored in a dense format with a specific type, allowing for much more performant access. This design can make commonly accessed subfields perform like first-class columns, while keeping the overall schema flexible. Shredding policies differ by system, and can be pre-determined or inferred from the data itself or from usage patterns.
 
-This document proposed adding a new `DType` variant named `Variant`, a logical type describing this group of data encodings and behavior, with its own canonical representation (see below).
+This document proposes adding a new `DType::Variant(Nullability)`, a logical type describing this group of data encodings and behavior, with its own canonical representation (see below).
 
 ### Arrow representation
 
@@ -37,9 +41,27 @@ Supporting extension types requires replacing the target `DataType` and nullabil
 
 ### Nullability
 
-In order to support data with a changing or unexpected schema, Variant arrays are always nullable, even for a specific key/path, its value might change type between items which will cause null values in shredded children.
+`Variant` should follow the same top-level nullability model as every other Vortex dtype:
+`DType::Variant(Nullability)` can be nullable or non-nullable. A nullable variant allows the
+array slot itself to be absent. A non-nullable variant guarantees that the slot is present, but it
+does **not** guarantee that extracted paths will be non-null.
 
-Combined with shredding, handling nulls can be complex and is encoding dependent (Like this [parquet example](https://github.com/apache/parquet-format/blob/master/VariantShredding.md#arrays) for handling arrays).
+This is distinct from the semantic null value inside the variant payload, which I'll call
+`variantnull` here to match the implementation discussion in
+[vortex-data/vortex#6912](https://github.com/vortex-data/vortex/pull/6912). A `variantnull` is a
+present variant value whose payload is `null`, while an outer null is the absence of the variant
+value itself. In scalar form this is the difference between
+`Scalar::null(DType::Variant(Nullability::Nullable))` and
+`Scalar::variant(Scalar::null(DType::Null))`.
+
+Typed extraction from a variant should therefore still return nullable arrays even when the source
+variant column is non-nullable. A path can be missing in a given row, have an unexpected type, or
+evaluate to `variantnull`, and each of those cases becomes null in the extracted child.
+
+Combined with shredding, handling nulls can still be complex and is encoding dependent (like this
+[parquet example](https://github.com/apache/parquet-format/blob/master/VariantShredding.md#arrays)
+for handling arrays), but that is separate from whether the outer `Variant` column itself is
+nullable.
 
 ### Expressions
 
@@ -54,7 +76,14 @@ Every variant encoding will need to be able to dispatch these behaviors, returni
 
 ### Scalar
 
-While there has been talk for a long time of converting the Vortex scalar system from an enum to length 1 arrays, I do believe the current system actually works very well for variants, and the Variant scalar can just be some version of the type described above.
+While there has been talk for a long time of converting the Vortex scalar system from an enum to
+length 1 arrays, I do believe the current system actually works very well for variants. A variant
+scalar can simply wrap another row-specific `Scalar`, rather than needing a dedicated scalar enum
+just for variants.
+
+That model also makes the null semantics explicit. `Scalar::null(DType::Variant(Nullability::Nullable))`
+means the variant scalar itself is missing. `Scalar::variant(Scalar::null(DType::Null))` means the
+variant is present and its payload is `variantnull`.
 
 Just like when extracting child arrays, Variant's need to support an additional expression, `get_variant_scalar(idx, path, dtype)` that will indicate the desired dtype.
 
