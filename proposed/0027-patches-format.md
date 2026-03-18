@@ -124,11 +124,13 @@ In practice, we perform the operation by
 - Intersecting the filter with our patches, ideally in a chunk-at-a-time way so we can write a vectorized version.
 - Applying the filtered patches over the executed child
 
-## ScalarFns
+## `ScalarFn`s
 
-We do not reduce any ScalarFns through the operation, instead they only run at execution time.
+The behavior of some scalar functions may be undefined over placeholder values that exist in the inner array. For example, integer addition may overflow.
 
-This matches the current behavior of BitPackedArrays.
+To avoid this, only scalar functions where `ScalarFnVTable::is_fallible()` is `false` can be kernelized.
+
+Currently, this only applies to the `CompareKernel`, which will push down to inner, then perform the comparison on the patches as well.
 
 ---
 
