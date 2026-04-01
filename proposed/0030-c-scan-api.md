@@ -1,7 +1,7 @@
 - Start Date: 2026-03-13
 - Authors: Mikhail Kot
 
-# C Scan API
+# High level C Scan API
 ## Summary
 
 Provide a layered C Scan API for non-Rust clients[^1], each layer exposing more
@@ -72,7 +72,10 @@ requires sync hosts to manage their own event loop which is tedious.
 Another benefit of splitting API into layers is that it can be discussed and
 implemented separately.
 
-## High level API
+As this is a big change, this PR will from now on focus just on the high level
+scan API. Other levels may be implemented later on demand.
+
+## Overview
 
 ```
 ┌──────────┐
@@ -91,7 +94,7 @@ implemented separately.
  └─►Array (thread unsafe)
 ```
 
-### DataSource
+## DataSource
 
 A DataSource is a reference to multiple possibly remote files. When created, it
 opens first file to determine the schema from DType, all other operations are
@@ -187,7 +190,7 @@ to a query engine.
     Memory allocation customization is out of scope of this proposal, but it's
     possible for Vortex to expose bringing allocator from outside for buffers.
 
-### Scan
+## Scan
 
 A Scan is a one-time traversal of files in a DataSource. A Scan can't be
 restarted once requested. Hosts are encouraged to utilize multiple threads for
@@ -262,7 +265,7 @@ vx_data_source_scan(const vx_data_source *ds, const vx_scan_options *options,
     vx_estimate* estimate, vx_error **err);
 ```
 
-### Partition
+## Partition
 
 A Partition allows a worker thread to produce Arrays thread-unsafely.
 Partitions also allow exporting the data to ArrowArrayStream for hosts
@@ -291,7 +294,7 @@ void vx_partition_scan_arrow(const vx_partition *partition,
 const vx_array *vx_partition_next(vx_partition *partition, vx_error **err);
 ```
 
-### Array introspection
+## Array introspection
 
 The main question is how to transform outputs of iteration, `vx_array`, into
 something query engines can operate with. You need to execute the array
@@ -299,26 +302,10 @@ iteratively till you recognize data and start exporting it. Thus API provides a
 way to scan partitions directly into ArrowArrayStream which should be good
 enough for most hosts.
 
-## Middle level
-
-TODO
-
-## Low level
-
-TODO
-
 ## Compatibility
 
 No impact. Existing C Scan API will exist for some time but will be removed
 eventually.
-
-## Drawbacks
-
-TODO
-
-## Alternatives
-
-TODO
 
 ## Prior Art
 
