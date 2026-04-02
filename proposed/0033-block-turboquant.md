@@ -591,6 +591,128 @@ New tests needed:
 - Per-block norm consistency with input vectors
 - Encode/decode benchmarks (see Performance analysis)
 
+## Future work: GPU decode and fused distance computation
+
+### Motivation
+
+For ANN search workloads, the dominant operation is computing distances between
+a query vector and millions of database vectors. On GPU, the goal is to perform
+this computation directly on the compressed representation, avoiding the cost
+of materializing full decompressed vectors in HBM. BlockTurboQuant's 64-dim
+block structure maps naturally to GPU tile sizes and tensor core operations.
+
+### Decode as GEMM
+
+The decode path for a single 64-dim block is:
+
+```
+decoded_block = norm × R⁻¹ × codebook_lookup(codes)
+```
+
+For a batch of N vectors sharing the same block's rotation matrix R⁻¹:
+
+```
+decoded_batch = diag(norms) × R⁻¹ × codebook_lookup_batch(codes)
+                                      ↑ 64×N matrix
+                               ↑ 64×64 × 64×N = GEMM
+```
+
+The codebook lookup produces a 64×N matrix (one column per vector, each entry
+is `centroids[code]`), and the inverse rotation is a 64×64 matrix multiply —
+a GEMM that maps directly to tensor cores.
+
+**Partial decompression pipeline on GPU:**
+
+1. **Decompress rotation matrix** (once per block, shared across all vectors):
+   - If stored as bitpacked SRHT signs: FastLanes SIMD unpack on CUDA cores,
+     then expand to 64×64 matrix in shared memory
+   - If stored as dense 64×64 matrix: direct load to shared memory (16 KB)
+
+2. **Decompress norms** (per vector, per block):
+   - If cascade-compressed with ALP or Pco: decompress via FastLanes on CUDA
+     cores into a register tile
+   - If uncompressed: direct load
+
+3. **Codebook gather** (per vector, per block):
+   - Stage the codebook in shared memory (16 entries × 4 bytes = 64 bytes at
+     b=4 — trivially small)
+   - Gather: stream code bytes from HBM, look up centroid values in shared
+     memory, assemble 64×N tile
+
+4. **Fused GEMM + scale**:
+   - R⁻¹ × gathered tile (64×64 × 64×N) on tensor cores
+   - Column-wise multiply by norms (element-wise scale)
+
+Steps 3-4 can be fused into a single kernel, following the double-buffered
+streaming pattern from Flash-KMeans [5]: prefetch the next batch of code bytes
+from HBM while computing the current batch's GEMM on tensor cores. This avoids
+materializing the full decompressed vectors in HBM — the decoded output is
+either consumed immediately by a distance computation or written once to the
+output buffer.
+
+### Fused distance computation (no decode)
+
+For distance computation without full decompression, the operation per block is:
+
+```
+dot_contribution_k = ‖query_k‖ × ‖data_k‖ × Σ_j dist_table[q_code[j]][d_code[j]]
+```
+
+On GPU, this becomes:
+
+1. **Stage distance table in shared memory**: `dist_table[i][j] = centroids[i] ×
+   centroids[j]`, 16×16 = 1 KB at b=4. Fits trivially in shared memory.
+
+2. **Stream code bytes from HBM**: For each 64-vector × 64-dim tile (matching
+   the PDX layout), gather from the distance table and accumulate in registers.
+   This is a gather-reduce pattern — no GEMM, just table lookups and FP adds.
+
+3. **Norm weighting**: After accumulating the unit-norm dot product for all
+   64 dimensions in a block, multiply by the query and data block norms.
+   Norms for 64 vectors fit in a single register tile.
+
+4. **Cross-block accumulation**: Sum the weighted dot products across all k
+   blocks to get the final distance estimate.
+
+The memory access pattern follows Flash-KMeans [5]: stream data tiles from HBM
+with double-buffered prefetch, accumulate on-chip, write only the final result.
+The key difference is that Flash-KMeans streams full float vectors while we
+stream quantized code bytes — 4-8× less HBM bandwidth per vector.
+
+### Int8 tensor core path (b=9)
+
+At b=9, the MSE component uses 8-bit codes. These are indices into a 256-entry
+codebook, not raw int8 values — so direct int8 tensor core GEMM does not apply
+without transformation. However, if the codebook is approximately linear
+(centroids roughly evenly spaced), the codes could be treated as approximate
+int8 values with a linear rescaling, enabling direct int8 GEMM for the inner
+product computation. This sacrifices some quantization optimality (linear
+quantization vs. Max-Lloyd optimal) but enables tensor core throughput.
+
+Whether this tradeoff is worthwhile depends on the application: for ANN ranking
+(where relative ordering matters more than absolute accuracy), linear int8 may
+be sufficient. For reconstruction (where MSE matters), Max-Lloyd centroids are
+preferred and the gather-from-codebook path should be used.
+
+### Interaction with Vortex file format
+
+The GPU decode pipeline reads compressed data from Vortex files:
+
+1. **File reader** loads compressed segments from storage (S3, local SSD)
+2. **Host-side cascade decompression** (BitPacked → codes, ALP → norms) or
+   direct GPU transfer of already-decompressed segments
+3. **GPU kernel** performs fused decode or fused distance computation
+
+The BlockTurboQuant encoding's child arrays (codes, norms, rotation signs) are
+individually compressed by the cascading compressor. For GPU decode, we need
+either:
+- Host-side decompression of the cascade, then GPU transfer of the raw children
+- Direct GPU decompression of FastLanes/ALP (if GPU decompression kernels exist)
+
+The 64-dim block structure ensures that rotation matrices (64×64 dense or 192
+bits SRHT signs) fit comfortably in GPU shared memory, enabling the fused
+decode kernel without spilling to HBM.
+
 ## References
 
 [1] Zandieh, A., Daliri, M., Hadian, M. and Mirrokni, V. "TurboQuant: Online
@@ -605,3 +727,6 @@ Transform." Advances in Adaptive Data Analysis, 3(1-2):115-126, 2011.
 
 [4] Kuffo, L., Krippner, E. and Boncz, P. "PDX: A Data Layout for Vector
 Similarity Search." Proceedings of SIGMOD '25. arXiv:2503.04422, March 2025.
+
+[5] Yang, S. et al. "Flash-KMeans: Fast and Memory-Efficient Exact K-Means."
+arXiv:2603.09229, March 2026.
