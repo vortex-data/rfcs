@@ -218,11 +218,11 @@ by the NormVector encoding (PR #7251).
 The per-block norms are stored as a single `FixedSizeListArray<F>` with
 `list_size = num_blocks`, where `F` matches or widens the input element type:
 
-| Input dtype | Norm dtype | Rationale |
-|-------------|-----------|-----------|
-| f16         | f32       | f16 has insufficient range/precision for norms |
-| f32         | f32       | Same type |
-| f64         | f64       | Preserve full precision |
+| Input dtype | Norm dtype | Rationale                                      |
+| ----------- | ---------- | ---------------------------------------------- |
+| f16         | f32        | f16 has insufficient range/precision for norms |
+| f32         | f32        | Same type                                      |
+| f64         | f64        | Preserve full precision                        |
 
 Norms are stored as plain child arrays — TurboQuant does not apply any secondary
 encoding to them. The cascading compressor treats norms like any other float
@@ -245,6 +245,7 @@ With block decomposition and externalized norms, quantized cosine similarity
 requires more work than the current single-block approach.
 
 **Quantized dot product:**
+
 ```
 <a, b> ≈ Σ_k ‖aₖ‖ · ‖bₖ‖ · Σ_j centroids[code_aₖ[j]] · centroids[code_bₖ[j]]
 ```
@@ -253,6 +254,7 @@ Per-block: compute the unit-norm quantized dot product (sum over 64 centroid
 products), then weight by both vectors' block norms.
 
 **Quantized cosine similarity:**
+
 ```
 cos(a, b) ≈ <a, b> / (‖a‖ · ‖b‖)
            = Σ_k ‖aₖ‖ · ‖bₖ‖ · unit_dotₖ
@@ -334,6 +336,7 @@ In a second stage, we transpose the code storage from row-major to
 dimension-major within groups of 64 vectors, following the PDX layout [4].
 
 **Row-major (Stage 1):**
+
 ```
 Vector 0: [b0_d0 b0_d1 ... b0_d63 | b1_d0 ... b1_d63 | ... ]
 Vector 1: [b0_d0 b0_d1 ... b0_d63 | b1_d0 ... b1_d63 | ... ]
@@ -344,6 +347,7 @@ All codes for a single vector are contiguous. Good for per-vector decode, bad
 for vectorized scans.
 
 **PDX (Stage 2), within each 64-vector chunk:**
+
 ```
 Block 0, dim 0: [v0 v1 v2 ... v63]
 Block 0, dim 1: [v0 v1 v2 ... v63]
@@ -450,18 +454,18 @@ in row-major or PDX-transposed layout.
 For f32 input at dimension d with bit width b (QJL, so b-1 MSE bits + 1 QJL
 bit), k = ⌈d/64⌉ blocks, B = 64:
 
-| Component | Bits per vector |
-|-----------|----------------|
-| MSE codes | k × B × (b-1) |
-| QJL signs | k × B × 1 |
-| Block norms | k × norm_bits |
-| QJL residual norms | k × norm_bits |
+| Component          | Bits per vector |
+| ------------------ | --------------- |
+| MSE codes          | k × B × (b-1)   |
+| QJL signs          | k × B × 1       |
+| Block norms        | k × norm_bits   |
+| QJL residual norms | k × norm_bits   |
 
-| Component | Shared bits |
-|-----------|-------------|
-| Centroids | 2^(b-1) × 32 |
-| MSE rotation signs | k × 3 × B |
-| QJL rotation signs | k × 3 × B |
+| Component          | Shared bits  |
+| ------------------ | ------------ |
+| Centroids          | 2^(b-1) × 32 |
+| MSE rotation signs | k × 3 × B    |
+| QJL rotation signs | k × 3 × B    |
 
 ### Example: f32, d=768, b=5 (4-bit MSE + 1-bit QJL), 1000 vectors, k=12
 
@@ -487,10 +491,10 @@ bit), k = ⌈d/64⌉ blocks, B = 64:
 
 ### Comparison: current single-SRHT TurboQuant
 
-| Dimension | Current ratio | Block ratio | Delta |
-|-----------|--------------|-------------|-------|
-| 768 (padded→1024) | 4.7× | 5.3× | +13% better |
-| 1024 (no padding) | 6.3× | 5.3× | -16% worse |
+| Dimension         | Current ratio | Block ratio | Delta       |
+| ----------------- | ------------- | ----------- | ----------- |
+| 768 (padded→1024) | 4.7×          | 5.3×        | +13% better |
+| 1024 (no padding) | 6.3×          | 5.3×        | -16% worse  |
 
 For power-of-2 dimensions, the block approach uses more storage due to per-block
 norms and QJL residual norms (k × 2 × 32 bits/vector overhead). At d=1024 with
@@ -506,12 +510,12 @@ modest overhead for power-of-2 dimensions.
 
 With k blocks at d-dimensional input, encoding requires:
 
-| Operation | Per-block | Total (k blocks) |
-|-----------|-----------|-------------------|
-| SRHT (3-round, B=64) | ~384 FLOPs | k × 384 |
-| Centroid lookup (B=64) | 64 binary searches | k × 64 |
-| QJL SRHT | ~384 FLOPs | k × 384 |
-| Norm computation | 64 FMA + sqrt | k × 65 |
+| Operation              | Per-block          | Total (k blocks) |
+| ---------------------- | ------------------ | ---------------- |
+| SRHT (3-round, B=64)   | ~384 FLOPs         | k × 384          |
+| Centroid lookup (B=64) | 64 binary searches | k × 64           |
+| QJL SRHT               | ~384 FLOPs         | k × 384          |
+| Norm computation       | 64 FMA + sqrt      | k × 65           |
 
 For d=768, k=12: total ~20K FLOPs per vector (SRHT + QJL SRHT) vs. current
 single-SRHT approach: 2 × ~10K = ~20K FLOPs. Encode throughput should be
@@ -521,12 +525,12 @@ comparable — the per-block overhead is offset by smaller per-block transforms.
 
 Decoding is dominated by k inverse rotations + codebook lookups:
 
-| Operation | Per-block | Total (k blocks) |
-|-----------|-----------|-------------------|
-| Codebook lookup | 64 table reads | k × 64 |
-| Inverse SRHT | ~384 FLOPs | k × 384 |
-| QJL inverse SRHT | ~384 FLOPs | k × 384 |
-| Denormalize | 64 multiplies | k × 64 |
+| Operation        | Per-block      | Total (k blocks) |
+| ---------------- | -------------- | ---------------- |
+| Codebook lookup  | 64 table reads | k × 64           |
+| Inverse SRHT     | ~384 FLOPs     | k × 384          |
+| QJL inverse SRHT | ~384 FLOPs     | k × 384          |
+| Denormalize      | 64 multiplies  | k × 64           |
 
 For d=768: ~10K FLOPs decode vs. current ~10K (single 1024-dim inverse SRHT).
 Similar throughput.
@@ -541,14 +545,13 @@ memory bandwidth utilization.
 ### Benchmarking plan
 
 Stage 1 should include benchmarks comparing:
+
 1. Encode throughput: block TQ vs. current TQ at d=128, 768, 1024
 2. Decode throughput: same dimensions
 3. Quantized cosine similarity throughput: block vs. current
 4. L2 norm readthrough latency: O(k) block norms vs. O(1) current
 
-Stage 2 should benchmark:
-5. PDX scan throughput vs. row-major scan at d=768, 1024
-6. Full decompression from PDX layout (includes un-transpose overhead)
+Stage 2 should benchmark: 5. PDX scan throughput vs. row-major scan at d=768, 1024 6. Full decompression from PDX layout (includes un-transpose overhead)
 
 ## Phasing
 
@@ -580,6 +583,7 @@ The current TurboQuant test suite validates specific behaviors that will change:
   more children to manage.
 
 New tests needed:
+
 - SRHT quality at d=64: coordinate distribution vs. analytical Beta at 3, 4, 5 rounds
 - Practical MSE comparison: d=64 blocks vs. d=768 single-rotation at same bit width
 - Straggler block handling: dense rotation, separate centroids
@@ -590,15 +594,14 @@ New tests needed:
 ## References
 
 [1] Zandieh, A., Daliri, M., Hadian, M. and Mirrokni, V. "TurboQuant: Online
-    Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874,
-    April 2025.
+Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874,
+April 2025.
 
 [2] Ailon, N. and Chazelle, B. "The Fast Johnson-Lindenstrauss Transform and
-    Approximate Nearest Neighbors." SIAM Journal on Computing, 39(1):302-322,
-    2009.
+Approximate Nearest Neighbors." SIAM Journal on Computing, 39(1):302-322, 2009.
 
 [3] Tropp, J.A. "Improved Analysis of the Subsampled Randomized Hadamard
-    Transform." Advances in Adaptive Data Analysis, 3(1-2):115-126, 2011.
+Transform." Advances in Adaptive Data Analysis, 3(1-2):115-126, 2011.
 
 [4] Kuffo, L., Krippner, E. and Boncz, P. "PDX: A Data Layout for Vector
-    Similarity Search." Proceedings of SIGMOD '25. arXiv:2503.04422, March 2025.
+Similarity Search." Proceedings of SIGMOD '25. arXiv:2503.04422, March 2025.
