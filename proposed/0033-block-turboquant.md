@@ -661,7 +661,7 @@ dot_contribution_k = ‖query_k‖ × ‖data_k‖ × Σ_j dist_table[q_code[j]]
 On GPU, this becomes:
 
 1. **Stage distance table in shared memory**: `dist_table[i][j] = centroids[i] ×
-   centroids[j]`, 16×16 = 1 KB at b=4. Fits trivially in shared memory.
+centroids[j]`, 16×16 = 1 KB at b=4. Fits trivially in shared memory.
 
 2. **Stream code bytes from HBM**: For each 64-vector × 64-dim tile (matching
    the PDX layout), gather from the distance table and accumulate in registers.
@@ -706,6 +706,7 @@ The GPU decode pipeline reads compressed data from Vortex files:
 The BlockTurboQuant encoding's child arrays (codes, norms, rotation signs) are
 individually compressed by the cascading compressor. For GPU decode, we need
 either:
+
 - Host-side decompression of the cascade, then GPU transfer of the raw children
 - Direct GPU decompression of FastLanes/ALP (if GPU decompression kernels exist)
 
