@@ -45,13 +45,52 @@ MSE stage — O(d²) storage and O(d²) per-vector. For the QJL stage, the paper
 uses a random Gaussian projection matrix S with i.i.d. N(0,1) entries (not an
 orthogonal rotation); this distinction matters for the unbiasedness proof.
 
-Our [current implementation][current-impl] substitutes a 3-round Structured
-Orthogonal Random Features (SORF) transform `HD₃·HD₂·HD₁` [5] for both the MSE
-rotation and the QJL projection, giving O(d) storage and O(d log d) per-vector.
-The 3-round SORF construction was introduced for kernel approximation [5] and
-approximates a random orthogonal matrix. Note that this is distinct from the
-single-round SRHT (`R·H·D`) analyzed by Tropp [3] and the FJLT (`P·H·D`) of
-Ailon-Chazelle [2], both of which are dimensionality-reducing projections.
+### Current Vortex implementation
+
+Our [current implementation][current-impl] (Rust, in the `vortex-tensor` crate)
+implements TurboQuant as a Vortex array encoding that compresses
+`FixedSizeList<float>` arrays — the storage format of `Vector` and
+`FixedShapeTensor` extension types. Key design choices and characteristics:
+
+**Rotation.** Instead of the paper's O(d²) QR rotation, we use a 3-round
+Structured Orthogonal Random Features (SORF) transform `HD₃·HD₂·HD₁` [5] for
+both the MSE rotation and the QJL projection, giving O(d) storage (3d sign bits,
+bitpacked) and O(d log d) per-vector. The rotation signs are stored as a
+bitpacked child array rather than recomputed from a seed at decode time. The
+3-round SORF was introduced for kernel approximation [5] and approximates a
+random orthogonal matrix. It is distinct from the single-round SRHT (`R·H·D`)
+analyzed by Tropp [3] and the FJLT (`P·H·D`) of Ailon-Chazelle [2], both of
+which are dimensionality-reducing projections rather than rotation
+approximations.
+
+**Centroids.** Max-Lloyd centroids are computed via numerical integration
+(trapezoid rule, 1000 points per interval) of the marginal Beta distribution at
+the padded dimension, using the `HalfIntExponent` type for exact integer/half-
+integer exponent arithmetic. Centroids are cached in a global `DashMap` keyed by
+`(dimension, bit_width)` and stored as a shared `PrimitiveArray<f32>` child.
+
+**Array structure.** The `TurboQuantArray` stores up to 7 child slots: codes
+(`FixedSizeListArray<u8>`, one per vector, list_size = padded_dim), norms
+(`PrimitiveArray<f32>`), centroids (shared), MSE rotation signs (shared,
+bitpacked), and optionally 3 QJL children (signs, residual norms, QJL rotation
+signs). Codes are stored as u8 centroid indices; the cascade compressor
+(BitPacked encoding) handles packing to the actual bit width on disk.
+
+**Compute pushdowns.** Slice and take propagate to per-row children (codes,
+norms) while sharing rotation signs and centroids. Quantized cosine similarity
+and dot product operate directly on codes and centroids without decompression.
+L2 norm returns the stored norm directly (O(1) readthrough).
+
+**Compression scheme.** `TurboQuantScheme` implements the `Scheme` trait for the
+BtrBlocks cascading compressor. It matches `Vector` and `FixedShapeTensor`
+extension arrays with non-nullable float elements and dimension ≥ 3, using the
+default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
+
+**Input handling.** All float types (f16, f32, f64) are converted to f32 before
+quantization. Per-vector L2 norms are computed and stored as f32. Non-power-of-2
+dimensions are zero-padded to the next power of 2 for SORF compatibility. The
+minimum dimension is 3 (d=2 causes a singularity in the Beta distribution
+exponent).
 
 ### Reference implementation bugs
 
@@ -105,12 +144,47 @@ The SORF requires power-of-2 input dimension. For non-power-of-2 dimensions
 
 ### PDX
 
-PDX [4] is a data layout for vector similarity search that stores dimensions in
-a vertical (dimension-major) layout within fixed-size blocks of 64 vectors. This
-enables the compiler to auto-vectorize the inner distance loop over vectors
+PDX [4] is a data layout for vector similarity search. The paper (SIGMOD '25)
+describes a dimension-major layout within fixed-size blocks of 64 vectors,
+enabling the compiler to auto-vectorize the inner distance loop over vectors
 rather than dimensions, achieving on average 2× speedups over SIMD-optimized
 row-major kernels on modern CPUs. The block size of 64 is empirically optimal
 across AVX-512, AVX2, and NEON architectures [4].
+
+**PDX implementation evolution.** The [open-source implementation][pdx-impl]
+has evolved beyond the paper in several ways relevant to this RFC:
+
+- **8-bit scalar quantization** (`IndexPDXIVFTreeSQ8`): Maps floats to 0-255 via
+  linear min-max scaling. The int8 layout differs from float32: dimensions are
+  packed in groups of 4 ("4 dims × 16 vecs") to leverage hardware dot-product
+  instructions (VPDPBUSD on x86, UDOT/SDOT on ARM) that process 4 byte pairs
+  per operation. This is a different tiling than the paper's "1 dim × 64 vecs."
+- **ADSampling with random rotation**: The pruner applies a random orthogonal
+  rotation (QR of Gaussian, or DCT when FFTW is available) to the entire
+  collection as a preprocessing step. This makes coordinates approximately
+  independent, enabling dimension-by-dimension hypothesis testing for early
+  pruning. The rotation serves a similar purpose to TurboQuant's rotation —
+  making the coordinate distribution known — but for pruning rather than
+  quantization.
+- **Dimension zones**: Consecutive dimensions are grouped into zones; at query
+  time, zones are ranked by "distance-to-means" and the most discriminative
+  zones are scanned first, enabling faster pruning.
+- **Future: 1-bit vectors** are mentioned as planned.
+
+**Implications for our design.** The PDX paper's float32 layout ("1 dim × 64
+vecs") maps cleanly to our quantized-code scan kernel, where the inner loop
+gathers from a centroid-product distance table over 64 vectors. However, if we
+pursue direct int8 arithmetic (b_mse=8 with linear centroids, see GPU section),
+the "4 dims × 16 vecs" int8 layout from the PDX implementation may be more
+appropriate, as it enables hardware dot-product instructions.
+
+Additionally, ADSampling's dimension-pruning approach is complementary to
+TurboQuant's block structure: when scanning with block decomposition, the pruner
+could skip entire TQ blocks (B dimensions at a time) if the partial distance
+already exceeds the candidate threshold. This combines the storage efficiency of
+quantization with the computational savings of early termination.
+
+[pdx-impl]: https://github.com/cwida/PDX
 
 ## Proposal
 
@@ -148,40 +222,68 @@ divides d. This eliminates stragglers entirely for common embedding dimensions:
 
 ### Stage 1: MSE-only TurboQuant (immediate — split from current PR)
 
-Split the [current PR][current-impl] to extract and merge the MSE-only subset
-(removing QJL encoding, QJL array slots, and QJL-specific tests). The QJL code
-can be preserved on a separate branch for Phase 4. The MSE-only encoding
-provides:
+Split the [current PR][current-impl] to extract and merge the MSE-only subset.
+The QJL code can be preserved on a separate branch for Phase 4.
 
-- SORF-based random rotation at the padded dimension
-- Max-Lloyd scalar quantization with shared centroids
-- Per-vector norm storage (single f32, regardless of input dtype — the
-  dtype-matching norm behavior described in Stage 2 is a later change)
-- Slice, take, scalar_at compute pushdowns
-- Quantized-domain cosine similarity and dot product
-- File format integration via the compression scheme
+**Changes vs. current PR:**
 
-This is a complete, useful encoding for power-of-2 dimensions. For non-power-of-2
-dimensions it has the padding overhead described above.
+| Aspect         | Current PR                                  | Stage 1                                               |
+| -------------- | ------------------------------------------- | ----------------------------------------------------- |
+| QJL support    | Full (encode, decode, QJL slots, QJL tests) | **Removed**                                           |
+| Array slots    | 7 (4 MSE + 3 QJL)                           | **4** (codes, norms, centroids, rotation_signs)       |
+| Scheme default | 5-bit QJL (4-bit MSE + 1-bit QJL)           | **5-bit MSE-only** (32 centroids)                     |
+| Norms dtype    | Always f32                                  | **Same-or-wider**: f64 for f64 input, f32 for f32/f16 |
+| Metadata       | `has_qjl: bool`                             | **Removed** (always MSE-only)                         |
+
+**Unchanged from current PR:** SORF rotation, Max-Lloyd centroids,
+zero-padding for non-power-of-2, slice/take/scalar_at pushdowns, quantized
+cosine similarity and dot product, compression scheme integration, minimum dim=3.
+
+**Added to metadata (for forward compat):** `block_size: u32` (always =
+padded_dim), `num_blocks: u32` (always = 1), `is_pdx: bool` (always = false).
+These fields are inert in Stage 1 but enable Stage 2/3 decoders to read
+Stage 1 files.
+
+This is a complete, useful encoding for all dimensions. Power-of-2 dimensions
+have zero padding waste; non-power-of-2 dimensions have the padding overhead
+described above.
 
 ### Stage 2: Block decomposition
 
 For non-power-of-2 dimensions, split into blocks of size B (as determined by the
 table above). Each full block gets an independent B-dim SORF rotation.
 
-**Key properties:**
+**Changes vs. Stage 1:**
+
+| Aspect                | Stage 1                              | Stage 2                                                                      |
+| --------------------- | ------------------------------------ | ---------------------------------------------------------------------------- |
+| Block count           | k = 1 (single block at padded_dim)   | **k = d/B** (multiple blocks, no padding)                                    |
+| SORF dimension        | padded_dim (e.g., 1024 for d=768)    | **B** (e.g., 256 for d=768)                                                  |
+| Rotation signs        | Single set, len = 3 × padded_dim     | **k sets**, len = k × 3 × B                                                  |
+| Centroids             | Computed for padded_dim distribution | **Computed for B-dim distribution** (different codebook!)                    |
+| Norms child           | `PrimitiveArray<F>`, 1 per vector    | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
+| Codes list_size       | padded_dim                           | **k × B** (= d for no-straggler dims)                                        |
+| Scheme compress()     | Pad → single SORF → quantize         | **Choose B → split → per-block normalize/rotate/quantize**                   |
+| Quantized dot product | Single sum over padded_dim centroids | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
+| L2 norm readthrough   | O(1) — return stored norm            | **O(k)** — compute √(Σ_k norm_k²)                                            |
+| Zero-padding waste    | Up to 33% (768→1024)                 | **Zero** for common dims                                                     |
+
+**Unchanged from Stage 1:** SORF construction (3-round HD), Max-Lloyd algorithm,
+f32 internal quantization, slice/take semantics (per-row data sliced, shared
+data cloned), bitpacked rotation sign storage, compression scheme trait.
+
+**For power-of-2 dimensions**: B = d, k = 1. The encoding produces an identical
+wire format to Stage 1 (single norm, single SORF, single codes block). A Stage 2
+encoder writing k=1 data is fully backward-compatible with Stage 1 decoders.
+
+**Key design properties:**
 
 - **Self-contained.** The TurboQuant array handles block splitting, per-block
-  normalization, rotation, and quantization internally. It accepts arbitrary
-  (non-unit-norm) input vectors and stores per-block norms as internal children.
-  No parent cooperation is needed — the array can decode without any parent
-  context.
-- **One shared centroid set** for all blocks. All blocks use the same B-dim
-  marginal distribution, so a single Max-Lloyd codebook serves every block.
+  normalization, rotation, and quantization internally. No parent cooperation
+  is needed.
+- **One shared centroid set** for all blocks at the same B-dim distribution.
 - **Per-block SORF rotation signs.** Each block's SORF is independent (different
   seed). Signs are 3 × B bits per block.
-- **For power-of-2 dimensions**: B = d, k = 1. The encoding is functionally
-  identical to Stage 1 (single norm, single SORF rotation, no block splitting).
 
 #### Norm architecture
 
@@ -248,6 +350,23 @@ B × B random orthogonal matrix (QR of Gaussian). Storage at B=256: 256 KB per
 block. For d=768 with k=3: 768 KB total. Amortizes for large columns (100K+
 vectors). Each block must have an **independent** rotation matrix.
 
+**Why not DCT?** The PDX implementation [pdx-impl] uses DCT (via FFTW) as a fast
+rotation for ADSampling. DCT is O(B log B) and invertible, but it is a **fixed
+structured transform**, not a random rotation — it does not produce the Beta
+marginal distribution `(1-x²)^((d-3)/2)` that TurboQuant's Max-Lloyd centroids
+are optimized for. ADSampling only needs approximate coordinate independence
+(for hypothesis-testing pruning), so DCT suffices there. TurboQuant needs a
+specific known marginal distribution, so only random orthogonal rotations (QR or
+SORF) are suitable.
+
+**Shared rotation with ADSampling.** Both TurboQuant and ADSampling apply a
+random orthogonal rotation to make coordinates independent. If we integrate
+ADSampling-style dimension pruning (see Stage 3), the same rotation could serve
+both purposes: producing the Beta distribution for quantization AND enabling
+hypothesis-testing for early pruning. This would avoid rotating the data twice
+and is a natural future optimization when combining block-TurboQuant with
+PDX-style scans.
+
 #### Quantized-domain operations
 
 All quantized operations read per-block norms from the internal child array:
@@ -305,6 +424,21 @@ x̃ = concat(x̂₀, ..., x̂ₖ₋₁)
 Transpose code storage from row-major to dimension-major within groups of 64
 vectors [4]. The 64-vector group size is independent of B.
 
+**Changes vs. Stage 2:**
+
+| Aspect                 | Stage 2                                          | Stage 3                                                           |
+| ---------------------- | ------------------------------------------------ | ----------------------------------------------------------------- |
+| Codes layout           | Row-major (all codes for one vector contiguous)  | **Dimension-major within 64-vector chunks**                       |
+| Metadata               | `is_pdx = false`                                 | **`is_pdx = true`**                                               |
+| Distance kernel        | Per-vector loop with per-element centroid lookup | **SIMD-friendly 64-vector inner loop with distance-table lookup** |
+| Decode path            | Direct inverse SORF per vector                   | **Un-transpose 64-vector chunk first**, then inverse SORF         |
+| QJL signs (if present) | Row-major                                        | **Also transposed** (same PDX layout as codes)                    |
+
+**Unchanged from Stage 2:** Block size B, centroid computation, norm storage,
+SORF rotation, all encoding logic (PDX transpose is applied after encoding).
+The encode path produces row-major codes then transposes; the decode path
+un-transposes then decodes.
+
 Within each 64-vector chunk, codes are stored dimension-major:
 
 ```
@@ -348,17 +482,47 @@ for tq_block in 0..k {
 }
 ```
 
+**Int8 layout variant.** The PDX implementation [pdx-impl] uses a different
+tiling for int8 data: "4 dims × 16 vecs" to leverage VPDPBUSD/UDOT hardware
+dot-product instructions. For TurboQuant codes at b_mse ≤ 8, codes are u8
+centroid indices (not linear values), so VPDPBUSD doesn't apply directly — we
+need the distance-table-lookup path shown above. However, if we support a linear
+quantization mode (b_mse=8 with uniform centroids), the "4 dims × 16 vecs"
+layout could enable direct hardware dot-product on the codes, bypassing the
+lookup table entirely. This is a potential Stage 3 optimization to evaluate.
+
+**ADSampling integration.** The PDX dimension-pruning approach (ADSampling [4])
+is complementary to TurboQuant's block structure. During a scan, the pruner
+could evaluate partial distances after each TQ block (B dimensions) and skip
+remaining blocks if the partial L2 distance already exceeds the candidate
+threshold. This requires the per-block norm weighting to happen at block
+boundaries (as shown in the kernel above), which our design already provides.
+
 **Open design questions:**
 
 - Slice/take on PDX-transposed codes: produce row-major (simpler) or preserve
   PDX (aligned 64-vector slices only)?
 - Is PDX a property of the encoding or a separate layout layer?
 - How does the compressor see the transposed codes?
+- Should we support the "4 dims × 16 vecs" int8 layout variant alongside the
+  "1 dim × 64 vecs" float-style layout?
 
 ### QJL correction (deferred — experimental)
 
 Based on community findings [8], QJL is deferred to after the MSE stages are
-validated. If pursued, four strategies should be compared:
+validated.
+
+**Changes vs. MSE-only (if pursued):**
+
+| Aspect                 | MSE-only                         | MSE + QJL                                                       |
+| ---------------------- | -------------------------------- | --------------------------------------------------------------- |
+| Bit budget             | All b bits → MSE (2^b centroids) | b-1 bits MSE + 1 bit QJL (2^(b-1) centroids)                    |
+| Inner product estimate | Biased (MSE quantization noise)  | Unbiased (QJL correction, Theorem 2 [1])                        |
+| Additional children    | None                             | QJL signs, QJL residual norms, QJL projection params            |
+| Encode cost            | SORF only                        | SORF + QJL projection (O(B²) for Gaussian, O(B log B) for SORF) |
+| Decode cost            | Inverse SORF only                | Inverse SORF + QJL inverse projection                           |
+
+If pursued, four strategies should be compared:
 
 | Strategy             | Theoretical           | Speed            | Storage         |
 | -------------------- | --------------------- | ---------------- | --------------- |
@@ -377,9 +541,24 @@ bit widths, so QJL may not be worth the complexity.
 
 ## Array layout
 
-### Stage 1 (single block, current)
+### Stage 1 (MSE-only single block)
 
-Identical to the [current PR][current-impl] array structure.
+```
+TurboQuantArray
+├── metadata: { dimension, b_mse, block_size (= padded_dim),
+│               num_blocks (= 1), is_pdx (= false) }
+│
+│  # Per-row children
+├── codes: FixedSizeListArray<u8>           # list_size = padded_dim
+├── norms: PrimitiveArray<F>               # len = num_rows (F = f64 for f64, f32 otherwise)
+│
+│  # Shared children
+├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
+├── mse_rotation_signs: PrimitiveArray<u8>  # len = 3 × padded_dim (bitpacked)
+```
+
+Same structure as the [current PR][current-impl] minus the 3 QJL slots, plus
+the forward-compatible metadata fields and dtype-matching norms.
 
 ### Stage 2 (block decomposition)
 
@@ -535,7 +714,8 @@ Stage 1 files without migration.
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
 
-- Stage 1: norms child is `PrimitiveArray<f32>`, one norm per vector.
+- Stage 1: norms child is `PrimitiveArray<F>`, one norm per vector (F = f64 for
+  f64 input, f32 otherwise).
 - Stage 2 with k=1 (power-of-2 dims): same as Stage 1, identical wire format.
 - Stage 2 with k>1: norms child is `FixedSizeListArray<F>`, k norms per vector.
 
