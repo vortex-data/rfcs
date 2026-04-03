@@ -19,9 +19,11 @@ in three stages:
    groups of 64 vectors for SIMD scan performance.
 
 QJL correction is deferred to a later stage and may ultimately be dropped.
-Community findings from 6+ independent TurboQuant implementations consistently
-show that MSE-only outperforms MSE+QJL for attention and ANN ranking in
-practice [8].
+Community findings from multiple independent TurboQuant implementations
+consistently show that MSE-only outperforms MSE+QJL for KV-cache attention [8].
+For ANN ranking and vector-search workloads, the evidence is currently less
+complete, so QJL should remain an empirical question rather than a settled
+conclusion.
 
 [current-impl]: https://github.com/vortex-data/vortex/pull/7167
 
@@ -61,10 +63,14 @@ differences are:
 | Bits per sub-vector    | Scalar: b bits per coordinate                                   | Vector: typically 8 bits per sub-vector (256 codewords)  |
 
 TurboQuant trades PQ's flexibility (data-dependent codebooks can exploit
-structure) for data-obliviousness (no training, provable bounds, zero indexing
-time). For uniformly distributed embeddings, TurboQuant's analytically optimal
-centroids should match or exceed PQ's learned codebooks. For highly structured
-data, PQ may still win empirically.
+structure) for data-obliviousness (no training, provable bounds, no offline
+index-training phase). Encode-time work (rotation + quantization) still applies.
+In return, PQ and OPQ retain a major advantage in expressivity: they learn
+sub-vector codebooks from data rather than applying an analytic scalar quantizer.
+In practice this means TurboQuant is attractive when training-free operation,
+simple deployment, and theoretical guarantees matter most, while PQ or OPQ may
+still win empirically when a learned vector codebook can exploit dataset-specific
+structure.
 
 ### Current Vortex implementation
 
@@ -140,17 +146,20 @@ bound itself — they are well below the 2.72/4^b bound.
 
 ### Community findings on QJL
 
-Multiple independent TurboQuant implementations have converged on a
-significant practical finding: **MSE-only consistently outperforms MSE+QJL for
-attention and ANN ranking**. The mechanism is a variance-bias tradeoff:
-TurboQuant's QJL correction eliminates bias but increases variance, and softmax
-attention (and cosine/L2 ranking) amplifies variance more than bias. At the same
-total bit budget, allocating all bits to MSE (more centroids, lower variance)
-beats splitting between MSE + QJL (fewer centroids + 1-bit correction). This has
-been confirmed by 6+ groups across Python, C, and Rust implementations [8].
+Multiple independent TurboQuant implementations have converged on a significant
+practical finding for **KV-cache attention**: MSE-only often outperforms MSE+QJL
+at the same bit budget. The likely mechanism is a variance-bias tradeoff: QJL
+removes bias in raw inner-product estimation but adds variance, and the softmax
+nonlinearity amplifies variance more than it penalizes bias. In that setting,
+allocating all bits to MSE (more centroids, lower quantization variance) can beat
+splitting the budget between MSE + QJL. This behavior has been reported by
+multiple groups across Python, C, and Rust implementations [8].
 
-This finding strongly supports making MSE-only the default strategy for our
-columnar storage use case (ANN search, cosine similarity ranking).
+For ANN search, cosine ranking, and other non-softmax vector-search workloads,
+the evidence is currently less settled. MSE-only is still a reasonable default
+because it is simpler and better supported by the current implementation work,
+but the ANN question should be treated as empirical until evaluated on ANN
+datasets with recall@k and ranking metrics (see Experimental plan).
 
 ### Current limitations
 
@@ -168,8 +177,10 @@ The SORF requires power-of-2 input dimension. For non-power-of-2 dimensions
 PDX [4] is a data layout for vector similarity search. The paper (SIGMOD '25)
 describes a dimension-major layout within fixed-size blocks of 64 vectors,
 enabling the compiler to auto-vectorize the inner distance loop over vectors
-rather than dimensions, achieving on average 2× speedups over SIMD-optimized
-row-major kernels on modern CPUs. The block size of 64 is empirically optimal
+rather than dimensions. In the paper, this yields average speedups of about 40%
+over SIMD-optimized row-major kernels for the direct kernel comparison, while
+dimension-pruning methods (ADSampling, BSA) recover much larger gains (2-7×)
+when paired with the PDX layout [4]. The block size of 64 is empirically optimal
 across AVX-512, AVX2, and NEON architectures [4].
 
 **PDX implementation evolution.** The [open-source implementation][pdx-impl]
@@ -338,7 +349,8 @@ norm = 0, decode as all zeros.
 
 #### Theoretical MSE bound
 
-The paper's MSE bound (Theorem 1 in [1]) is:
+The paper's MSE bound (Theorem 1 in [1]; verify theorem numbering against the
+ICLR 2026 camera-ready if it differs from the arXiv version) is:
 
 ```
 E[‖x - x̂‖² / ‖x‖²] ≤ (√3 · π / 2) / 4^b ≈ 2.72 / 4^b
@@ -349,12 +361,22 @@ Gaussian), not SORF.** Our SORF is an approximation. The bound holds exactly
 only with a true random orthogonal rotation or with empirical SORF validation
 (see Experimental plan).
 
-Assuming the per-block MSE bound holds, for a vector split into blocks:
+Assuming the per-block MSE bound holds, for a vector split into blocks the
+following **algebraic** identity is exact:
 
 ```
 ‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)
                    ≤ MSE_bound × Σ_k (‖xₖ‖² / ‖x‖²) = MSE_bound
 ```
+
+The inequality applies Theorem 1's **probabilistic** bound (over the random
+rotation) to each block independently. The conclusion should be read in terms
+of **expectations**: `E[‖x - x̂‖² / ‖x‖²] ≤ MSE_bound` assuming independent
+per-block rotations. Note that TurboQuant's original analysis uses a single
+global rotation in high-d where coordinates are nearly independent; with
+smaller block dimension B, within-block coordinate dependence after rotation may
+be stronger even when marginals are correct — this is an additional motivation
+for the experimental plan's comparison of block sizes.
 
 The actual MSE may depend on block dimension B: at larger B the coordinate
 distribution is more concentrated (variance ~1/B), giving the Max-Lloyd
@@ -374,19 +396,25 @@ vectors). Each block must have an **independent** rotation matrix.
 **Why not DCT?** The PDX implementation [pdx-impl] uses DCT (via FFTW) as a fast
 rotation for ADSampling. DCT is O(B log B) and invertible, but it is a **fixed
 structured transform**, not a random rotation — it does not produce the Beta
-marginal distribution `(1-x²)^((d-3)/2)` that TurboQuant's Max-Lloyd centroids
-are optimized for. ADSampling only needs approximate coordinate independence
+marginal distribution `(1-x²)^((B-3)/2)` (in block dimension B) that
+TurboQuant's Max-Lloyd centroids are optimized for. ADSampling only needs
+approximate coordinate independence
 (for hypothesis-testing pruning), so DCT suffices there. TurboQuant needs a
 specific known marginal distribution, so only random orthogonal rotations (QR or
 SORF) are suitable.
 
-**Shared rotation with ADSampling.** Both TurboQuant and ADSampling apply a
-random orthogonal rotation to make coordinates independent. If we integrate
-ADSampling-style dimension pruning (see Stage 3), the same rotation could serve
-both purposes: producing the Beta distribution for quantization AND enabling
-hypothesis-testing for early pruning. This would avoid rotating the data twice.
-Note that the query must also be rotated at query time with the same rotation
-matrix (stored as a shared child); ADSampling already requires this.
+**Shared rotation with ADSampling (speculative).** Both TurboQuant and
+ADSampling apply a random orthogonal rotation to make coordinates independent.
+If we integrate ADSampling-style dimension pruning (see Stage 3), the same
+rotation could in principle serve both purposes. However, this is not automatic
+under the Stage 2 block-decomposed design: ADSampling is formulated around a
+single full-dimensional random projection whose coordinates can be sequentially
+sampled, whereas Stage 2 introduces per-block rotations and per-block norm
+weighting. Reusing one rotation across both systems should be treated as a
+**future research direction** that requires new analysis or direct empirical
+validation. If it proves viable, it would avoid rotating the data twice. The
+query would also need to be rotated at query time with the same stored
+transform.
 
 #### Quantized-domain operations
 
@@ -589,8 +617,9 @@ for Gaussian. SORF for QJL is an additional approximation (the
 [current implementation][current-impl] uses SORF for QJL). Per-block QJL has
 d/B times more variance than full-dimension QJL (Lemma 4 [1]).
 
-The community consensus is that MSE-only likely wins for ANN ranking at all
-bit widths, so QJL may not be worth the complexity.
+Community reports indicate MSE-only often wins for KV-cache attention at all
+tested bit widths [8]. Whether this extends to ANN ranking is an empirical
+question (see Experimental plan); QJL may not be worth the complexity.
 
 ## Array layout
 
@@ -650,22 +679,27 @@ replace 32 with 64 in the norms row — ratios decrease accordingly):
 
 ### Worked examples (f32, b_mse=5, N=1000)
 
-| d             | B    | k   | Per-vec bits          | Ratio | Notes                      |
-| ------------- | ---- | --- | --------------------- | ----- | -------------------------- |
-| 768           | 256  | 3   | 3×256×5 + 3×32 = 3936 | 6.2×  | Block decomp; zero padding |
-| 1024          | 1024 | 1   | 1024×5 + 32 = 5152    | 6.4×  | Single block (= current)   |
-| 768 (current) | 1024 | 1   | 1024×5 + 32 = 5152    | 4.8×  | Padded; 33% overhead       |
+| d             | B    | k   | Per-vec bits          | Ratio | Notes                    |
+| ------------- | ---- | --- | --------------------- | ----- | ------------------------ |
+| 768           | 256  | 3   | 3×256×5 + 3×32 = 3936 | 6.2×  | Block decomp; no padding |
+| 1024          | 1024 | 1   | 1024×5 + 32 = 5152    | 6.4×  | Single block (= current) |
+| 768 (current) | 1024 | 1   | 1024×5 + 32 = 5152    | 4.8×  | Padded; 33% overhead     |
 
-Block decomposition improves d=768 from 4.8× to 6.2× — a 30% storage
-improvement. For d=1024 the encoding is identical to current.
+Block decomposition improves the compression ratio for d=768 from ~4.8× to
+~6.2× (about 29% higher ratio; equivalently, about 24% fewer compressed bits
+per vector: 5152 → 3936). For d=1024 the encoding is identical to current.
+
+**Shared overhead note:** centroids and SORF signs are amortized over N vectors;
+for small N, per-column shared metadata is significant — report totals with and
+without amortization when publishing ratios.
 
 ## Performance analysis
 
 ### Encode/decode throughput
 
-SORF at B dimensions: 3 × B × log₂(B) butterflies + 3 × B sign applications
-per block (plus B normalization multiplies, omitted for simplicity). For k
-blocks:
+SORF at B dimensions (heuristic — real cost is dominated by memory bandwidth
+and constant factors): 3 × B × log₂(B) butterflies + 3 × B sign applications
+per block (plus B normalization multiplies, omitted). For k blocks:
 
 | B              | SORF FLOPs/block          | k (d=768) | Total MSE FLOPs |
 | -------------- | ------------------------- | --------- | --------------- |
@@ -698,7 +732,8 @@ approach, despite more blocks, because each block is smaller.
 - Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim padded SORF QJL
   vs. MSE-only
 - Key metric: ANN recall@k on the datasets above (Contriever, OpenAI, SIFT)
-- Per community findings, MSE-only is expected to win [8]
+- Per community findings for attention, MSE-only is expected to win [8]; ANN
+  ranking is the key open question
 
 ### Benchmarking datasets
 
@@ -784,14 +819,17 @@ decoded_batch = diag(norms) × R⁻¹ × codebook_lookup_batch(codes)
 ```
 
 The codebook gather + inverse rotation + norm scaling can be fused into a single
-kernel following the double-buffered streaming pattern from Flash-KMeans [6].
+kernel using an IO-aware streaming pattern analogous to Flash-KMeans [6] — not
+the same algorithm (Flash-KMeans is GPU k-means), but a similar systems goal:
+reduce HBM traffic and avoid full materialization.
 For distance computation without full decode, a precomputed (2^b_mse)²-entry
 distance table fits in shared memory (1 KB at b_mse=4, 4 KB at b_mse=5); the
 kernel streams code bytes from HBM with gather-reduce accumulation, using
 4-8× less bandwidth than full float vectors.
 
-At b_mse=8, codes are uint8 indices (0-255). Direct int8 tensor core GEMM
-(using codes as the unsigned operand in VPDPBUSD) requires approximately linear
+At b_mse=8, codes are uint8 indices (0-255). Direct low-precision GEMM on
+hardware accelerators (tensor cores on GPU, byte-dot-product instructions on
+CPU) requires approximately linear
 centroids — but at high B the Max-Lloyd centroids are already near-uniform
 (the Beta distribution is highly concentrated, approaching Gaussian, for which
 high-resolution optimal quantization is approximately uniform). Whether the
@@ -822,8 +860,13 @@ unit_dot_k / (‖a‖ · ‖b‖)` with `‖a‖ = √(Σ_k norm_a_k²)`.
 - `dot_product_quantized_column`: same per-block weighting.
 - `l2_norm`: currently returns the stored norm directly (O(1)). Must change to
   `√(Σ_k norm_k²)` — read the norms FSL child and compute.
-- Both operands must have the **same block size B** and compatible centroids for
-  the quantized path to apply. If block sizes differ, fall back to exact.
+- Both operands must have the **same block size B**, compatible centroids (same
+  `b_mse` and B-dim codebook), and **bit-identical MSE rotation parameters**
+  (`mse_rotation_signs` and same SORF construction) for the quantized
+  inner-product path to be valid. Two stored columns with different rotations
+  must **fall back to exact** (decompress → float). The common **column vs.
+  constant query** path avoids this: the query is re-encoded with the column's
+  rotation and centroids at query time.
 
 **Stage 3 changes.** The PDX distance kernel (shown in Stage 3 pseudocode) is a
 new execution path that operates on `PDXArray`-typed codes. It should be exposed
@@ -908,14 +951,21 @@ arXiv:2603.09229, March 2026.
 
 [7] Pathare, T. et al. "TurboQuant: Implementation Corrections, Production
 Hardening, and Deployment Infrastructure." Eviox Tech Report v1.2.0,
-March 2026.
+March 2026. https://eviox.tech/nexus/eviox_turboquant_corrections_study.pdf
 
-[8] Community TurboQuant implementations and findings. Key sources:
-tonbistudio/turboquant-pytorch (PyTorch, V3 MSE-only findings),
-ggml-org/llama.cpp#20969 (C/C++, quantized attention analysis),
-0xSero/turboquant (Triton kernels), vivekvar-dl/turboquant (pip package),
-scos-lab/turboquant (reference reproduction). Consensus: MSE-only beats
-MSE+QJL for attention and ANN ranking at all tested bit widths.
+[8] Community TurboQuant implementation reports. These sources primarily study
+KV-cache attention rather than ANN search; claims should be scoped accordingly.
+Key sources (pin commits/releases in final external draft):
+
+- tonbistudio/turboquant-pytorch: MSE-only (V3) vs MSE+QJL (V2) for attention
+  and generation. Workload: KV-cache attention.
+- ggml-org/llama.cpp discussion #21155: TurboQuant quantized attention analysis.
+  Workload: KV-cache attention.
+- 0xSero/turboquant: Triton kernels, paper validation scripts.
+- scos-lab/turboquant: Reference reproduction, MSE vs Prod comparison.
+  Several groups report MSE-only beating MSE+QJL for attention metrics at tested
+  bit widths. ANN ranking conclusions remain preliminary pending dedicated
+  benchmarks.
 
 [9] Jégou, H., Douze, M. and Schmid, C. "Product Quantization for Nearest
 Neighbor Search." IEEE Trans. PAMI 33(1):117-128, 2011.
