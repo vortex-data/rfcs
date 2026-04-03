@@ -105,12 +105,47 @@ The SORF requires power-of-2 input dimension. For non-power-of-2 dimensions
 
 ### PDX
 
-PDX [4] is a data layout for vector similarity search that stores dimensions in
-a vertical (dimension-major) layout within fixed-size blocks of 64 vectors. This
-enables the compiler to auto-vectorize the inner distance loop over vectors
+PDX [4] is a data layout for vector similarity search. The paper (SIGMOD '25)
+describes a dimension-major layout within fixed-size blocks of 64 vectors,
+enabling the compiler to auto-vectorize the inner distance loop over vectors
 rather than dimensions, achieving on average 2× speedups over SIMD-optimized
 row-major kernels on modern CPUs. The block size of 64 is empirically optimal
 across AVX-512, AVX2, and NEON architectures [4].
+
+**PDX implementation evolution.** The [open-source implementation][pdx-impl]
+has evolved beyond the paper in several ways relevant to this RFC:
+
+- **8-bit scalar quantization** (`IndexPDXIVFTreeSQ8`): Maps floats to 0-255 via
+  linear min-max scaling. The int8 layout differs from float32: dimensions are
+  packed in groups of 4 ("4 dims × 16 vecs") to leverage hardware dot-product
+  instructions (VPDPBUSD on x86, UDOT/SDOT on ARM) that process 4 byte pairs
+  per operation. This is a different tiling than the paper's "1 dim × 64 vecs."
+- **ADSampling with random rotation**: The pruner applies a random orthogonal
+  rotation (QR of Gaussian, or DCT when FFTW is available) to the entire
+  collection as a preprocessing step. This makes coordinates approximately
+  independent, enabling dimension-by-dimension hypothesis testing for early
+  pruning. The rotation serves a similar purpose to TurboQuant's rotation —
+  making the coordinate distribution known — but for pruning rather than
+  quantization.
+- **Dimension zones**: Consecutive dimensions are grouped into zones; at query
+  time, zones are ranked by "distance-to-means" and the most discriminative
+  zones are scanned first, enabling faster pruning.
+- **Future: 1-bit vectors** are mentioned as planned.
+
+**Implications for our design.** The PDX paper's float32 layout ("1 dim × 64
+vecs") maps cleanly to our quantized-code scan kernel, where the inner loop
+gathers from a centroid-product distance table over 64 vectors. However, if we
+pursue direct int8 arithmetic (b_mse=8 with linear centroids, see GPU section),
+the "4 dims × 16 vecs" int8 layout from the PDX implementation may be more
+appropriate, as it enables hardware dot-product instructions.
+
+Additionally, ADSampling's dimension-pruning approach is complementary to
+TurboQuant's block structure: when scanning with block decomposition, the pruner
+could skip entire TQ blocks (B dimensions at a time) if the partial distance
+already exceeds the candidate threshold. This combines the storage efficiency of
+quantization with the computational savings of early termination.
+
+[pdx-impl]: https://github.com/cwida/PDX
 
 ## Proposal
 
@@ -248,6 +283,23 @@ B × B random orthogonal matrix (QR of Gaussian). Storage at B=256: 256 KB per
 block. For d=768 with k=3: 768 KB total. Amortizes for large columns (100K+
 vectors). Each block must have an **independent** rotation matrix.
 
+**Why not DCT?** The PDX implementation [pdx-impl] uses DCT (via FFTW) as a fast
+rotation for ADSampling. DCT is O(B log B) and invertible, but it is a **fixed
+structured transform**, not a random rotation — it does not produce the Beta
+marginal distribution `(1-x²)^((d-3)/2)` that TurboQuant's Max-Lloyd centroids
+are optimized for. ADSampling only needs approximate coordinate independence
+(for hypothesis-testing pruning), so DCT suffices there. TurboQuant needs a
+specific known marginal distribution, so only random orthogonal rotations (QR or
+SORF) are suitable.
+
+**Shared rotation with ADSampling.** Both TurboQuant and ADSampling apply a
+random orthogonal rotation to make coordinates independent. If we integrate
+ADSampling-style dimension pruning (see Stage 3), the same rotation could serve
+both purposes: producing the Beta distribution for quantization AND enabling
+hypothesis-testing for early pruning. This would avoid rotating the data twice
+and is a natural future optimization when combining block-TurboQuant with
+PDX-style scans.
+
 #### Quantized-domain operations
 
 All quantized operations read per-block norms from the internal child array:
@@ -348,12 +400,30 @@ for tq_block in 0..k {
 }
 ```
 
+**Int8 layout variant.** The PDX implementation [pdx-impl] uses a different
+tiling for int8 data: "4 dims × 16 vecs" to leverage VPDPBUSD/UDOT hardware
+dot-product instructions. For TurboQuant codes at b_mse ≤ 8, codes are u8
+centroid indices (not linear values), so VPDPBUSD doesn't apply directly — we
+need the distance-table-lookup path shown above. However, if we support a linear
+quantization mode (b_mse=8 with uniform centroids), the "4 dims × 16 vecs"
+layout could enable direct hardware dot-product on the codes, bypassing the
+lookup table entirely. This is a potential Stage 3 optimization to evaluate.
+
+**ADSampling integration.** The PDX dimension-pruning approach (ADSampling [4])
+is complementary to TurboQuant's block structure. During a scan, the pruner
+could evaluate partial distances after each TQ block (B dimensions) and skip
+remaining blocks if the partial L2 distance already exceeds the candidate
+threshold. This requires the per-block norm weighting to happen at block
+boundaries (as shown in the kernel above), which our design already provides.
+
 **Open design questions:**
 
 - Slice/take on PDX-transposed codes: produce row-major (simpler) or preserve
   PDX (aligned 64-vector slices only)?
 - Is PDX a property of the encoding or a separate layout layer?
 - How does the compressor see the transposed codes?
+- Should we support the "4 dims × 16 vecs" int8 layout variant alongside the
+  "1 dim × 64 vecs" float-style layout?
 
 ### QJL correction (deferred — experimental)
 
