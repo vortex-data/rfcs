@@ -2,7 +2,7 @@
 
 **Authors:** Will Manning
 **Status:** Proposal
-**Date:** 2026-04-03
+**Date:** 2026-04-02
 
 ## Summary
 
@@ -14,7 +14,7 @@ in three stages:
 2. **Block decomposition** (next): for non-power-of-2 dimensions, split into
    blocks of size B = the largest power-of-2 ≥ 64 that divides d. For
    power-of-2 dimensions, B = d (single block, same as current). Per-block
-   norms externalized.
+   norms stored as internal children.
 3. **PDX layout** (later): within each block, transpose codes into groups of
    64 vectors for SIMD scan performance.
 
@@ -171,22 +171,27 @@ table above). Each full block gets an independent B-dim SORF rotation.
 
 **Key properties:**
 
+- **Self-contained.** The TurboQuant array handles block splitting, per-block
+  normalization, rotation, and quantization internally. It accepts arbitrary
+  (non-unit-norm) input vectors and stores per-block norms as internal children.
+  No parent cooperation is needed — the array can decode without any parent
+  context.
 - **One shared centroid set** for all blocks. All blocks use the same B-dim
   marginal distribution, so a single Max-Lloyd codebook serves every block.
-- **Unit-norm assumption.** The TurboQuant array operates only on pre-normalized
-  sub-vectors. Per-block norms are externalized, following the pattern explored
-  in PR #7251 (closed; concept will need reimplementation).
 - **Per-block SORF rotation signs.** Each block's SORF is independent (different
   seed). Signs are 3 × B bits per block.
 - **For power-of-2 dimensions**: B = d, k = 1. The encoding is functionally
-  identical to Stage 1. The norm remains a single value per vector (not a
-  FixedSizeList with list_size=1). Norm externalization is optional for k=1 and
-  can be deferred to when it provides concrete benefit (e.g., GPU decode).
+  identical to Stage 1 (single norm, single SORF rotation, no block splitting).
 
 #### Norm architecture
 
-The per-block norms are stored as a `FixedSizeListArray<F>` with
-`list_size = num_blocks`, where `F` matches or widens the input element type:
+Per-block norms are stored as an **internal child** of the TurboQuant array:
+
+- For k = 1 (power-of-2 dims): `PrimitiveArray<F>` with len = num_rows
+  (identical to Stage 1's single-norm layout).
+- For k > 1: `FixedSizeListArray<F>` with list_size = k, len = num_rows.
+
+The norm dtype `F` matches or widens the input element type:
 
 | Input dtype | Norm dtype | Rationale                                      |
 | ----------- | ---------- | ---------------------------------------------- |
@@ -232,8 +237,9 @@ The actual MSE may depend on block dimension B: at larger B the coordinate
 distribution is more concentrated (variance ~1/B), giving the Max-Lloyd
 quantizer more to exploit. See Experimental plan.
 
-**SORF approximation.** The 3-round SORF `HD₃·HD₂·HD₁` [5] provides
-3 × log₂(B) butterfly stages per round (18 at B=64, 24 at B=256, 27 at B=512).
+**SORF approximation.** The 3-round SORF `HD₃·HD₂·HD₁` [5] provides log₂(B)
+butterfly stages per round × 3 rounds = 3·log₂(B) total (18 at B=64, 24 at
+B=256, 27 at B=512).
 This is a rough heuristic for mixing quality — [5] does not analyze convergence
 rate as a function of rounds × dimension. Empirical validation is needed.
 
@@ -244,7 +250,7 @@ vectors). Each block must have an **independent** rotation matrix.
 
 #### Quantized-domain operations
 
-All quantized operations require per-block norms:
+All quantized operations read per-block norms from the internal child array:
 
 - **L2 distance**: `‖a-b‖² = Σ_k ‖aₖ‖² + Σ_k ‖bₖ‖² - 2·Σ_k ‖aₖ‖·‖bₖ‖·
 unit_dotₖ`. Primary ANN metric; reuses per-block dot product and norms.
@@ -279,8 +285,9 @@ for i in 0..k:
     else:
         cᵢ[j] = 0
 
-Store: codes (k × B per vector), block_norms (k per vector),
-       centroids (2^b_mse, shared), SORF signs (k × 3 × B, shared)
+Store (all as internal children):
+  codes (k × B per vector), norms (k per vector),
+  centroids (2^b_mse, shared), SORF signs (k × 3 × B, shared)
 ```
 
 #### Decoding algorithm
@@ -289,7 +296,7 @@ Store: codes (k × B per vector), block_norms (k per vector),
 for i in 0..k:
     r̂ᵢ[j] = centroids[cᵢ[j]]
     ûᵢ = SORF⁻¹ᵢ(r̂ᵢ)
-    x̂ᵢ = nᵢ × ûᵢ
+    x̂ᵢ = nᵢ × ûᵢ                    (nᵢ read from internal norms child)
 x̃ = concat(x̂₀, ..., x̂ₖ₋₁)
 ```
 
@@ -350,7 +357,7 @@ for tq_block in 0..k {
 
 ### QJL correction (deferred — experimental)
 
-Based on community findings [7], QJL is deferred to after the MSE stages are
+Based on community findings [8], QJL is deferred to after the MSE stages are
 validated. If pursued, four strategies should be compared:
 
 | Strategy             | Theoretical           | Speed            | Storage         |
@@ -377,18 +384,17 @@ Identical to the [current PR][current-impl] array structure.
 ### Stage 2 (block decomposition)
 
 ```
-TurboQuantArray (operates on unit-norm B-dim sub-vectors)
+TurboQuantArray (self-contained, handles blocks internally)
 ├── metadata: { dimension, b_mse, block_size, num_blocks, is_pdx }
 │
-│  # Per-row children
+│  # Per-row children (sliced/taken on row operations)
 ├── codes: FixedSizeListArray<u8>           # list_size = k × B
+├── norms: PrimitiveArray<F>                # len = num_rows (k=1)
+│      or  FixedSizeListArray<F>            # list_size = k (k>1)
 │
-│  # Shared children
+│  # Shared children (cloned on row operations, not sliced)
 ├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
 ├── mse_rotation_signs: PrimitiveArray<u8>  # len = k × 3 × B
-
-Externalized:
-├── block_norms: FixedSizeListArray<F>      # list_size = k
 ```
 
 ## Compression ratio
@@ -467,10 +473,10 @@ to merge MSE-only (no QJL). This is a complete encoding for all dimensions
 (with padding for non-power-of-2).
 
 **Phase 2** — Block decomposition: Add block splitting for non-power-of-2
-dimensions. Externalize norms. B = largest power-of-2 ≥ 64 dividing d. The
-`TurboQuantScheme::compress()` method must be updated to: (a) choose B based on
-d, (b) split input into blocks, (c) normalize per-block, (d) encode each block,
-and (e) store per-block norms in the parent encoding layer.
+dimensions. B = largest power-of-2 ≥ 64 dividing d. Per-block norms stored as
+internal children. The `TurboQuantScheme::compress()` method must be updated to:
+(a) choose B based on d, (b) split input into blocks, (c) normalize per-block,
+(d) encode each block, and (e) store per-block norms as an internal child array.
 
 **Phase 3** — PDX layout: Dimension-major code transposition within 64-vector
 chunks. Distance computation kernels.
@@ -514,6 +520,44 @@ kernel streams code bytes from HBM with gather-reduce accumulation, using
 At b=8, codes are raw int8 indices. Direct int8 tensor core GEMM requires
 approximately linear centroids (sacrificing Max-Lloyd optimality); viable for
 ANN ranking but not reconstruction.
+
+## Migration and compatibility
+
+TurboQuant has not shipped yet, so there are no existing files to migrate. We
+can design the metadata for forward compatibility from day one.
+
+**Strategy: single array ID, versioned metadata.** All stages use the same array
+ID (`vortex.turboquant`). The metadata includes `block_size`, `num_blocks`, and
+`is_pdx` fields from Stage 1 onward. Stage 1 always writes `num_blocks=1,
+is_pdx=false`, but the fields exist so that Stage 2 and 3 decoders can read
+Stage 1 files without migration.
+
+**Norms are always internal children.** The TurboQuant array is self-contained —
+it stores norms as a child slot, not in a parent encoding. This means:
+
+- Stage 1: norms child is `PrimitiveArray<f32>`, one norm per vector.
+- Stage 2 with k=1 (power-of-2 dims): same as Stage 1, identical wire format.
+- Stage 2 with k>1: norms child is `FixedSizeListArray<F>`, k norms per vector.
+
+The decoder distinguishes k=1 from k>1 by reading `num_blocks` from metadata.
+A k=1 decoder is backward-compatible with Stage 1 files. A k>1 decoder is a new
+code path that only applies to files written by Stage 2+.
+
+**Stage 3 (PDX) is additive.** The `is_pdx` flag in metadata tells the decoder
+whether codes are row-major or dimension-major. Stage 1/2 files have
+`is_pdx=false`; Stage 3 files have `is_pdx=true`. The decoder un-transposes
+PDX files on read if needed. No migration required.
+
+**Incremental shipping:**
+
+| Stage        | Ships to users?  | Reads Stage 1 files?   | Notes                               |
+| ------------ | ---------------- | ---------------------- | ----------------------------------- |
+| 1 (MSE-only) | Yes, immediately | N/A (first version)    | New encoding, no backcompat concern |
+| 2 (blocks)   | Yes              | Yes (k=1 is identical) | k>1 files need Stage 2+ decoder     |
+| 3 (PDX)      | Yes              | Yes (is_pdx=false)     | PDX files need Stage 3 decoder      |
+
+Each stage is independently shippable. Users can upgrade incrementally. Files
+written by earlier stages are always readable by later decoders.
 
 ## References
 
