@@ -6,18 +6,22 @@
 
 ## Summary
 
-We propose modifying the [TurboQuant vector quantization encoding][current-impl]
-to use uniform blocks of a tunable power-of-2 size B (to be experimentally
-determined; expected range 64-256) with per-block SORF rotations for the MSE
-stage. The QJL correction strategy is an open design question with four options
-to be experimentally compared: per-block Gaussian (paper-correct), per-block
-SORF (fast but approximate), full-dimension padded SORF (current approach,
-better convergence but wastes sign bits), or MSE-only (no QJL). The
-lowest-level TurboQuant array operates only on unit-norm vectors, with norms
-externalized. In a second stage, a PDX-style dimension-major code layout within
-groups of 64 vectors enables SIMD-friendly vectorized distance computation. The
-TQ block size B (for quantization quality) and the PDX vector group size (always
-64, for SIMD utilization) are independent parameters.
+We propose evolving the [TurboQuant vector quantization encoding][current-impl]
+in three stages:
+
+1. **MSE-only TurboQuant** (immediate): merge the current PR as an MSE-only
+   encoding. This is a complete, self-contained building block.
+2. **Block decomposition** (next): for non-power-of-2 dimensions, split into
+   blocks of size B = the largest power-of-2 ≥ 64 that divides d. For
+   power-of-2 dimensions, B = d (single block, same as current). Per-block
+   norms externalized.
+3. **PDX layout** (later): within each block, transpose codes into groups of
+   64 vectors for SIMD scan performance.
+
+QJL correction is deferred to a later stage and may ultimately be dropped.
+Community findings from 6+ independent TurboQuant implementations consistently
+show that MSE-only outperforms MSE+QJL for attention and ANN ranking in
+practice [7].
 
 [current-impl]: https://github.com/vortex-data/vortex/pull/7167
 
@@ -47,240 +51,134 @@ rotation and the QJL projection, giving O(d) storage and O(d log d) per-vector.
 The 3-round SORF construction was introduced for kernel approximation [5] and
 approximates a random orthogonal matrix. Note that this is distinct from the
 single-round SRHT (`R·H·D`) analyzed by Tropp [3] and the FJLT (`P·H·D`) of
-Ailon-Chazelle [2], both of which are dimensionality-reducing projections. Using
-SORF for QJL (where the paper prescribes Gaussian S) is an additional
-approximation that may affect the unbiasedness guarantee of Theorem 2.
+Ailon-Chazelle [2], both of which are dimensionality-reducing projections.
+
+### Reference implementation bugs
+
+The Eviox corrections study [7] identified six material bugs in the paper's
+reference Python implementation. The most critical is a mathematical error in
+the QJL scale factor: the reference code used `√(π/(2d))` instead of
+`√(π/2)/d` (Definition 1 in [1]), differing by a factor of √d (≈11× at d=128).
+Our [current implementation][current-impl] uses the correct formula
+(`sqrt(FRAC_PI_2) / padded_dim` in Rust), so this bug does **not** affect us.
+
+Other notable Eviox findings: (a) the reference code recomputes codebooks at
+every instantiation (we cache in a `DashMap`); (b) the reference uses float16
+for codebook distance computation, causing misassignment at small centroid
+spacings (we cast to f32 before quantization). See [7] for the full list.
+
+### Theorem 1 constant
+
+There is an ambiguity in the paper's notation for the MSE bound constant. The
+formal proof gives `(√3 · π / 2) · 4^{-b}` where the constant √3·π/2 ≈ 2.72.
+The Eviox report [7] interprets the notation as `√(3π)/2 ≈ 1.535`, but this is
+incorrect: the measured distortion values from the paper (b=2: 0.117, b=3: 0.03)
+exceed the putative `√(3π)/2` bound (b=2: 0.096, b=3: 0.024), confirming that
+2.72 is the correct constant. The paper's "explicit values" (0.36, 0.117, 0.03,
+0.009) are the actual computed distortion of the optimal quantizer, not the
+bound itself — they are well below the 2.72/4^b bound.
+
+### Community findings on QJL
+
+Multiple independent TurboQuant implementations [7] have converged on a
+significant practical finding: **MSE-only consistently outperforms MSE+QJL for
+attention and ANN ranking**. The mechanism is a variance-bias tradeoff:
+TurboQuant's QJL correction eliminates bias but increases variance, and softmax
+attention (and cosine/L2 ranking) amplifies variance more than bias. At the same
+total bit budget, allocating all bits to MSE (more centroids, lower variance)
+beats splitting between MSE + QJL (fewer centroids + 1-bit correction). This has
+been confirmed by 6+ groups across Python, C, and Rust implementations.
+
+This finding strongly supports making MSE-only the default strategy for our
+columnar storage use case (ANN search, cosine similarity ranking).
 
 ### Current limitations
 
 The SORF requires power-of-2 input dimension. For non-power-of-2 dimensions
-(e.g., 768-d embeddings from common transformer models), the input is
-zero-padded to the next power of 2 (1024). This causes:
+(e.g., 768-d embeddings), the input is zero-padded to the next power of 2
+(1024). This causes:
 
-- **33% wasted storage** for 768-d vectors: 1024 quantized codes stored per
-  vector when only 768 carry information.
-- **QJL variance inflation**: The QJL correction also uses a padded SORF. Of
-  the 1024 QJL sign bits, 256 encode information about the zero-padded region
-  rather than the actual residual. The estimator remains unbiased in expectation,
-  but the wasted measurement budget inflates variance. Empirically, this
-  manifests as ~23% mean signed relative error in inner product estimation for
-  768-d vs. ~11% for power-of-2 dimensions.
-- **No scan-optimized layout**: Codes are stored in row-major order (all codes
-  for one vector contiguous), which prevents SIMD-over-vectors distance
-  computation.
+- **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful.
+- **No scan-optimized layout**: row-major code storage prevents SIMD-over-vectors
+  distance computation.
 
 ### PDX
 
 PDX [4] is a data layout for vector similarity search that stores dimensions in
 a vertical (dimension-major) layout within fixed-size blocks of 64 vectors. This
 enables the compiler to auto-vectorize the inner distance loop over vectors
-rather than dimensions, achieving on average 2x speedups over SIMD-optimized
-row-major kernels (up to 5.5x at low dimensions) on modern CPUs. The block size
-of 64 is empirically optimal across AVX-512, AVX2, and NEON architectures [4].
+rather than dimensions, achieving on average 2× speedups over SIMD-optimized
+row-major kernels on modern CPUs. The block size of 64 is empirically optimal
+across AVX-512, AVX2, and NEON architectures [4].
 
 ## Proposal
 
-### Stage 1: Tunable block decomposition
+### Block size strategy
 
-Partition d dimensions into `⌈d/B⌉` blocks of B dimensions each, where B is a
-power-of-2 block size (configurable; expected range 64-256, to be determined
-experimentally). The last block ("straggler") may have fewer than B dimensions
-— see Straggler handling below. Each full block gets an independent B-dim SORF
-rotation for the MSE stage.
+For each dimension d, choose B = the largest power-of-2 ≥ 64 that evenly
+divides d. This eliminates stragglers entirely for common embedding dimensions:
 
-Larger B gives better quantization quality (more concentrated coordinate
-distribution, better SORF mixing) but more per-block norm overhead. Smaller B
-gives more blocks (more norms) but each block has higher practical variance.
-The optimal B should be determined experimentally — see Experimental plan.
+| Dimension d | Block size B | Blocks k | Notes                       |
+| ----------- | ------------ | -------- | --------------------------- |
+| 512         | 512          | 1        | Single block (= current TQ) |
+| 768         | 256          | 3        | Largest dividing power-of-2 |
+| 1024        | 1024         | 1        | Single block                |
+| 1536        | 512          | 3        |                             |
+| 2048        | 2048         | 1        | Single block                |
+| 3072        | 1024         | 3        |                             |
+| 4096        | 4096         | 1        | Single block                |
+
+**Key observations:**
+
+- **Power-of-2 dimensions** (512, 1024, 2048, 4096) use B = d — a single block,
+  identical to the current implementation except with PDX underneath (Stage 3).
+  No block decomposition overhead, no per-block norms. These dimensions are
+  already well-served by the current design.
+- **Non-power-of-2 dimensions** (768, 1536, 3072) decompose into k=3 blocks at
+  B=256 or B=512. Zero padding waste. Each block has its own SORF rotation and
+  shares a single centroid set.
+- **Stragglers are eliminated** for all common embedding dimensions. Dimensions
+  that are not multiples of 64 (e.g., 100, 200) would need straggler handling,
+  but these are rare in practice for modern model architectures.
+- **The SORF approximation at B=256+ is well-tested**: 3 rounds at B=256 provides
+  24 butterfly stages, and at B=512 provides 27 — both comparable to the current
+  B=1024 (30 stages).
+
+### Stage 1: MSE-only TurboQuant (immediate — split from current PR)
+
+Merge the [current MSE-only TurboQuant implementation][current-impl] as a
+standalone encoding. This provides:
+
+- SORF-based random rotation at the padded dimension
+- Max-Lloyd scalar quantization with shared centroids
+- Per-vector norm storage (single f32 per vector)
+- Slice, take, scalar_at compute pushdowns
+- Quantized-domain cosine similarity and dot product
+- File format integration via the compression scheme
+
+This is a complete, useful encoding for power-of-2 dimensions. For non-power-of-2
+dimensions it has the padding overhead described above.
+
+### Stage 2: Block decomposition
+
+For non-power-of-2 dimensions, split into blocks of size B (as determined by the
+table above). Each full block gets an independent B-dim SORF rotation.
 
 **Key properties:**
 
-- **B is a power of 2**, so every full block has zero SORF padding waste.
-  Common embedding dimensions are divisible by 64 and 128; most are also
-  divisible by 256. The straggler case is rare for well-chosen B.
-- **One shared centroid set** for full blocks. All full blocks use the same
-  B-dim marginal distribution, so a single Max-Lloyd codebook serves every full
-  block.
+- **One shared centroid set** for all blocks. All blocks use the same B-dim
+  marginal distribution, so a single Max-Lloyd codebook serves every block.
 - **Unit-norm assumption.** The TurboQuant array operates only on pre-normalized
-  sub-vectors. Per-block norms are externalized (see Norm architecture below).
-- **Per-block SORF rotation signs.** Each block's MSE SORF is independent
-  (different seed). Signs are 3 × B bits per block. For d=768 with B=128:
-  6 blocks × 3 × 128 = 2304 bits = 288 bytes.
-
-#### Straggler handling
-
-If `d % B ≠ 0`, the final block has `d mod B` dimensions. Initially, the
-straggler is **zero-padded to B** and uses the same SORF and centroids as all
-other blocks. This is the simplest approach and reuses all existing
-infrastructure. The padding waste is bounded by B-1 dimensions — much smaller
-than the current full-dimension padding (up to d-1 dimensions).
-
-As a follow-up experiment, we will test using a **dense random orthogonal
-matrix** (QR of Gaussian) at the straggler's actual dimension with its own
-centroid set. This eliminates the straggler's padding waste entirely and may
-allow increasing B (since the straggler cost is bounded). This requires separate
-storage for the straggler rotation matrix and centroids.
-
-#### Zero-norm sub-vectors
-
-When splitting a vector into B-dim blocks, some blocks may have zero norm
-(e.g., sparse embeddings, or dimensions that are structurally unused). The
-encoding must handle ‖xₖ‖ = 0 explicitly: skip rotation and quantization for
-that block, store norm = 0, and decode as all zeros. The codes for a zero-norm
-block are arbitrary (never read during decode).
-
-#### Theoretical MSE bound
-
-The paper's MSE bound (Theorem 1 in [1]) is:
-
-```
-E[‖x - x̂‖² / ‖x‖²] ≤ (√3 · π / 2) / 4^b
-```
-
-This bound is dimension-independent — it depends only on the bit width `b`.
-**Crucially, Theorem 1 is proved for true random orthogonal matrices.** Our use
-of SORF is an approximation; the bound holds exactly only if the per-block
-rotation is a true random orthogonal matrix (or if the SORF approximation is
-validated empirically — see Experimental plan).
-
-Assuming the per-block MSE bound holds, for a vector split into blocks with
-per-block normalization (‖xₖ‖ > 0):
-
-```
-‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)
-                   ≤ MSE_bound × Σ_k (‖xₖ‖² / ‖x‖²)
-                   = MSE_bound
-```
-
-The Pythagorean identity `Σ_k ‖xₖ‖² = ‖x‖²` ensures the weights sum to 1.
-Blocks with ‖xₖ‖ = 0 contribute zero error and are excluded from the sum.
-
-**Practical MSE vs. theoretical bound.** The bound `(√3π/2)/4^b` is a worst-case
-upper bound that is dimension-independent. However, the **actual** MSE depends
-on the block dimension B. At higher dimensions, the coordinate distribution
-after rotation is more concentrated (variance ~1/B), and the Max-Lloyd quantizer
-exploits this concentration — the actual MSE can be well below the bound. At
-smaller B, the distribution is wider and the quantizer has less concentration to
-exploit.
-
-Block decomposition preserves the theoretical bound but may give worse
-**practical** MSE than a single full-dimension rotation, because each B-dim
-block operates at a less favorable point on the distortion curve. This must be
-quantified empirically (see Experimental plan).
-
-**SORF approximation caveat.** Theorems 1 and 2 in [1] are proved for true
-random orthogonal matrices (QR of Gaussian), not SORF. The 3-round SORF
-construction `HD₃·HD₂·HD₁` [5] is a structured approximation. The approximation quality depends on dimension: each round of the Walsh-Hadamard
-transform mixes all B coordinates through log₂(B) butterfly stages, so 3 rounds
-provides 3 × log₂(B) total butterfly stages (18 at B=64, 21 at 128, 24 at 256).
-This is a rough heuristic for mixing quality, not a formal convergence metric —
-[5] does not analyze convergence rate as a function of rounds × dimension.
-Empirical validation is needed for each candidate B — see Experimental plan.
-
-**Fallback: dense rotation.** If SORF proves insufficient at the chosen B, use a
-B × B random orthogonal matrix (QR of Gaussian) instead. Storage at B=128:
-128×128×4 = 64 KB per block. With k blocks for MSE: total = k × 64 KB. For
-d=768, B=128 (k=6): 384 KB of MSE rotation matrices. This is significant for
-small columns (1K vectors at 3 MB uncompressed ≈ 13% overhead) but amortizes to
-negligible for large columns (100K+ vectors). Each block must have an
-**independent** rotation matrix (different seeds) to avoid correlation between
-quantization errors across blocks.
-
-#### QJL correction
-
-The QJL stage in the TurboQuant paper [1] uses a random Gaussian projection
-matrix S ∈ ℝ^(d×d) with i.i.d. N(0,1) entries — **not** an orthogonal rotation.
-The unbiasedness proof (Lemma 4 in [1]) and the scale factor `√(π/2)/d` are
-derived specifically for Gaussian S. The [current implementation][current-impl]
-uses SORF instead, which is an additional approximation.
-
-The QJL correction has several possible strategies, differing in projection
-type (Gaussian vs SORF), scope (per-block vs full-dimension), and whether QJL
-is used at all. The choice significantly affects correctness guarantees,
-variance, storage, and speed.
-
-**Per-block Gaussian QJL** is the paper-correct approach: each block gets an
-independent Gaussian projection Sₖ ∈ ℝ^(B×B) with i.i.d. N(0,1) entries. Since
-Gaussian matrices work at any dimension, no padding is needed for the QJL stage.
-Each block's QJL is provably unbiased by Lemma 4 in [1], and the sum over
-blocks is also unbiased: `E[<y, correction>] = <y, r>`. However, the per-block
-variance is **d/B times higher** than full-dimension QJL.
-
-Lemma 4 gives the variance for QJL of a unit vector. Since QJL is applied to the
-residual rₖ (with norm γₖ = ‖rₖ‖, typically ≪ 1), the actual variance scales
-by γₖ²:
-
-```
-Per-block (B-dim):   Var[<y, correction>] ≤ (π / (2B)) × ‖r‖² × ‖y‖²
-Full-dim (d-dim):    Var[<y, correction>] ≤ (π / (2d)) × ‖r‖² × ‖y‖²
-```
-
-The ‖r‖² factor cancels when comparing strategies (same MSE quality → same
-residual norms), so the **relative** variance ratio is d/B regardless. At
-d=768, B=128: per-block has 6× more variance than full-dim. The absolute
-variance is small — at b=4 MSE, ‖r‖² ≈ 0.01, so the per-block variance is
-≈ 0.01 × (π/(2×128)) × ‖y‖² ≈ 1.2×10⁻⁴ × ‖y‖².
-
-Storage: B×B×4 bytes per block (384 KB for k=6 at B=128). Encode/decode cost:
-O(B²) matmul per block.
-
-**Per-block SORF QJL** substitutes a B-dim SORF (`HD₃·HD₂·HD₁` [5]) for the
-Gaussian matrix. This is NOT theoretically justified — Lemma 4 in [1] is proved
-specifically for Gaussian S. For Haar-distributed random orthogonal S,
-unbiasedness follows from rotational invariance (a separate argument), but the
-variance constant may differ from π/(2B). SORF is an approximation to neither
-Gaussian nor Haar measure.
-However, the [current implementation][current-impl] already uses SORF for QJL at
-d=1024 with acceptable results (~11% mean relative error for power-of-2 dims),
-demonstrating practical viability. The tradeoff vs Gaussian is compelling:
-O(B log B) speed (~10× faster than Gaussian at B=128), O(B) storage (over
-1000× less). Quality
-at B=128 needs validation — with only 21 mixing stages, the approximation to
-Haar measure is weaker than at d=1024 (30 stages).
-
-**Full-dimension padded SORF QJL** applies a single SORF at the padded
-dimension (e.g., 1024 for d=768) to the full residual vector `r = x - x̂`,
-matching the [current implementation][current-impl]. The higher dimension gives
-better SORF-to-Haar convergence (30 butterfly stages at d=1024 vs 21 at B=128)
-and full-dimension variance `~(π/(2·padded_d))·‖r‖²·‖y‖²`, but wastes
-`(padded_d - d)/padded_d`
-of the sign bits on zero-padded coordinates (25% at 768→1024). This approach
-requires computing the full residual from all blocks before applying QJL,
-adding a full-dimension decode step to the encode path.
-
-**MSE-only (no QJL)** skips the QJL correction entirely. Inner product
-estimates are biased but this may be acceptable for ANN ranking where relative
-ordering matters more than absolute accuracy. Eliminates all QJL storage and
-computation.
-
-**QJL strategy options** (to be experimentally compared):
-
-| Strategy             | Theoretical       | Variance (×‖r‖²‖y‖²) | Padding waste   | Storage      | Speed            |
-| -------------------- | ----------------- | -------------------- | --------------- | ------------ | ---------------- |
-| Per-block Gaussian   | Correct (Lemma 4) | π/(2B)               | None            | k×B²×4 bytes | O(B²)/block      |
-| Per-block SORF       | Approximate       | ~π/(2B)              | None            | k×3×B bits   | O(B log B)/block |
-| Full-dim padded SORF | Approximate       | ~π/(2·pad_d)         | (pad_d-d)/pad_d | 3×pad_d bits | O(d log d) total |
-| MSE-only             | N/A               | N/A                  | N/A             | None         | 0                |
-
-Variance entries show the coefficient of `‖r‖²×‖y‖²` where `‖r‖²` is the
-residual MSE (≈ 0.01 at b=4). The ‖r‖² factor is the same across strategies
-(same MSE quality), so relative comparisons reduce to the coefficient alone:
-per-block is d/B times higher than full-dim (6× at d=768, B=128).
-
-Note: the full-dim padded SORF variance bound formally uses `pad_d` (e.g.,
-1024), not `d` (768). The `pad_d - d` sign bits spent on zero-padded
-coordinates carry no information about the residual, so the effective variance
-reduction may be closer to `π/(2d)`. The experiment should measure actual
-variance to resolve this.
+  sub-vectors. Per-block norms are externalized, following the pattern explored
+  in PR #7251 (closed; concept will need reimplementation).
+- **Per-block SORF rotation signs.** Each block's SORF is independent (different
+  seed). Signs are 3 × B bits per block.
+- **For power-of-2 dimensions**: B = d, k = 1. The block decomposition is a
+  no-op; the encoding is identical to Stage 1 except norms may be externalized.
 
 #### Norm architecture
 
-The TurboQuant array itself operates only on unit-norm B-dim sub-vectors. Norms
-are externalized into a separate child array, following the pattern explored in
-the NormVector encoding prototype (PR #7251, closed — the concept will need to
-be implemented as part of this work or adapted from a different source).
-
-The per-block norms are stored as a single `FixedSizeListArray<F>` with
+The per-block norms are stored as a `FixedSizeListArray<F>` with
 `list_size = num_blocks`, where `F` matches or widens the input element type:
 
 | Input dtype | Norm dtype | Rationale                                      |
@@ -289,147 +187,111 @@ The per-block norms are stored as a single `FixedSizeListArray<F>` with
 | f32         | f32        | Same type                                      |
 | f64         | f64        | Preserve full precision                        |
 
-Norms are stored as plain child arrays — TurboQuant does not apply any secondary
-encoding to them. The cascading compressor treats norms like any other float
-column and is free to re-encode them with ALP, Pco, FastLanes, or other float
-compression schemes.
+Norms are stored as plain child arrays; the cascading compressor handles
+secondary encoding (ALP, Pco, etc.).
 
-Note: centroids and quantization always operate in f32 (the
+Note: centroids and quantization always operate in f32 internally (the
 [current implementation][current-impl] converts all input to f32 before
-quantization). For f64 input, the decode path produces f32 reconstructions
-scaled by f64 norms — a mixed-precision multiply. This preserves the precision
-of the norms (which capture the bulk of the vector's magnitude) while accepting
-f32 precision for the unit-direction reconstruction.
+quantization). For f64 input, decode produces f32 unit-direction reconstructions
+scaled by f64 norms — a mixed-precision multiply that preserves norm precision.
 
-#### Quantized-domain operations with per-block norms
+#### Zero-norm sub-vectors
 
-All quantized-domain operations require reading the block norms for both
-operands. This is a cost increase vs. the [current implementation][current-impl]
-which stores a single global norm per vector.
+When splitting a vector into B-dim blocks, some blocks may have zero norm. The
+encoding handles ‖xₖ‖ = 0 explicitly: skip rotation and quantization, store
+norm = 0, decode as all zeros.
 
-- **L2 norm**: Read block norms, compute `√(Σ_k ‖xₖ‖²)`. O(k) per vector — a
-  regression from the current O(1) single-norm readthrough, but modest compared
-  to full decompression.
-- **Dot product**: `<a, b> ≈ Σ_k ‖aₖ‖·‖bₖ‖ · Σ_j centroids[code_aₖ[j]] ·
-centroids[code_bₖ[j]]`. Per-block: compute unit-norm quantized dot product
-  (sum of B centroid products), then weight by both vectors' block norms.
-- **Cosine similarity**: `cos(a, b) ≈ (Σ_k ‖aₖ‖·‖bₖ‖·unit_dotₖ) /
-(√(Σ_k ‖aₖ‖²) · √(Σ_k ‖bₖ‖²))`. Requires global norms reconstructed from
-  block norms.
-- **L2 distance** (squared Euclidean): `‖a-b‖² = ‖a‖² + ‖b‖² - 2<a,b>
-= Σ_k ‖aₖ‖² + Σ_k ‖bₖ‖² - 2 × Σ_k ‖aₖ‖·‖bₖ‖·unit_dotₖ`. Reuses the
-  per-block dot product and per-block norms; this is the primary ANN metric.
+#### Theoretical MSE bound
 
-The norms tensor should be read once per scan query and cached.
+The paper's MSE bound (Theorem 1 in [1]) is:
+
+```
+E[‖x - x̂‖² / ‖x‖²] ≤ (√3 · π / 2) / 4^b ≈ 2.72 / 4^b
+```
+
+**Crucially, Theorem 1 is proved for true random orthogonal matrices (QR of
+Gaussian), not SORF.** Our SORF is an approximation. The bound holds exactly
+only with a true random orthogonal rotation or with empirical SORF validation
+(see Experimental plan).
+
+Assuming the per-block MSE bound holds, for a vector split into blocks:
+
+```
+‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)
+                   ≤ MSE_bound × Σ_k (‖xₖ‖² / ‖x‖²) = MSE_bound
+```
+
+The actual MSE may depend on block dimension B: at larger B the coordinate
+distribution is more concentrated (variance ~1/B), giving the Max-Lloyd
+quantizer more to exploit. See Experimental plan.
+
+**SORF approximation.** The 3-round SORF `HD₃·HD₂·HD₁` [5] provides
+3 × log₂(B) butterfly stages per round (18 at B=64, 24 at B=256, 27 at B=512).
+This is a rough heuristic for mixing quality — [5] does not analyze convergence
+rate as a function of rounds × dimension. Empirical validation is needed.
+
+**Fallback: dense rotation.** If SORF proves insufficient at the chosen B, use a
+B × B random orthogonal matrix (QR of Gaussian). Storage at B=256: 256 KB per
+block. For d=768 with k=3: 768 KB total. Amortizes for large columns (100K+
+vectors). Each block must have an **independent** rotation matrix.
+
+#### Quantized-domain operations
+
+All quantized operations require per-block norms:
+
+- **L2 distance**: `‖a-b‖² = Σ_k ‖aₖ‖² + Σ_k ‖bₖ‖² - 2·Σ_k ‖aₖ‖·‖bₖ‖·
+unit_dotₖ`. Primary ANN metric; reuses per-block dot product and norms.
+- **Dot product**: `<a,b> ≈ Σ_k ‖aₖ‖·‖bₖ‖ · Σ_j centroids[code_aₖ[j]] ·
+centroids[code_bₖ[j]]`.
+- **Cosine similarity**: `cos(a,b) ≈ dot(a,b) / (‖a‖·‖b‖)` where
+  `‖a‖ = √(Σ_k ‖aₖ‖²)`.
+- **L2 norm**: `√(Σ_k ‖xₖ‖²)`. O(k) per vector — a regression from the
+  current O(1) single-norm readthrough, but modest.
 
 #### Encoding algorithm
 
 ```
-Input: x ∈ ℝ^d, total_bits b, block_size B (power of 2)
-b_mse = b - 1 for QJL strategies, b_mse = b for MSE-only
+Input: x ∈ ℝ^d, b_mse bits per coordinate, block_size B
+k = d / B  (exact division, no straggler for chosen B)
 num_centroids = 2^b_mse
-k = ⌈d/B⌉
 
 # Block split and normalize
 for i in 0..k:
-    xᵢ = x[i*B .. min((i+1)*B, d)], zero-pad to B if straggler
+    xᵢ = x[i*B .. (i+1)*B]
     nᵢ = ‖xᵢ‖
     if nᵢ > 0:
         ûᵢ = xᵢ / nᵢ
     else:
-        ûᵢ = zeros(B)               (zero-norm block: skip quantization)
+        ûᵢ = zeros(B)
 
 # MSE stage (per block, SORF rotation)
 for i in 0..k:
     if nᵢ > 0:
-        rᵢ = SORFᵢ(ûᵢ)             (3-round HD, independent per block)
-        cᵢ[j] = nearest_centroid(rᵢ[j])  (shared codebook, num_centroids levels)
+        rᵢ = SORFᵢ(ûᵢ)
+        cᵢ[j] = nearest_centroid(rᵢ[j])
     else:
         cᵢ[j] = 0
 
 Store: codes (k × B per vector), block_norms (k per vector),
-       centroids (shared), SORF signs (k × 3 × B, shared across vectors)
-
-# QJL stage (optional, one of four strategies)
-
-# --- Per-block strategies (Gaussian or SORF) ---
-# Operate in unit-norm space, per block. Note: the current implementation
-# computes the QJL residual in original scale (r = x - x̂). With externalized
-# norms, we instead compute the unit-norm residual (rᵢ = ûᵢ - x̂_unitᵢ) and
-# let denormalization handle the scaling. These are mathematically equivalent:
-# nᵢ × correctionᵢ gives the same result either way.
-for i in 0..k:
-    if nᵢ > 0:
-        x̂ᵢ = decode_mse_block(cᵢ, centroids, SORFᵢ)
-        rᵢ = ûᵢ - x̂ᵢ                (per-block unit-norm residual)
-        γᵢ = ‖rᵢ‖
-        sᵢ = sign(Projᵢ × rᵢ)       (Gaussian B×B or SORF at B-dim)
-    else:
-        γᵢ = 0, sᵢ = zeros
-Store: qjl_signs (k × B per vector), qjl_residual_norms (k per vector)
-
-# --- Full-dim padded SORF strategy ---
-# Requires full decode + denormalization to compute the d-dim residual.
-# This crosses the norm externalization boundary: the TurboQuant array
-# operates on unit-norm sub-vectors, but the full residual lives in the
-# original scale. The full-dim QJL encode path is:
-x̂ = concat(nᵢ × decode_mse_block(cᵢ, ...) for i in 0..k)[0..d]
-r = x - x̂                            (d-dim, original scale)
-γ = ‖r‖
-r_pad = [r; zeros(padded_d - d)]      (zero-pad to padded_d)
-s = sign(SORF_qjl(r_pad))             (single padded_d-dim SORF)
-Store: qjl_signs (padded_d per vector), qjl_residual_norm (1 per vector)
-
-# Note: the full-dim strategy is more complex to implement because it
-# requires a full MSE decode + denormalization during encoding, adding
-# O(d) work and coupling the QJL stage to the norm externalization layer.
+       centroids (2^b_mse, shared), SORF signs (k × 3 × B, shared)
 ```
 
 #### Decoding algorithm
 
 ```
-# MSE decode (produces unit-norm sub-vectors)
 for i in 0..k:
     r̂ᵢ[j] = centroids[cᵢ[j]]
     ûᵢ = SORF⁻¹ᵢ(r̂ᵢ)
-
-# QJL correction (if present)
-
-# --- Per-block strategies (Gaussian or SORF) ---
-# Scale factor uses B (block dimension) because Lemma 4 applies per-block.
-for i in 0..k:
-    if γᵢ > 0:
-        correctionᵢ = (√(π/2) / B) × γᵢ × Projᵢᵀ × sᵢ
-        ûᵢ += correctionᵢ
-# Denormalize and concatenate
-for i in 0..k:
     x̂ᵢ = nᵢ × ûᵢ
-x̃ = concat(x̂₀, x̂₁, ..., x̂ₖ₋₁)[0..d]
-
-# --- Full-dim padded SORF strategy ---
-# Denormalize first (QJL operates in original scale)
-for i in 0..k:
-    x̂ᵢ = nᵢ × ûᵢ
-x̂ = concat(x̂₀, ..., x̂ₖ₋₁)[0..d]
-correction = (√(π/2) / padded_d) × γ × SORF⁻¹_qjl(s)
-x̃ = x̂ + correction[0..d]
+x̃ = concat(x̂₀, ..., x̂ₖ₋₁)
 ```
 
-### Stage 2: PDX dimension-major layout
+### Stage 3: PDX dimension-major layout
 
-In a second stage, we transpose the code storage from row-major to
-dimension-major within groups of 64 vectors, following the PDX layout [4]. The
-64-vector group size is independent of the TQ block size B.
+Transpose code storage from row-major to dimension-major within groups of 64
+vectors [4]. The 64-vector group size is independent of B.
 
-**Row-major (Stage 1):**
-
-```
-Vector 0: [tq0_d0 ... tq0_d(B-1) | tq1_d0 ... tq1_d(B-1) | ... ]
-Vector 1: [tq0_d0 ... tq0_d(B-1) | tq1_d0 ... tq1_d(B-1) | ... ]
-...
-```
-
-**PDX (Stage 2), within each 64-vector chunk:**
+Within each 64-vector chunk, codes are stored dimension-major:
 
 ```
 TQ block 0, dim 0:        [v0 v1 v2 ... v63]
@@ -440,302 +302,186 @@ TQ block 1, dim 0:        [v0 v1 v2 ... v63]
 ...
 ```
 
-All codes for the same dimension across 64 vectors are contiguous. The inner
-loop (over 64 vectors) has no inter-vector data dependencies and
-auto-vectorizes into SIMD. TQ block boundaries affect only where norm weighting
-occurs in the distance kernel — they don't affect the PDX transpose itself.
+The inner SIMD loop (64 vectors) has no inter-vector dependencies. TQ block
+boundaries only affect where norm weighting occurs — they don't affect the
+transpose.
 
-This creates **B × 64 tiles**: B dimension coordinates × 64 vectors per chunk.
-
-#### Relationship to chunking
-
-The PDX 64-vector groups are effectively chunks. Shared metadata (centroids,
-rotation signs/matrices) lives at the array level, not per-chunk.
-
-**Open design questions:**
-
-- Should slice/take produce row-major or PDX results? Row-major is simpler
-  (un-transpose on the fly) but loses the scan benefit.
-- Should the PDX flag be a property of the encoding or a separate layout layer?
-- How does the PDX transpose interact with the cascading compressor?
-
-#### Quantized distance computation
+**Quantized distance kernel (dot product):**
 
 ```rust
-// Precompute: dist_table[i][j] = centroids[i] * centroids[j]
-// At b=4: 16×16 = 256 floats = 1KB, fits in L1 cache
+let dist_table = precompute_product_table(&centroids);
+// At b=4: 16×16 = 256 floats = 1KB, fits in L1
 
-for tq_block in 0..num_tq_blocks {
+for tq_block in 0..k {
     for dim in 0..B {
         let qd = query_codes[tq_block * B + dim];
         let row = &dist_table[qd as usize];
-        for v in 0..64 {  // SIMD-friendly: no inter-vector deps
-            distances[v] += row[codes[offset + v] as usize];
+        for v in 0..64 {  // SIMD-friendly
+            unit_dots[v] += row[codes[offset] as usize];
+            offset += 1;
         }
     }
-    // Weight by query_block_norm × data_block_norms[v] for this TQ block
+    for v in 0..64 {
+        distances[v] += query_norms[tq_block] * data_norms[v][tq_block]
+                        * unit_dots[v];
+        unit_dots[v] = 0.0;
+    }
 }
 ```
 
-**Full decompression from PDX layout.** When a scan is not the use case (e.g.,
-`scalar_at` or `to_canonical`), 64-vector chunks are un-transposed back to
-row-major before per-vector inverse SORF decoding.
+**Open design questions:**
+
+- Slice/take on PDX-transposed codes: produce row-major (simpler) or preserve
+  PDX (aligned 64-vector slices only)?
+- Is PDX a property of the encoding or a separate layout layer?
+- How does the compressor see the transposed codes?
+
+### QJL correction (deferred — experimental)
+
+Based on community findings [7], QJL is deferred to after the MSE stages are
+validated. If pursued, four strategies should be compared:
+
+| Strategy             | Theoretical           | Speed            | Storage         |
+| -------------------- | --------------------- | ---------------- | --------------- |
+| Per-block Gaussian   | Correct (Lemma 4 [1]) | O(B²)/block      | k×B²×4 bytes    |
+| Per-block SORF       | Approximate           | O(B log B)/block | k×3×B bits      |
+| Full-dim padded SORF | Approximate           | O(d log d) total | 3×padded_d bits |
+| MSE-only (no QJL)    | N/A                   | 0                | None            |
+
+The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] is proved specifically
+for Gaussian. SORF for QJL is an additional approximation (the
+[current implementation][current-impl] uses SORF for QJL). Per-block QJL has
+d/B times more variance than full-dimension QJL (Lemma 4 [1]).
+
+The community consensus is that MSE-only likely wins for ANN ranking at all
+bit widths, so QJL may not be worth the complexity.
 
 ## Array layout
 
+### Stage 1 (single block, current)
+
+Identical to the [current PR][current-impl] array structure.
+
+### Stage 2 (block decomposition)
+
 ```
 TurboQuantArray (operates on unit-norm B-dim sub-vectors)
-├── metadata: { dimension: u32, bit_width: u32, block_size: u32,
-│               num_blocks: u32, qjl_strategy: enum, is_pdx: bool }
+├── metadata: { dimension, b_mse, block_size, num_blocks, is_pdx }
 │
-│  # Per-row children (sliced/taken on row operations)
-├── codes: FixedSizeListArray<u8>              # len=num_rows, list_size=num_blocks×B
+│  # Per-row children
+├── codes: FixedSizeListArray<u8>           # list_size = k × B
 │
-│  # Shared children (cloned on row operations, not sliced)
-├── centroids: PrimitiveArray<f32>             # len=2^(bit_width-1) [MSE codebook]
-├── mse_rotation_signs: PrimitiveArray<u8>     # len=num_blocks×3×B [per-block MSE SORF]
-│
-│  # QJL children (strategy-dependent, all optional)
-│  #
-│  # Per-block Gaussian:
-│  #   qjl_signs: FSL<u8>, list_size=num_blocks×B    (per row)
-│  #   qjl_residual_norms: FSL<F>, list_size=num_blocks (per row, externalized)
-│  #   qjl_matrices: Primitive<f32>, len=num_blocks×B×B (shared)
-│  #
-│  # Per-block SORF:
-│  #   qjl_signs: FSL<u8>, list_size=num_blocks×B    (per row)
-│  #   qjl_residual_norms: FSL<F>, list_size=num_blocks (per row, externalized)
-│  #   qjl_sorf_signs: Primitive<u8>, len=num_blocks×3×B (shared)
-│  #
-│  # Full-dim padded SORF:
-│  #   qjl_signs: FSL<u8>, list_size=padded_d         (per row — larger than per-block!)
-│  #   qjl_residual_norm: Primitive<F>, len=num_rows   (per row, single norm, externalized)
-│  #   qjl_sorf_signs: Primitive<u8>, len=3×padded_d   (shared)
+│  # Shared children
+├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
+├── mse_rotation_signs: PrimitiveArray<u8>  # len = k × 3 × B
 
-Externalized (lives in parent encoding, not in TurboQuantArray):
-├── block_norms: FixedSizeListArray<F>         # len=num_rows, list_size=num_blocks
-└── [qjl_residual_norms]: (see strategy above)
+Externalized:
+├── block_norms: FixedSizeListArray<F>      # list_size = k
 ```
-
-The `is_pdx` flag in metadata determines whether `codes` (and `qjl_signs`) are
-in row-major or PDX-transposed layout.
-
-Note: the full-dim padded SORF strategy has different per-vector storage than
-the per-block strategies: `padded_d` QJL sign bits per vector (e.g., 1024 for
-d=768) vs. `num_blocks × B` bits (768 for d=768, B=128). It also stores a
-single residual norm per vector rather than one per block.
 
 ## Compression ratio
 
-For f32 input at dimension d with MSE bit width b_mse (b_mse = b-1 for QJL
-strategies, b_mse = b for MSE-only), k = ⌈d/B⌉ blocks:
-
-**MSE components (all strategies):**
+For f32 input, b_mse bits MSE, k = d/B blocks, N vectors:
 
 | Component   | Bits per vector |
 | ----------- | --------------- |
 | MSE codes   | k × B × b_mse   |
-| Block norms | k × norm_bits   |
+| Block norms | k × 32          |
 
-| Component      | Shared bits  |
-| -------------- | ------------ |
-| Centroids      | 2^b_mse × 32 |
-| MSE SORF signs | k × 3 × B    |
+| Component  | Shared bits  |
+| ---------- | ------------ |
+| Centroids  | 2^b_mse × 32 |
+| SORF signs | k × 3 × B    |
 
-**QJL components (strategy-dependent):**
+### Worked examples (f32, b_mse=5, N=1000)
 
-| Strategy             | Signs/vec | Res. norms/vec | Shared       |
-| -------------------- | --------- | -------------- | ------------ |
-| Per-block Gaussian   | k × B     | k × norm_bits  | k × B² × 32  |
-| Per-block SORF       | k × B     | k × norm_bits  | k × 3 × B    |
-| Full-dim padded SORF | padded_d  | norm_bits      | 3 × padded_d |
-| MSE-only             | 0         | 0              | 0            |
+| d             | B    | k   | Per-vec bits          | Ratio | Notes                      |
+| ------------- | ---- | --- | --------------------- | ----- | -------------------------- |
+| 768           | 256  | 3   | 3×256×5 + 3×32 = 3936 | 6.2×  | Block decomp; zero padding |
+| 1024          | 1024 | 1   | 1024×5 + 32 = 5152    | 6.4×  | Single block (= current)   |
+| 768 (current) | 1024 | 1   | 1024×5 + 32 = 5152    | 4.8×  | Padded; 33% overhead       |
 
-### Example: f32, d=768, b=5, B=128, N=1000, k=6 (per-block Gaussian QJL)
-
-- Uncompressed: 768 × 32 × 1000 = 24,576,000 bits (3,000 KB)
-- MSE codes: 6 × 128 × 4 × 1000 = 3,072,000 bits
-- QJL signs: 6 × 128 × 1 × 1000 = 768,000 bits
-- Block norms: 6 × 32 × 1000 = 192,000 bits
-- QJL residual norms: 6 × 32 × 1000 = 192,000 bits
-- Shared: 512 + 2,304 + 3,145,728 = 3,148,544 bits
-- **Total compressed: 7,372,544 bits (899 KB)**
-- **Ratio: 3.3×** (QJL Gaussian matrices dominate at small N)
-
-At N=100K, the shared overhead is ~31.5 bits/vector (<1% of per-vector cost),
-giving ratio ≈ 5.8×. At N=1M, ratio ≈ 5.8×.
-
-### Comparison across configurations (f32, d=768, 5 bits/coordinate total)
-
-All configurations use 5 total bits per coordinate. For QJL strategies, this is
-4-bit MSE + 1-bit QJL. For MSE-only, all 5 bits go to MSE (32 centroids).
-
-| Config                                | B   | Ratio (N=1K) | Ratio (N=100K) | Notes                              |
-| ------------------------------------- | --- | ------------ | -------------- | ---------------------------------- |
-| Block MSE-only (5-bit MSE)            | 128 | 6.1×         | 6.1×           | No QJL; biased inner products      |
-| Block + per-block SORF QJL            | 128 | 5.8×         | 5.8×           | Approximate; minimal overhead      |
-| Block + full-dim padded SORF QJL      | 128 | 5.7×         | 5.7×           | Lower variance; padded_d signs/vec |
-| Block + per-block Gaussian QJL        | 128 | 3.3×         | 5.8×           | Paper-correct; matrices amortize   |
-| [Current][current-impl] (padded SORF) | —   | 4.7×         | 4.7×           | 33% padding waste                  |
-
-Per-block SORF QJL has the best ratio at all column sizes (SORF signs are
-negligible overhead). Full-dim padded SORF QJL is close behind (the extra
-padded_d − d = 256 sign bits per vector are a small cost). Per-block Gaussian
-QJL is competitive only for large columns where the B²×k×4 byte matrices
-amortize.
+Block decomposition improves d=768 from 4.8× to 6.2× — a 30% storage
+improvement. For d=1024 the encoding is identical to current.
 
 ## Performance analysis
 
-### Encode throughput
+### Encode/decode throughput
 
-With k blocks at B-dim, encoding requires per block:
+SORF at B dimensions: 3 × B × log₂(B) + 3 × B FLOPs per block. For k blocks:
 
-| Operation                    | FLOPs (B=128)                         |
-| ---------------------------- | ------------------------------------- |
-| MSE SORF (3-round)           | 3 × 128 × log₂(128) + 3 × 128 ≈ 3,072 |
-| Centroid lookup              | 128 binary searches                   |
-| QJL Gaussian matmul (S × r)  | 2B² = 32,768 (multiply + add)         |
-| QJL SORF (if per-block SORF) | ≈ 3,072 (same as MSE)                 |
-| Norm computation             | 128 FMA + sqrt ≈ 129                  |
+| B              | SORF FLOPs/block          | k (d=768) | Total MSE FLOPs |
+| -------------- | ------------------------- | --------- | --------------- |
+| 256            | 3×256×8 + 768 = 6,912     | 3         | 20,736          |
+| 512            | 3×512×9 + 1536 = 15,360   | —         | —               |
+| 1024 (current) | 3×1024×10 + 3072 = 33,792 | 1         | 33,792          |
 
-For d=768, k=6: MSE total ≈ 18K FLOPs. QJL depends on strategy: Gaussian
-matmul ≈ 197K FLOPs (~10× more than SORF QJL at ≈ 18K). The Gaussian QJL
-dominates encode cost. SORF QJL adds negligible overhead. Acceptable for
-offline encoding in both cases.
-
-### Decode throughput
-
-| Operation                        | FLOPs per block (B=128) |
-| -------------------------------- | ----------------------- |
-| Codebook lookup                  | 128 table reads         |
-| Inverse SORF                     | ≈ 3,072                 |
-| QJL Gaussian matmul (Sᵀ × signs) | 2B² = 32,768            |
-| QJL SORF (if per-block SORF)     | ≈ 3,072                 |
-| Denormalize                      | 128 multiplies          |
-
-For d=768, k=6: MSE decode ≈ 18K FLOPs. QJL decode: Gaussian ≈ 197K FLOPs,
-SORF ≈ 18K FLOPs. Gaussian QJL decode is ~10× more expensive than SORF QJL.
-For scan workloads that only need inner products (not full reconstruction), the
-fused distance computation path avoids full decode entirely.
-
-### Scan throughput (PDX, Stage 2)
-
-The PDX scan kernel is memory-bandwidth bound, not compute bound. The lookup
-table fits in L1 (1 KB at b=4). With 64 vectors per SIMD pass, this achieves
-near-peak memory bandwidth utilization. Norm weighting adds k scalar multiplies
-per 64-vector group — negligible.
+Block decomposition at d=768 is ~40% fewer FLOPs than the current padded
+approach, despite more blocks, because each block is smaller.
 
 ### Benchmarking plan
 
-Stage 1:
-
-1. Encode throughput: block TQ vs. current TQ at d=128, 768, 1024
-2. Decode throughput: same dimensions
-3. Quantized cosine similarity: block vs. current (includes norm overhead)
-4. L2 norm readthrough: O(k) block norms vs. O(1) current
-
-Stage 2:
-
-5. PDX scan throughput vs. row-major scan at d=768, 1024
-6. Full decompression from PDX layout (includes un-transpose overhead)
+1. Encode/decode throughput: block TQ vs. current TQ at d=128, 768, 1024
+2. Quantized cosine similarity: block vs. current
+3. L2 norm readthrough: O(k) vs. O(1)
+4. PDX scan throughput vs. row-major (Stage 3)
 
 ## Experimental plan
 
-Before committing to specific parameters, the following experiments are needed:
-
 ### MSE quality vs. block size
 
-- Compare actual normalized MSE at B ∈ {64, 128, 256} vs. full-dimension
-  single-SORF at bit widths b ∈ {2, 3, 4, 5, 8}
+- Compare actual normalized MSE at B ∈ {64, 128, 256, 512} vs. single-SORF at
+  padded dimension, at bit widths b ∈ {2, 3, 4, 5, 8}
 - Test SORF coordinate distribution at each B: histogram vs. analytical Beta
-- Test 3, 4, and 5 SORF rounds at each B (3 rounds provides 3 × log₂(B)
-  mixing stages: 18 at B=64, 21 at 128, 24 at 256)
+- Test 3, 4, 5 SORF rounds at each B
+- Determine if the practical MSE constant is worse at smaller B
 
-### QJL strategy comparison
+### QJL strategy comparison (if pursued)
 
-Compare all four strategies at d=768 with B ∈ {64, 128, 256}:
+- Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim padded SORF QJL
+  vs. MSE-only
+- Key metric: ANN recall@k on standard benchmarks (SIFT, GloVe)
+- Per community findings, MSE-only is expected to win [7]
 
-- **Per-block Gaussian QJL** (paper-correct): measure inner product bias and
-  variance. Baseline for correctness.
-- **Per-block SORF QJL**: measure bias/variance vs. per-block Gaussian at same
-  B. Quantify the quality cost of the SORF approximation at small block
-  dimensions. Test at 3, 4, 5 SORF rounds.
-- **Full-dimension padded SORF QJL** (current approach): measure for comparison.
-  Higher dimension gives better SORF-to-Haar convergence (30 butterfly stages at
-  d=1024) which may compensate for the padding waste. This is the key
-  comparison — does the better convergence of full-dim SORF outweigh the 25%
-  wasted sign bits?
-- **MSE-only** (no QJL): measure inner product bias to establish baseline.
+### Straggler handling (if needed)
 
-Key metrics:
-
-- Mean signed relative error on inner products (bias)
-- Variance of inner product estimates
-- ANN recall@k on standard benchmarks (e.g., SIFT, GloVe)
-
-Per-block Gaussian QJL has d/B times more variance than full-dim QJL (6× at
-d=768, B=128). Per-block SORF QJL has additional approximation error on top of
-that. Full-dim padded SORF QJL has lower variance but wastes bits on padding.
-The experiment should determine which effect dominates in practice.
-
-### Straggler handling
-
-- Compare padded straggler (zero-pad to B, use SORF) vs. dense rotation at
-  actual straggler dimension with own centroids
-- Measure whether dense straggler enables increasing B (e.g., B=256 with
-  d=768 = 3×256, no straggler at all)
+Rare for common dimensions. If encountered: zero-pad to B (simplest). Follow-up:
+dense rotation at actual dimension.
 
 ## Phasing
 
-**Stage 1** (block decomposition): Modify the existing TurboQuant encoding to
-use B-dim blocks with per-block SORF rotation, externalized norms, and
-configurable QJL strategy (per-block Gaussian, per-block SORF, full-dim padded
-SORF, or MSE-only). Row-major code layout.
+**Phase 1** — MSE-only single-block TurboQuant: Split the [current PR][current-impl]
+to merge MSE-only (no QJL). This is a complete encoding for all dimensions
+(with padding for non-power-of-2).
 
-**Stage 2** (PDX layout): Add dimension-major code transposition within
-64-vector chunks. PDX-native distance computation kernels. Requires resolving
-open design questions around chunk alignment and compressor interaction.
+**Phase 2** — Block decomposition: Add block splitting for non-power-of-2
+dimensions. Externalize norms. B = largest power-of-2 ≥ 64 dividing d.
 
-## Test migration
+**Phase 3** — PDX layout: Dimension-major code transposition within 64-vector
+chunks. Distance computation kernels.
 
-The [current TurboQuant test suite][current-impl] will need rewriting:
+**Phase 4** (experimental) — QJL: If the experimental plan shows QJL improves
+recall@k beyond MSE-only, add per-block Gaussian or SORF QJL. Based on
+community findings, this may not be pursued.
 
-- **Slot counts**: New structure with per-block SORF signs, QJL Gaussian
-  matrices, externalized norms.
-- **Serde roundtrips**: New metadata (block_size, num_blocks).
-- **MSE bound tests**: Add tests at B ∈ {64, 128, 256}.
-- **QJL tests**: Compare all four strategies (per-block Gaussian, per-block
-  SORF, full-dim padded SORF, MSE-only).
-- **Quantized cosine similarity**: Update for per-block norm weighting.
-- **Slice/take**: More children to manage, same semantics.
+## Practical recommendations
 
-New tests:
+For common model dimensions, the most promising configurations are:
 
-- SORF quality at B=64, 128, 256: distribution vs. Beta at 3, 4, 5 rounds
-- Practical MSE comparison: block vs. single-rotation at same bit width
-- QJL comparison: per-block Gaussian vs. per-block SORF vs. full-dim padded SORF
-- Zero-norm sub-vector handling
-- Straggler handling (padded initially, dense rotation as follow-up)
-- Encode/decode benchmarks
+| Dimension             | Recommendation              | Rationale                                                                  |
+| --------------------- | --------------------------- | -------------------------------------------------------------------------- |
+| 512, 1024, 2048, 4096 | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
+| 768, 1536, 3072       | 3-block MSE-only + PDX      | B=256 or 512. Zero padding waste. 3 blocks, shared centroids.              |
+| Arbitrary d (rare)    | Padded single-block         | Fall back to current approach. Padding overhead bounded by B-1 dims.       |
+
+In all cases, MSE-only is the recommended starting point. QJL should only be
+added if experiments demonstrate clear recall@k improvements for the target
+workload.
 
 ## Future work: GPU decode and fused distance computation
 
-### Motivation
-
-For ANN search workloads, the dominant operation is computing distances between
-a query vector and millions of database vectors. On GPU, the goal is to perform
-this computation directly on the compressed representation, avoiding the cost
-of materializing full decompressed vectors in HBM.
-
-### Decode as GEMM
-
-The decode path for a single B-dim block is:
-
-```
-decoded_block = norm × R⁻¹ × codebook_lookup(codes)
-```
-
-For a batch of N vectors sharing the same block's rotation matrix R⁻¹:
+The B-dim block structure maps naturally to GPU tile sizes and tensor cores.
+For a batch of N vectors sharing the same rotation matrix R⁻¹:
 
 ```
 decoded_batch = diag(norms) × R⁻¹ × codebook_lookup_batch(codes)
@@ -743,70 +489,39 @@ decoded_batch = diag(norms) × R⁻¹ × codebook_lookup_batch(codes)
                                ↑ B×B × B×N = GEMM
 ```
 
-The codebook lookup produces a B×N matrix, and the inverse rotation is a B×B
-matrix multiply — a GEMM that maps directly to tensor cores.
+The codebook gather + inverse rotation + norm scaling can be fused into a single
+kernel following the double-buffered streaming pattern from Flash-KMeans [6].
+For distance computation without full decode, a precomputed B²-entry distance
+table (1 KB at b=4) fits in shared memory; the kernel streams code bytes from
+HBM with gather-reduce accumulation, using 4-8× less bandwidth than full float
+vectors.
 
-**Partial decompression pipeline on GPU:**
-
-1. **Decompress rotation matrix** (once per block, shared across all vectors):
-   - If stored as bitpacked SORF signs: FastLanes unpack on CUDA cores, then
-     expand to B×B matrix in shared memory
-   - If stored as dense B×B matrix: direct load to shared memory
-
-2. **Decompress norms** (per vector, per block):
-   - If cascade-compressed with ALP or Pco: decompress on CUDA cores
-   - If uncompressed: direct load
-
-3. **Codebook gather + fused GEMM + scale**:
-   - Stage codebook in shared memory (trivially small)
-   - Stream code bytes from HBM, look up centroids, assemble B×N tile
-   - R⁻¹ × tile on tensor cores, scale by norms
-   - Follows the double-buffered streaming pattern from Flash-KMeans [6]
-
-### Fused distance computation (no decode)
-
-Stage the distance table in shared memory (1 KB at b=4), stream code bytes from
-HBM, gather-reduce on-chip, write only final distances. The memory access
-pattern follows Flash-KMeans [6]: double-buffered prefetch, on-chip
-accumulation. We stream quantized code bytes — 4-8× less HBM bandwidth than
-full float vectors.
-
-### Int8 tensor core path (b=9)
-
-At b=9, MSE codes are 8-bit indices. Direct int8 tensor core GEMM requires
-approximately linear centroids (sacrificing Max-Lloyd optimality). Viable for
-ANN ranking; prefer codebook gather for reconstruction.
-
-### Interaction with Vortex file format
-
-The B-dim block structure ensures rotation matrices fit in GPU shared memory
-(B×B×4 bytes). Child arrays are individually compressed by the cascading
-compressor; GPU decode requires either host-side decompression + GPU transfer,
-or direct GPU decompression of FastLanes/ALP.
-
-Note: the GPU decode pipeline described above assumes per-block QJL. The
-full-dim padded SORF QJL strategy requires a padded_d-dim inverse SORF, which
-is a different (larger) kernel and may not fit the per-block tiling model as
-cleanly.
+At b=8, codes are raw int8 indices. Direct int8 tensor core GEMM requires
+approximately linear centroids (sacrificing Max-Lloyd optimality); viable for
+ANN ranking but not reconstruction.
 
 ## References
 
 [1] Zandieh, A., Daliri, M., Hadian, M. and Mirrokni, V. "TurboQuant: Online
-Vector Quantization with Near-optimal Distortion Rate." arXiv:2504.19874,
-April 2025.
+Vector Quantization with Near-optimal Distortion Rate." ICLR 2026.
+arXiv:2504.19874, April 2025.
 
 [2] Ailon, N. and Chazelle, B. "The Fast Johnson-Lindenstrauss Transform and
-Approximate Nearest Neighbors." SIAM Journal on Computing, 39(1):302-322, 2009.
+Approximate Nearest Neighbors." SIAM J. Comput. 39(1):302-322, 2009.
 
 [3] Tropp, J.A. "Improved Analysis of the Subsampled Randomized Hadamard
-Transform." Advances in Adaptive Data Analysis, 3(1-2):115-126, 2011.
+Transform." Adv. Adaptive Data Analysis 3(1-2):115-126, 2011.
 
 [4] Kuffo, L., Krippner, E. and Boncz, P. "PDX: A Data Layout for Vector
-Similarity Search." Proceedings of SIGMOD '25. arXiv:2503.04422, March 2025.
+Similarity Search." SIGMOD '25. arXiv:2503.04422, March 2025.
 
 [5] Yu, F.X., Suresh, A.T., Choromanski, K., Holtmann-Rice, D. and Kumar, S.
-"Orthogonal Random Features." Advances in Neural Information Processing
-Systems 29 (NeurIPS), 2016. arXiv:1610.09072.
+"Orthogonal Random Features." NeurIPS 2016. arXiv:1610.09072.
 
 [6] Yang, S. et al. "Flash-KMeans: Fast and Memory-Efficient Exact K-Means."
 arXiv:2603.09229, March 2026.
+
+[7] Pathare, T. et al. "TurboQuant: Implementation Corrections, Production
+Hardening, and Deployment Infrastructure." Eviox Tech Report v1.2.0,
+March 2026. Community implementations: tonbistudio/turboquant-pytorch,
+ggml-org/llama.cpp#20969, 0xSero/turboquant, others.
