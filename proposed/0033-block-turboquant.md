@@ -12,7 +12,7 @@ in three stages:
 1. **MSE-only TurboQuant** (immediate): merge the current PR as an MSE-only
    encoding. This is a complete, self-contained building block.
 2. **Block decomposition** (next): for non-power-of-2 dimensions, split into
-   blocks of size B = the largest power-of-2 ≥ 64 that divides d. For
+   blocks of size B = the greatest power-of-2 ≥ 64 that divides d. For
    power-of-2 dimensions, B = d (single block, same as current). Per-block
    norms stored as internal children.
 3. **PDX layout** (later): transpose codes into dimension-major order within
@@ -20,7 +20,7 @@ in three stages:
 
 QJL correction is deferred to a later stage and may ultimately be dropped.
 Community findings from multiple independent TurboQuant implementations
-consistently show that MSE-only outperforms MSE+QJL for KV-cache attention [8].
+often show that MSE-only outperforms MSE+QJL for KV-cache attention [8].
 For ANN ranking and vector-search workloads, the evidence is currently less
 complete, so QJL should remain an empirical question rather than a settled
 conclusion.
@@ -59,7 +59,7 @@ differences are:
 | Codebook               | Analytically derived from Beta distribution; **data-oblivious** | Learned via k-means on training data; **data-dependent** |
 | Rotation               | Random orthogonal within each sub-vector                        | Typically none (OPQ [10] adds a learned rotation)        |
 | Theoretical guarantees | Provable MSE bound (Theorem 1 [1])                              | Empirical quality only                                   |
-| Indexing time          | Zero (codebook precomputed from distribution)                   | Requires training pass over data                         |
+| Codebook training      | None (centroids derived from theory)                            | Requires training pass over data                         |
 | Bits per sub-vector    | Scalar: b bits per coordinate                                   | Vector: typically 8 bits per sub-vector (256 codewords)  |
 
 TurboQuant trades PQ's flexibility (data-dependent codebooks can exploit
@@ -222,18 +222,18 @@ quantization with the computational savings of early termination.
 
 ### Block size strategy
 
-For each dimension d, choose B = the largest power-of-2 ≥ 64 that evenly
+For each dimension d, choose B = the greatest power-of-2 ≥ 64 that evenly
 divides d. This eliminates stragglers entirely for common embedding dimensions:
 
-| Dimension d | Block size B | Blocks k | Notes                       |
-| ----------- | ------------ | -------- | --------------------------- |
-| 512         | 512          | 1        | Single block (= current TQ) |
-| 768         | 256          | 3        | Largest dividing power-of-2 |
-| 1024        | 1024         | 1        | Single block                |
-| 1536        | 512          | 3        |                             |
-| 2048        | 2048         | 1        | Single block                |
-| 3072        | 1024         | 3        |                             |
-| 4096        | 4096         | 1        | Single block                |
+| Dimension d | Block size B | Blocks k | Notes                        |
+| ----------- | ------------ | -------- | ---------------------------- |
+| 512         | 512          | 1        | Single block (= current TQ)  |
+| 768         | 256          | 3        | Greatest dividing power-of-2 |
+| 1024        | 1024         | 1        | Single block                 |
+| 1536        | 512          | 3        |                              |
+| 2048        | 2048         | 1        | Single block                 |
+| 3072        | 1024         | 3        |                              |
+| 4096        | 4096         | 1        | Single block                 |
 
 **Key observations:**
 
@@ -614,8 +614,9 @@ If pursued, four strategies should be compared:
 
 The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] is proved specifically
 for Gaussian. SORF for QJL is an additional approximation (the
-[current implementation][current-impl] uses SORF for QJL). Per-block QJL has
-d/B times more variance than full-dimension QJL (Lemma 4 [1]).
+[current implementation][current-impl] uses SORF for QJL). Per-block QJL can
+incur up to d/B times larger variance bound than full-dimension QJL (Lemma 4
+[1]), depending on how query and residual energy are distributed across blocks.
 
 Community reports indicate MSE-only often wins for KV-cache attention at all
 tested bit widths [8]. Whether this extends to ANN ranking is an empirical
@@ -737,10 +738,11 @@ approach, despite more blocks, because each block is smaller.
 
 ### Benchmarking datasets
 
-The current test suite uses i.i.d. Gaussian vectors, which is a pessimistic
-baseline for TurboQuant: real embeddings have structure (clusters, anisotropy)
-that rotation-based quantization can exploit, while Gaussian vectors are already
-rotationally invariant (the rotation is a no-op in distribution). Recent work
+The current test suite uses i.i.d. Gaussian vectors as a theory anchor and
+sanity check: for isotropic data, a random orthogonal transform is
+distributionally neutral, which cleanly validates theoretical bounds. This is
+not a universal "worst case" for all production workloads — heavy-tailed or
+clustered embeddings can behave differently. Recent work
 (VIBE [11]) argues that traditional benchmarks (SIFT, GloVe) are no longer
 representative of modern ANN workloads.
 
@@ -779,7 +781,7 @@ to merge MSE-only (no QJL). This is a complete encoding for all dimensions
 (with padding for non-power-of-2).
 
 **Phase 2** — Block decomposition: Add block splitting for non-power-of-2
-dimensions. B = largest power-of-2 ≥ 64 dividing d. Per-block norms stored as
+dimensions. B = greatest power-of-2 ≥ 64 dividing d. Per-block norms stored as
 internal children. The `TurboQuantScheme::compress()` method must be updated to:
 (a) choose B based on d, (b) split input into blocks, (c) normalize per-block,
 (d) encode each block, and (e) store per-block norms as an internal child array.
@@ -791,7 +793,7 @@ operate on PDXArray's dimension-contiguous slices.
 
 **Phase 4** (experimental) — QJL: If the experimental plan shows QJL improves
 recall@k beyond MSE-only, add per-block Gaussian or SORF QJL. Based on
-community findings, this may not be pursued.
+KV-cache community reports [8], this may not be pursued.
 
 ## Practical recommendations
 
@@ -953,17 +955,16 @@ arXiv:2603.09229, March 2026.
 Hardening, and Deployment Infrastructure." Eviox Tech Report v1.2.0,
 March 2026. https://eviox.tech/nexus/eviox_turboquant_corrections_study.pdf
 
-[8] Community TurboQuant implementation reports. These sources primarily study
-KV-cache attention rather than ANN search; claims should be scoped accordingly.
-Key sources (pin commits/releases in final external draft):
+[8] Community TurboQuant implementation reports (primarily KV-cache attention):
 
-- tonbistudio/turboquant-pytorch: MSE-only (V3) vs MSE+QJL (V2) for attention
-  and generation. Workload: KV-cache attention.
-- ggml-org/llama.cpp discussion #21155: TurboQuant quantized attention analysis.
-  Workload: KV-cache attention.
-- 0xSero/turboquant: Triton kernels, paper validation scripts.
-- scos-lab/turboquant: Reference reproduction, MSE vs Prod comparison.
-  Several groups report MSE-only beating MSE+QJL for attention metrics at tested
+- https://github.com/tonbistudio/turboquant-pytorch — MSE-only (V3) vs
+  MSE+QJL (V2); reports MSE-only wins for attention and generation quality.
+- https://github.com/ggml-org/llama.cpp/discussions/21155 — Quantized
+  attention analysis; MSE vs Prod comparison for KV-cache workloads.
+- https://github.com/0xSero/turboquant — Triton kernels; paper validation.
+- https://github.com/scos-lab/turboquant — Reference reproduction; MSE vs
+  Prod/QJL comparison.
+  Multiple groups report MSE-only beating MSE+QJL for attention metrics at tested
   bit widths. ANN ranking conclusions remain preliminary pending dedicated
   benchmarks.
 
