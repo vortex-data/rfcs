@@ -39,13 +39,12 @@ embeddings. It works by:
 
 1. Randomly rotating a unit-norm vector so that each coordinate follows a known
    marginal distribution — specifically `(1 - x²)^((d-3)/2)` on [-1, 1], a
-   concentrated Beta distribution (Lemma 1 in [1]; verify numbering against the
-   ICLR 2026 camera-ready if it differs from the arXiv version).
+   concentrated Beta distribution (Lemma 1 in [1]; numbering per arXiv v1).
 2. Applying an MSE-optimal scalar quantizer (Max-Lloyd centroids) independently
    to each coordinate.
 3. Optionally adding a 1-bit QJL (Quantized Johnson-Lindenstrauss) correction
    on the residual for unbiased inner product estimation (Theorem 2 in [1];
-   same camera-ready caveat).
+   numbering per arXiv v1).
 
 The paper prescribes a full random orthogonal rotation (QR decomposition of a
 matrix with i.i.d. N(0,1) entries, yielding a Haar-uniform orthogonal matrix)
@@ -400,8 +399,7 @@ norm = 0, decode as all zeros.
 
 #### Theoretical MSE bound
 
-The paper's MSE bound (Theorem 1 in [1]; verify theorem numbering against the
-ICLR 2026 camera-ready if it differs from the arXiv version) is:
+The paper's MSE bound (Theorem 1 in [1]; numbering per arXiv v1) is:
 
 ```
 E[‖x - x̂‖² / ‖x‖²] ≤ (√3 · π / 2) / 4^b ≈ 2.72 / 4^b
@@ -679,8 +677,8 @@ If pursued, four strategies should be compared:
 | Full-dim padded SORF | Approximate           | O(d log d) total | 3×padded_d bits |
 | MSE-only (no QJL)    | N/A                   | 0                | None            |
 
-The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] (same camera-ready
-numbering caveat as Theorem 1) is proved specifically
+The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] (numbering per arXiv
+v1) is proved specifically
 for Gaussian. SORF for QJL is an additional approximation (the
 [current implementation][current-impl] uses SORF for QJL). Per-block QJL can
 incur up to d/B times larger variance bound than full-dimension QJL (Lemma 4
@@ -811,13 +809,21 @@ amortized; optionally show sensitivity to small N where shared costs dominate.
 The current proposal of 128 is conservative; experiments may justify lowering
 to 64 or raising to 256.
 
-### MSE quality vs. block size
+### MSE quality and scan performance vs. block size
 
 - Compare actual normalized MSE at B ∈ {64, 128, 256, 512} vs. single-SORF at
   padded dimension, at bit widths b ∈ {2, 3, 4, 5, 8}
+- Compare ANN recall@k and scan throughput at fixed d (e.g., d=3072) across
+  B ∈ {256, 512, 1024} — smaller B gives more pruning checkpoints for
+  ADSampling-style early termination but increases norm overhead
 - Test SORF coordinate distribution at each B: histogram vs. analytical Beta
 - Test 3, 4, 5 SORF rounds at each B
 - Determine if the practical MSE constant is worse at smaller B
+
+The block-size rule ("greatest qualifying B") is a starting heuristic that
+maximizes per-block quality and minimizes norm count. Experiments may show that
+smaller B with more pruning checkpoints yields better end-to-end scan
+performance despite higher per-block overhead.
 
 ### QJL strategy comparison (if pursued)
 
@@ -904,7 +910,8 @@ workload.
 ## Future work: GPU decode and fused distance computation
 
 The B-dim block structure maps naturally to GPU tile sizes and tensor cores.
-For a batch of N vectors sharing the same rotation matrix R⁻¹:
+For a single block (k=1; Stage 2 generalizes to k independent per-block GEMMs)
+with a batch of N vectors sharing the same rotation matrix R⁻¹:
 
 ```
 decoded_batch = diag(norms) × R⁻¹ × codebook_lookup_batch(codes)
@@ -994,10 +1001,14 @@ fields from Stage 1 onward. Stage 1 always writes `num_blocks=1`, but the field
 exists so that Stage 2 decoders can read Stage 1 files without migration.
 
 **Decoder invariant:** `block_size` is always the per-block SORF dimension B.
-`codes.list_size` = `num_blocks × block_size`. In Stage 1, `num_blocks=1` and
-`block_size = padded_dim`, so `codes.list_size = padded_dim`. In Stage 2 with
-k>1, `block_size = B` (e.g., 256) and `codes.list_size = d` (e.g., 768). The
-decoder reconstructs `k = codes.list_size / block_size`.
+`codes.list_size` = `num_blocks × block_size`. The decoder reconstructs
+`k = codes.list_size / block_size`. Note that `metadata.dimension` may differ
+from `codes.list_size`:
+
+- Stage 1, non-power-of-2 d: `dimension=768`, `block_size=1024` (padded),
+  `list_size=1024`. `dimension < list_size` is expected; trailing code slots
+  are structural zeros from padding.
+- Stage 2, no stragglers: `dimension = list_size = num_blocks × block_size`.
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
