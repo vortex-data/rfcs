@@ -226,7 +226,7 @@ could skip entire TQ blocks (B dimensions at a time) if the partial distance
 already exceeds the candidate threshold. This combines the storage efficiency of
 quantization with the computational savings of early termination.
 
-[pdx-impl]: https://github.com/cwida/PDX (specific files: `include/pdx/quantizers/scalar.hpp` for SQ8, `include/pdx/pruners/adsampling.hpp` for ADSampling/DCT, `include/pdx/layout.hpp` for int8 interleaving, `include/pdx/distance_computers/avx512_computers.hpp` for VPDPBUSD kernels)
+[pdx-impl]: https://github.com/cwida/PDX "specific files: `include/pdx/quantizers/scalar.hpp` for SQ8, `include/pdx/pruners/adsampling.hpp` for ADSampling/DCT, `include/pdx/layout.hpp` for int8 interleaving, `include/pdx/distance_computers/avx512_computers.hpp` for VPDPBUSD kernels"
 
 ## Proposal
 
@@ -1043,8 +1043,8 @@ written by earlier stages are always readable by later decoders.
 
 ## References
 
-*All lemma, theorem, and definition numbers for [1] refer to arXiv:2504.19874v1.
-The ICLR 2026 camera-ready proceedings may use different numbering.*
+_All lemma, theorem, and definition numbers for [1] refer to arXiv:2504.19874v1.
+The ICLR 2026 camera-ready proceedings may use different numbering._
 
 [1] Zandieh, A., Daliri, M., Hadian, M. and Mirrokni, V. "TurboQuant: Online
 Vector Quantization with Near-optimal Distortion Rate." ICLR 2026.
