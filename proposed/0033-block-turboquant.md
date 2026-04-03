@@ -9,14 +9,15 @@
 We propose modifying the [TurboQuant vector quantization encoding][current-impl]
 to use uniform blocks of a tunable power-of-2 size B (to be experimentally
 determined; expected range 64-256) with per-block SORF rotations for the MSE
-stage. The QJL correction uses per-block Gaussian projection matrices as
-prescribed by [1], not SORF — this eliminates the need for power-of-2 padding in
-the QJL stage. The lowest-level TurboQuant array operates only on unit-norm
-vectors, with norms externalized. In a second stage, a PDX-style
-dimension-major code layout within groups of 64 vectors enables SIMD-friendly
-vectorized distance computation. The TQ block size B (for quantization quality)
-and the PDX vector group size (always 64, for SIMD utilization) are independent
-parameters.
+stage. The QJL correction strategy is an open design question with four options
+to be experimentally compared: per-block Gaussian (paper-correct), per-block
+SORF (fast but approximate), full-dimension padded SORF (current approach,
+better convergence but wastes sign bits), or MSE-only (no QJL). The
+lowest-level TurboQuant array operates only on unit-norm vectors, with norms
+externalized. In a second stage, a PDX-style dimension-major code layout within
+groups of 64 vectors enables SIMD-friendly vectorized distance computation. The
+TQ block size B (for quantization quality) and the PDX vector group size (always
+64, for SIMD utilization) are independent parameters.
 
 [current-impl]: https://github.com/vortex-data/vortex/pull/7167
 
@@ -136,8 +137,14 @@ The paper's MSE bound (Theorem 1 in [1]) is:
 E[‖x - x̂‖² / ‖x‖²] ≤ (√3 · π / 2) / 4^b
 ```
 
-This bound is dimension-independent — it depends only on the bit width `b`. For
-a vector split into blocks with per-block normalization (assuming ‖xₖ‖ > 0):
+This bound is dimension-independent — it depends only on the bit width `b`.
+**Crucially, Theorem 1 is proved for true random orthogonal matrices.** Our use
+of SORF is an approximation; the bound holds exactly only if the per-block
+rotation is a true random orthogonal matrix (or if the SORF approximation is
+validated empirically — see Experimental plan).
+
+Assuming the per-block MSE bound holds, for a vector split into blocks with
+per-block normalization (‖xₖ‖ > 0):
 
 ```
 ‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)
@@ -231,12 +238,18 @@ computation.
 
 **QJL strategy options** (to be experimentally compared):
 
-| Strategy             | Theoretical       | Variance       | Padding waste | Storage         | Speed (per block) |
-| -------------------- | ----------------- | -------------- | ------------- | --------------- | ----------------- |
-| Per-block Gaussian   | Correct (Lemma 4) | (π/(2B))·‖y‖²  | None          | k×B²×4 bytes    | O(B²)             |
-| Per-block SORF       | Approximate       | ~(π/(2B))·‖y‖² | None          | k×3×B bits      | O(B log B)        |
-| Full-dim padded SORF | Approximate       | ~(π/(2d))·‖y‖² | (pad-d)/pad   | 3×padded_d bits | O(d log d)        |
-| MSE-only             | N/A               | N/A            | N/A           | None            | 0                 |
+| Strategy             | Theoretical       | Variance            | Padding waste   | Storage      | Speed            |
+| -------------------- | ----------------- | ------------------- | --------------- | ------------ | ---------------- |
+| Per-block Gaussian   | Correct (Lemma 4) | (π/(2B))·‖y‖²       | None            | k×B²×4 bytes | O(B²)/block      |
+| Per-block SORF       | Approximate       | ~(π/(2B))·‖y‖²      | None            | k×3×B bits   | O(B log B)/block |
+| Full-dim padded SORF | Approximate       | ~(π/(2·pad_d))·‖y‖² | (pad_d-d)/pad_d | 3×pad_d bits | O(d log d) total |
+| MSE-only             | N/A               | N/A                 | N/A             | None         | 0                |
+
+Note: the full-dim padded SORF variance bound formally uses `pad_d` (e.g.,
+1024), not `d` (768). However, the `pad_d - d` sign bits spent on zero-padded
+coordinates carry no information about the residual, so the effective variance
+reduction may be closer to `(π/(2d))·‖y‖²`. The experiment should measure
+actual variance to resolve this.
 
 #### Norm architecture
 
@@ -301,21 +314,34 @@ Store: codes (k × B per vector), block_norms (k per vector),
        centroids (shared), SORF signs (k × 3 × B, shared across vectors)
 
 # QJL stage (optional, one of four strategies)
+
+# --- Per-block strategies (Gaussian or SORF) ---
+# Operate in unit-norm space, per block:
 for i in 0..k:
     if nᵢ > 0:
         x̂ᵢ = decode_mse_block(cᵢ, centroids, SORFᵢ)
         rᵢ = ûᵢ - x̂ᵢ                (per-block unit-norm residual)
         γᵢ = ‖rᵢ‖
-        sᵢ = sign(Projᵢ × rᵢ)       (see QJL strategy options)
+        sᵢ = sign(Projᵢ × rᵢ)       (Gaussian B×B or SORF at B-dim)
     else:
         γᵢ = 0, sᵢ = zeros
+Store: qjl_signs (k × B per vector), qjl_residual_norms (k per vector)
 
-# Projᵢ is one of:
-#   - Sᵢ ∈ ℝ^(B×B) Gaussian i.i.d. N(0,1)    (per-block Gaussian)
-#   - SORF_qjlᵢ at B-dim                       (per-block SORF)
-#   - SORF_qjl at padded_d-dim on full r        (full-dim padded SORF)
+# --- Full-dim padded SORF strategy ---
+# Requires full decode + denormalization to compute the d-dim residual.
+# This crosses the norm externalization boundary: the TurboQuant array
+# operates on unit-norm sub-vectors, but the full residual lives in the
+# original scale. The full-dim QJL encode path is:
+x̂ = concat(nᵢ × decode_mse_block(cᵢ, ...) for i in 0..k)[0..d]
+r = x - x̂                            (d-dim, original scale)
+γ = ‖r‖
+r_pad = [r; zeros(padded_d - d)]      (zero-pad to padded_d)
+s = sign(SORF_qjl(r_pad))             (single padded_d-dim SORF)
+Store: qjl_signs (padded_d per vector), qjl_residual_norm (1 per vector)
 
-Store: qjl_signs, qjl_residual_norms, projection params (strategy-dependent)
+# Note: the full-dim strategy is more complex to implement because it
+# requires a full MSE decode + denormalization during encoding, adding
+# O(d) work and coupling the QJL stage to the norm externalization layer.
 ```
 
 #### Decoding algorithm
@@ -327,16 +353,24 @@ for i in 0..k:
     ûᵢ = SORF⁻¹ᵢ(r̂ᵢ)
 
 # QJL correction (if present)
+
+# --- Per-block strategies (Gaussian or SORF) ---
 for i in 0..k:
     if γᵢ > 0:
-        correctionᵢ = (√(π/2) / dim_proj) × γᵢ × Projᵢᵀ × sᵢ
+        correctionᵢ = (√(π/2) / B) × γᵢ × Projᵢᵀ × sᵢ
         ûᵢ += correctionᵢ
-# dim_proj = B for per-block strategies, padded_d for full-dim strategy
-
-# Denormalize and concatenate (using externalized norms)
+# Denormalize and concatenate
 for i in 0..k:
     x̂ᵢ = nᵢ × ûᵢ
 x̃ = concat(x̂₀, x̂₁, ..., x̂ₖ₋₁)[0..d]
+
+# --- Full-dim padded SORF strategy ---
+# Denormalize first (QJL operates in original scale)
+for i in 0..k:
+    x̂ᵢ = nᵢ × ûᵢ
+x̂ = concat(x̂₀, ..., x̂ₖ₋₁)[0..d]
+correction = (√(π/2) / padded_d) × γ × SORF⁻¹_qjl(s)
+x̃ = x̂ + correction[0..d]
 ```
 
 ### Stage 2: PDX dimension-major layout
@@ -410,7 +444,7 @@ row-major before per-vector inverse SORF decoding.
 ```
 TurboQuantArray (operates on unit-norm B-dim sub-vectors)
 ├── metadata: { dimension: u32, bit_width: u32, block_size: u32,
-│               num_blocks: u32, has_qjl: bool, is_pdx: bool }
+│               num_blocks: u32, qjl_strategy: enum, is_pdx: bool }
 │
 │  # Per-row children (sliced/taken on row operations)
 ├── codes: FixedSizeListArray<u8>              # len=num_rows, list_size=num_blocks×B
@@ -419,37 +453,63 @@ TurboQuantArray (operates on unit-norm B-dim sub-vectors)
 ├── centroids: PrimitiveArray<f32>             # len=2^(bit_width-1) [MSE codebook]
 ├── mse_rotation_signs: PrimitiveArray<u8>     # len=num_blocks×3×B [per-block MSE SORF]
 │
-│  # Optional QJL children (per-block Gaussian)
-├── [qjl_signs]: FixedSizeListArray<u8>        # len=num_rows, list_size=num_blocks×B
-├── [qjl_matrices]: PrimitiveArray<f32>        # len=num_blocks×B×B [Gaussian i.i.d. N(0,1)]
+│  # QJL children (strategy-dependent, all optional)
+│  #
+│  # Per-block Gaussian:
+│  #   qjl_signs: FSL<u8>, list_size=num_blocks×B    (per row)
+│  #   qjl_residual_norms: FSL<F>, list_size=num_blocks (per row, externalized)
+│  #   qjl_matrices: Primitive<f32>, len=num_blocks×B×B (shared)
+│  #
+│  # Per-block SORF:
+│  #   qjl_signs: FSL<u8>, list_size=num_blocks×B    (per row)
+│  #   qjl_residual_norms: FSL<F>, list_size=num_blocks (per row, externalized)
+│  #   qjl_sorf_signs: Primitive<u8>, len=num_blocks×3×B (shared)
+│  #
+│  # Full-dim padded SORF:
+│  #   qjl_signs: FSL<u8>, list_size=padded_d         (per row — larger than per-block!)
+│  #   qjl_residual_norm: Primitive<F>, len=num_rows   (per row, single norm, externalized)
+│  #   qjl_sorf_signs: Primitive<u8>, len=3×padded_d   (shared)
 
 Externalized (lives in parent encoding, not in TurboQuantArray):
 ├── block_norms: FixedSizeListArray<F>         # len=num_rows, list_size=num_blocks
-└── [qjl_residual_norms]: FixedSizeListArray<F>    # len=num_rows, list_size=num_blocks
+└── [qjl_residual_norms]: (see strategy above)
 ```
 
 The `is_pdx` flag in metadata determines whether `codes` (and `qjl_signs`) are
 in row-major or PDX-transposed layout.
 
+Note: the full-dim padded SORF strategy has different per-vector storage than
+the per-block strategies: `padded_d` QJL sign bits per vector (e.g., 1024 for
+d=768) vs. `num_blocks × B` bits (768 for d=768, B=128). It also stores a
+single residual norm per vector rather than one per block.
+
 ## Compression ratio
 
-For f32 input at dimension d with bit width b (QJL, so b-1 MSE bits + 1 QJL
-bit), k = ⌈d/B⌉ blocks:
+For f32 input at dimension d with MSE bit width b_mse (b_mse = b-1 for QJL
+strategies, b_mse = b for MSE-only), k = ⌈d/B⌉ blocks:
 
-| Component          | Bits per vector |
-| ------------------ | --------------- |
-| MSE codes          | k × B × (b-1)   |
-| QJL signs          | k × B × 1       |
-| Block norms        | k × norm_bits   |
-| QJL residual norms | k × norm_bits   |
+**MSE components (all strategies):**
 
-| Component             | Shared bits  |
-| --------------------- | ------------ |
-| Centroids             | 2^(b-1) × 32 |
-| MSE SORF signs        | k × 3 × B    |
-| QJL Gaussian matrices | k × B² × 32  |
+| Component   | Bits per vector |
+| ----------- | --------------- |
+| MSE codes   | k × B × b_mse   |
+| Block norms | k × norm_bits   |
 
-### Example: f32, d=768, b=5, B=128, N=1000 vectors, k=6
+| Component      | Shared bits  |
+| -------------- | ------------ |
+| Centroids      | 2^b_mse × 32 |
+| MSE SORF signs | k × 3 × B    |
+
+**QJL components (strategy-dependent):**
+
+| Strategy             | Signs/vec | Res. norms/vec | Shared       |
+| -------------------- | --------- | -------------- | ------------ |
+| Per-block Gaussian   | k × B     | k × norm_bits  | k × B² × 32  |
+| Per-block SORF       | k × B     | k × norm_bits  | k × 3 × B    |
+| Full-dim padded SORF | padded_d  | norm_bits      | 3 × padded_d |
+| MSE-only             | 0         | 0              | 0            |
+
+### Example: f32, d=768, b=5, B=128, N=1000, k=6 (per-block Gaussian QJL)
 
 - Uncompressed: 768 × 32 × 1000 = 24,576,000 bits (3,000 KB)
 - MSE codes: 6 × 128 × 4 × 1000 = 3,072,000 bits
@@ -460,20 +520,25 @@ bit), k = ⌈d/B⌉ blocks:
 - **Total compressed: 7,372,544 bits (899 KB)**
 - **Ratio: 3.3×** (QJL Gaussian matrices dominate at small N)
 
-At N=100K vectors the shared overhead amortizes to <0.04 bits/vector, giving
-ratio ≈ 5.7×. At N=1M, ratio ≈ 5.8×.
+At N=100K, the shared overhead is ~31.5 bits/vector (<1% of per-vector cost),
+giving ratio ≈ 5.8×. At N=1M, ratio ≈ 5.8×.
 
-### Comparison across configurations (f32, d=768, b=5)
+### Comparison across configurations (f32, d=768, 5 bits/coordinate total)
 
-| Config                                           | B   | Ratio (N=1K) | Ratio (N=100K) | Notes                         |
-| ------------------------------------------------ | --- | ------------ | -------------- | ----------------------------- |
-| Block MSE-only                                   | 128 | 6.5×         | 6.5×           | No QJL; biased inner products |
-| Block + per-block Gaussian QJL                   | 128 | 3.3×         | 5.7×           | Unbiased; matrices amortize   |
-| [Current][current-impl] (padded SORF + SORF QJL) | —   | 4.7×         | 4.7×           | 33% padding waste             |
+All configurations use 5 total bits per coordinate. For QJL strategies, this is
+4-bit MSE + 1-bit QJL. For MSE-only, all 5 bits go to MSE (32 centroids).
 
-For small columns, MSE-only or the current padded approach may be preferable.
-For large columns (the common case for embedding tables), per-block Gaussian QJL
-gives the best ratio.
+| Config                                | B   | Ratio (N=1K) | Ratio (N=100K) | Notes                         |
+| ------------------------------------- | --- | ------------ | -------------- | ----------------------------- |
+| Block MSE-only (5-bit MSE)            | 128 | 6.1×         | 6.1×           | No QJL; biased inner products |
+| Block + per-block SORF QJL            | 128 | 5.8×         | 5.8×           | Approximate; minimal overhead |
+| Block + per-block Gaussian QJL        | 128 | 3.3×         | 5.8×           | Correct; matrices amortize    |
+| [Current][current-impl] (padded SORF) | —   | 4.7×         | 4.7×           | 33% padding waste             |
+
+Per-block SORF QJL has the best ratio at all column sizes (SORF signs are
+negligible overhead). Per-block Gaussian QJL is competitive only for large
+columns where the B²×k×4 byte matrices amortize. For small columns, MSE-only
+or per-block SORF QJL is preferable.
 
 ## Performance analysis
 
@@ -671,6 +736,11 @@ The B-dim block structure ensures rotation matrices fit in GPU shared memory
 (B×B×4 bytes). Child arrays are individually compressed by the cascading
 compressor; GPU decode requires either host-side decompression + GPU transfer,
 or direct GPU decompression of FastLanes/ALP.
+
+Note: the GPU decode pipeline described above assumes per-block QJL. The
+full-dim padded SORF QJL strategy requires a padded_d-dim inverse SORF, which
+is a different (larger) kernel and may not fit the per-block tiling model as
+cleanly.
 
 ## References
 
