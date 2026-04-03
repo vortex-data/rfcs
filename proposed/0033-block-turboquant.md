@@ -39,12 +39,11 @@ embeddings. It works by:
 
 1. Randomly rotating a unit-norm vector so that each coordinate follows a known
    marginal distribution — specifically `(1 - x²)^((d-3)/2)` on [-1, 1], a
-   concentrated Beta distribution (Lemma 1 in [1]; numbering per arXiv v1).
+   concentrated Beta distribution (Lemma 1 in [1]).
 2. Applying an MSE-optimal scalar quantizer (Max-Lloyd centroids) independently
    to each coordinate.
 3. Optionally adding a 1-bit QJL (Quantized Johnson-Lindenstrauss) correction
-   on the residual for unbiased inner product estimation (Theorem 2 in [1];
-   numbering per arXiv v1).
+   on the residual for unbiased inner product estimation (Theorem 2 in [1]).
 
 The paper prescribes a full random orthogonal rotation (QR decomposition of a
 matrix with i.i.d. N(0,1) entries, yielding a Haar-uniform orthogonal matrix)
@@ -227,7 +226,7 @@ could skip entire TQ blocks (B dimensions at a time) if the partial distance
 already exceeds the candidate threshold. This combines the storage efficiency of
 quantization with the computational savings of early termination.
 
-[pdx-impl]: https://github.com/cwida/PDX
+[pdx-impl]: https://github.com/cwida/PDX (specific files: `include/pdx/quantizers/scalar.hpp` for SQ8, `include/pdx/pruners/adsampling.hpp` for ADSampling/DCT, `include/pdx/layout.hpp` for int8 interleaving, `include/pdx/distance_computers/avx512_computers.hpp` for VPDPBUSD kernels)
 
 ## Proposal
 
@@ -399,7 +398,7 @@ norm = 0, decode as all zeros.
 
 #### Theoretical MSE bound
 
-The paper's MSE bound (Theorem 1 in [1]; numbering per arXiv v1) is:
+The paper's MSE bound (Theorem 1 in [1]) is:
 
 ```
 E[‖x - x̂‖² / ‖x‖²] ≤ (√3 · π / 2) / 4^b ≈ 2.72 / 4^b
@@ -677,8 +676,7 @@ If pursued, four strategies should be compared:
 | Full-dim padded SORF | Approximate           | O(d log d) total | 3×padded_d bits |
 | MSE-only (no QJL)    | N/A                   | 0                | None            |
 
-The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] (numbering per arXiv
-v1) is proved specifically
+The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] is proved specifically
 for Gaussian. SORF for QJL is an additional approximation (the
 [current implementation][current-impl] uses SORF for QJL). Per-block QJL can
 incur up to d/B times larger variance bound than full-dimension QJL (Lemma 4
@@ -686,7 +684,9 @@ incur up to d/B times larger variance bound than full-dimension QJL (Lemma 4
 
 Community reports indicate MSE-only often wins for KV-cache attention at all
 tested bit widths [8]. Whether this extends to ANN ranking is an empirical
-question (see Experimental plan); QJL may not be worth the complexity.
+question (see Experimental plan); QJL may not be worth the complexity. Note:
+the [current PR][current-impl] flags a known SORF-related QJL bias for
+non-power-of-2 padded dimensions (#7245); MSE-only Stage 1 avoids this path.
 
 ## Array layout
 
@@ -1001,8 +1001,9 @@ fields from Stage 1 onward. Stage 1 always writes `num_blocks=1`, but the field
 exists so that Stage 2 decoders can read Stage 1 files without migration.
 
 **Decoder invariant:** `block_size` is always the per-block SORF dimension B.
-`codes.list_size` = `num_blocks × block_size`. The decoder reconstructs
-`k = codes.list_size / block_size`. Note that `metadata.dimension` may differ
+`codes.list_size` = `num_blocks × block_size`. The decoder **validates**
+`num_blocks == codes.list_size / block_size` (exact integer division; reject
+files where this does not hold). Note that `metadata.dimension` may differ
 from `codes.list_size`:
 
 - Stage 1, non-power-of-2 d: `dimension=768`, `block_size=1024` (padded),
@@ -1041,6 +1042,9 @@ Each stage is independently shippable. Users can upgrade incrementally. Files
 written by earlier stages are always readable by later decoders.
 
 ## References
+
+*All lemma, theorem, and definition numbers for [1] refer to arXiv:2504.19874v1.
+The ICLR 2026 camera-ready proceedings may use different numbering.*
 
 [1] Zandieh, A., Daliri, M., Hadian, M. and Mirrokni, V. "TurboQuant: Online
 Vector Quantization with Near-optimal Distortion Rate." ICLR 2026.
