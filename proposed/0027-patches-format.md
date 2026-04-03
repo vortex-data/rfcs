@@ -88,13 +88,11 @@ pub struct PatchedArray {
     pub(super) len: usize,
 
     /// lane offsets. The PType of these MUST be u32
-    pub(super) lane_offsets: BufferHandle,
+    pub(super) lane_offsets: ArrayRef,
     /// indices within a 1024-element chunk. The PType of these MUST be u16
-    pub(super) indices: BufferHandle,
+    pub(super) indices: ArrayRef,
     /// patch values corresponding to the indices. The ptype is specified by `values_ptype`.
-    pub(super) values: BufferHandle,
-    /// PType of the scalars in `values`. Can be any native type.
-    pub(super) values_ptype: PType,
+    pub(super) values: ArrayRef,
 
     pub(super) stats_set: ArrayStats,
 }
@@ -185,4 +183,6 @@ We use a data layout that closely matches the one described in _G-ALP_ and apply
 
 ## Future Possibilities
 
-What natural extensions or follow-on work does this enable? This is a good place to note related ideas that are out of scope for this RFC but worth capturing.
+It would be nice to use this to replace the SparseArray.
+
+We also need a plan for how to extend this to non-primitive types. Would need to pick a lane count for the other types.
