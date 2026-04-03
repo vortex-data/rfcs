@@ -98,8 +98,8 @@ pub struct PatchedArray {
 }
 ```
 
-The PatchedArray holds buffer handles for the `lane_offsets` which provides chunk/lane-level random indexing
-into the patch `indices` and `values`, so these values can live equivalently in device or host memory.
+The PatchedArray holds a `lane_offsets` child which provides chunk/lane-level random indexing
+into the patch `indices` and `values`. Like all arrays, these can live in device or host memory.
 
 The only operation performed at planning time is slicing, which means that all of its reduce rules would run
 without issue in CUDA or on CPU.
@@ -112,15 +112,14 @@ without issue in CUDA or on CPU.
 
 We look at the slice indices, align them to chunk boundaries, then slice both the child and the patches to chunk boundaries, and preserve the offset + len to apply the final intra-chunk slice at execution time.
 
-## Filter / Take Execution
+## Filter
 
-Filter / Take operations can arbitrarily break and reconstruct new chunks, so they cannot be done metadata-only and thus must be a Kernel rather than a Reduce rule.
+We can do some limited optimization of Filter in a reducer. First, we find the start/end indices of the filter mask to nearest chunk boundary (1024 elements).
 
-In practice, we perform the operation by
+We then slice the underlying array to those boundaries. We also can slice the `lane_offsets` by multiples of `n_lanes` to trim to only in-bounds chunks.
 
-- Executing the filter on the child, then executing it
-- Intersecting the filter with our patches, ideally in a chunk-at-a-time way so we can write a vectorized version.
-- Applying the filtered patches over the executed child
+Then we re-wrap in a FilterArray with the mask sliced to same chunk boundaries. When the filter is sparse and clustered this greatly reduces the number of chunks
+that need to be decoded.
 
 ## `ScalarFn`s
 
