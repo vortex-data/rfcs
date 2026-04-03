@@ -11,10 +11,11 @@ in three stages:
 
 1. **MSE-only TurboQuant** (immediate): merge the current PR as an MSE-only
    encoding. This is a complete, self-contained building block.
-2. **Block decomposition** (next): for non-power-of-2 dimensions, split into
-   blocks of size B = the greatest power-of-2 ≥ 64 that divides d. For
-   power-of-2 dimensions, B = d (single block, same as current). Per-block
-   norms stored as internal children.
+2. **Block decomposition** (next): for dimensions where a valid B exists
+   (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
+   power-of-2 dimensions, B = d (single block). Dimensions with no qualifying
+   B fall back to padded single-block. Per-block norms stored as internal
+   children.
 3. **PDX layout** (later): transpose codes into dimension-major order within
    groups of 64 vectors for SIMD scan performance.
 
@@ -36,11 +37,13 @@ embeddings. It works by:
 
 1. Randomly rotating a unit-norm vector so that each coordinate follows a known
    marginal distribution — specifically `(1 - x²)^((d-3)/2)` on [-1, 1], a
-   concentrated Beta distribution (Lemma 1 in [1]).
+   concentrated Beta distribution (Lemma 1 in [1]; verify numbering against the
+   ICLR 2026 camera-ready if it differs from the arXiv version).
 2. Applying an MSE-optimal scalar quantizer (Max-Lloyd centroids) independently
    to each coordinate.
 3. Optionally adding a 1-bit QJL (Quantized Johnson-Lindenstrauss) correction
-   on the residual for unbiased inner product estimation (Theorem 2 in [1]).
+   on the residual for unbiased inner product estimation (Theorem 2 in [1];
+   same camera-ready caveat).
 
 The paper prescribes a full random orthogonal rotation (QR decomposition of a
 matrix with i.i.d. N(0,1) entries, yielding a Haar-uniform orthogonal matrix)
@@ -284,8 +287,10 @@ described above.
 
 ### Stage 2: Block decomposition
 
-For non-power-of-2 dimensions, split into blocks of size B (as determined by the
-table above). Each full block gets an independent B-dim SORF rotation.
+For dimensions where the block-size rule produces a valid B (see table above),
+split into blocks of size B. Each full block gets an independent B-dim SORF
+rotation. Dimensions with no qualifying B (e.g., d=96) remain on the padded
+single-block path from Stage 1.
 
 **Changes vs. Stage 1:**
 
@@ -369,10 +374,12 @@ line applies Theorem 1's **probabilistic** bound to each block and should be
 read as holding in **expectation** over independent per-block rotations, not
 almost surely:
 
-````
+```
 ‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)      (exact)
     E[...]         ≤ MSE_bound × Σ_k (‖xₖ‖² / ‖x‖²) = MSE_bound          (in expectation)
-``` The conclusion: `E[‖x - x̂‖² / ‖x‖²] ≤ MSE_bound` assuming independent
+```
+
+The conclusion: `E[‖x - x̂‖² / ‖x‖²] ≤ MSE_bound` assuming independent
 per-block rotations. (Theorem 1 applies because each block is normalized to
 unit norm before rotation and quantization; the per-block encoding pipeline is:
 split → normalize → rotate → quantize, matching the theorem's unit-sphere
@@ -435,7 +442,7 @@ centroids[code_bₖ[j]]`.
 
 #### Encoding algorithm
 
-````
+```
 
 Input: x ∈ ℝ^d, b_mse bits per coordinate, block_size B
 k = d / B (exact division, no straggler for chosen B)
@@ -542,7 +549,7 @@ TQ block 0, dim (B - 1): [v0 v1 v2 ... v63]
 TQ block 1, dim 0: [v0 v1 v2 ... v63]
 ...
 
-````
+```
 
 The inner SIMD loop (64 vectors) has no inter-vector dependencies. TQ block
 boundaries only affect where norm weighting occurs — they don't affect the
@@ -574,7 +581,7 @@ for tq_block in 0..k {
         unit_dots[v] = 0.0;  // reset for next TQ block
     }
 }
-````
+```
 
 **Int8 layout variant.** The PDX implementation [pdx-impl] uses a different
 tiling for int8 data: "4 dims × 16 vecs" to leverage VPDPBUSD/UDOT hardware
@@ -796,8 +803,8 @@ dense rotation at actual dimension.
 to merge MSE-only (no QJL). This is a complete encoding for all dimensions
 (with padding for non-power-of-2).
 
-**Phase 2** — Block decomposition: Add block splitting for non-power-of-2
-dimensions. B = greatest power-of-2 ≥ 64 dividing d. Per-block norms stored as
+**Phase 2** — Block decomposition: Add block splitting for dimensions where a
+valid B exists (greatest power-of-2 ≥ 64 dividing d). Per-block norms stored as
 internal children. The `TurboQuantScheme::compress()` method must be updated to:
 (a) choose B based on d, (b) split input into blocks, (c) normalize per-block,
 (d) encode each block, and (e) store per-block norms as an internal child array.
@@ -815,11 +822,11 @@ KV-cache community reports [8], this may not be pursued.
 
 For common model dimensions, the most promising configurations are:
 
-| Dimension             | Recommendation              | Rationale                                                                  |
-| --------------------- | --------------------------- | -------------------------------------------------------------------------- |
-| 512, 1024, 2048, 4096 | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
-| 768, 1536, 3072       | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
-| Arbitrary d (rare)    | Padded single-block         | Fall back to current approach. Padding overhead bounded by B-1 dims.       |
+| Dimension              | Recommendation              | Rationale                                                                  |
+| ---------------------- | --------------------------- | -------------------------------------------------------------------------- |
+| 512, 1024, 2048, 4096  | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
+| 768, 1536, 3072        | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
+| No qualifying B (rare) | Padded single-block         | Fall back to Stage 1 padded path. Padding overhead bounded by B-1 dims.    |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
