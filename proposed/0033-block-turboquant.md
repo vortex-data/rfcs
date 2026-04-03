@@ -2,7 +2,7 @@
 
 **Authors:** Will Manning
 **Status:** Proposal
-**Date:** 2026-04-02
+**Date:** 2026-04-03
 
 ## Summary
 
@@ -170,10 +170,12 @@ quantified empirically (see Experimental plan).
 
 **SORF approximation caveat.** Theorems 1 and 2 in [1] are proved for true
 random orthogonal matrices (QR of Gaussian), not SORF. The 3-round SORF
-construction `HD₃·HD₂·HD₁` [5] is a structured approximation. The
-approximation quality depends on dimension: 3 rounds provides 3 × log₂(B)
-mixing stages (18 at B=64, 21 at 128, 24 at 256, 30 at 1024). Empirical
-validation is needed for each candidate B — see Experimental plan.
+construction `HD₃·HD₂·HD₁` [5] is a structured approximation. The approximation quality depends on dimension: each round of the Walsh-Hadamard
+transform mixes all B coordinates through log₂(B) butterfly stages, so 3 rounds
+provides 3 × log₂(B) total butterfly stages (18 at B=64, 21 at 128, 24 at 256).
+This is a rough heuristic for mixing quality, not a formal convergence metric —
+[5] does not analyze convergence rate as a function of rounds × dimension.
+Empirical validation is needed for each candidate B — see Experimental plan.
 
 **Fallback: dense rotation.** If SORF proves insufficient at the chosen B, use a
 B × B random orthogonal matrix (QR of Gaussian) instead. Storage at B=128:
@@ -202,31 +204,46 @@ independent Gaussian projection Sₖ ∈ ℝ^(B×B) with i.i.d. N(0,1) entries. 
 Gaussian matrices work at any dimension, no padding is needed for the QJL stage.
 Each block's QJL is provably unbiased by Lemma 4 in [1], and the sum over
 blocks is also unbiased: `E[<y, correction>] = <y, r>`. However, the per-block
-variance is **d/B times higher** than full-dimension QJL:
+variance is **d/B times higher** than full-dimension QJL.
+
+Lemma 4 gives the variance for QJL of a unit vector. Since QJL is applied to the
+residual rₖ (with norm γₖ = ‖rₖ‖, typically ≪ 1), the actual variance scales
+by γₖ²:
 
 ```
-Per-block (B-dim):   Var[<y, correction>] ≤ (π / (2B)) × ‖y‖²
-Full-dim (d-dim):    Var[<y, correction>] ≤ (π / (2d)) × ‖y‖²
+Per-block (B-dim):   Var[<y, correction>] ≤ (π / (2B)) × ‖r‖² × ‖y‖²
+Full-dim (d-dim):    Var[<y, correction>] ≤ (π / (2d)) × ‖r‖² × ‖y‖²
 ```
 
-At d=768, B=128: 6× more variance. Storage: B×B×4 bytes per block (384 KB for
-k=6 at B=128). Encode/decode cost: O(B²) matmul per block.
+The ‖r‖² factor cancels when comparing strategies (same MSE quality → same
+residual norms), so the **relative** variance ratio is d/B regardless. At
+d=768, B=128: per-block has 6× more variance than full-dim. The absolute
+variance is small — at b=4 MSE, ‖r‖² ≈ 0.01, so the per-block variance is
+≈ 0.01 × (π/(2×128)) × ‖y‖² ≈ 1.2×10⁻⁴ × ‖y‖².
+
+Storage: B×B×4 bytes per block (384 KB for k=6 at B=128). Encode/decode cost:
+O(B²) matmul per block.
 
 **Per-block SORF QJL** substitutes a B-dim SORF (`HD₃·HD₂·HD₁` [5]) for the
-Gaussian matrix. This is NOT theoretically justified — Lemma 4 requires Gaussian
-or Haar-orthogonal S, and SORF is only an approximation to Haar measure.
+Gaussian matrix. This is NOT theoretically justified — Lemma 4 in [1] is proved
+specifically for Gaussian S. For Haar-distributed random orthogonal S,
+unbiasedness follows from rotational invariance (a separate argument), but the
+variance constant may differ from π/(2B). SORF is an approximation to neither
+Gaussian nor Haar measure.
 However, the [current implementation][current-impl] already uses SORF for QJL at
 d=1024 with acceptable results (~11% mean relative error for power-of-2 dims),
 demonstrating practical viability. The tradeoff vs Gaussian is compelling:
-O(B log B) speed (5× faster at B=128), O(B) storage (over 1000× less). Quality
+O(B log B) speed (~10× faster than Gaussian at B=128), O(B) storage (over
+1000× less). Quality
 at B=128 needs validation — with only 21 mixing stages, the approximation to
 Haar measure is weaker than at d=1024 (30 stages).
 
 **Full-dimension padded SORF QJL** applies a single SORF at the padded
 dimension (e.g., 1024 for d=768) to the full residual vector `r = x - x̂`,
 matching the [current implementation][current-impl]. The higher dimension gives
-better SORF-to-Haar convergence (30 mixing stages at d=1024 vs 21 at B=128) and
-full-dimension variance `(π/(2d))·‖y‖²`, but wastes `(padded_d - d)/padded_d`
+better SORF-to-Haar convergence (30 butterfly stages at d=1024 vs 21 at B=128)
+and full-dimension variance `~(π/(2·padded_d))·‖r‖²·‖y‖²`, but wastes
+`(padded_d - d)/padded_d`
 of the sign bits on zero-padded coordinates (25% at 768→1024). This approach
 requires computing the full residual from all blocks before applying QJL,
 adding a full-dimension decode step to the encode path.
@@ -238,24 +255,30 @@ computation.
 
 **QJL strategy options** (to be experimentally compared):
 
-| Strategy             | Theoretical       | Variance            | Padding waste   | Storage      | Speed            |
-| -------------------- | ----------------- | ------------------- | --------------- | ------------ | ---------------- |
-| Per-block Gaussian   | Correct (Lemma 4) | (π/(2B))·‖y‖²       | None            | k×B²×4 bytes | O(B²)/block      |
-| Per-block SORF       | Approximate       | ~(π/(2B))·‖y‖²      | None            | k×3×B bits   | O(B log B)/block |
-| Full-dim padded SORF | Approximate       | ~(π/(2·pad_d))·‖y‖² | (pad_d-d)/pad_d | 3×pad_d bits | O(d log d) total |
-| MSE-only             | N/A               | N/A                 | N/A             | None         | 0                |
+| Strategy             | Theoretical       | Variance (×‖r‖²‖y‖²) | Padding waste   | Storage      | Speed            |
+| -------------------- | ----------------- | -------------------- | --------------- | ------------ | ---------------- |
+| Per-block Gaussian   | Correct (Lemma 4) | π/(2B)               | None            | k×B²×4 bytes | O(B²)/block      |
+| Per-block SORF       | Approximate       | ~π/(2B)              | None            | k×3×B bits   | O(B log B)/block |
+| Full-dim padded SORF | Approximate       | ~π/(2·pad_d)         | (pad_d-d)/pad_d | 3×pad_d bits | O(d log d) total |
+| MSE-only             | N/A               | N/A                  | N/A             | None         | 0                |
+
+Variance entries show the coefficient of `‖r‖²×‖y‖²` where `‖r‖²` is the
+residual MSE (≈ 0.01 at b=4). The ‖r‖² factor is the same across strategies
+(same MSE quality), so relative comparisons reduce to the coefficient alone:
+per-block is d/B times higher than full-dim (6× at d=768, B=128).
 
 Note: the full-dim padded SORF variance bound formally uses `pad_d` (e.g.,
-1024), not `d` (768). However, the `pad_d - d` sign bits spent on zero-padded
+1024), not `d` (768). The `pad_d - d` sign bits spent on zero-padded
 coordinates carry no information about the residual, so the effective variance
-reduction may be closer to `(π/(2d))·‖y‖²`. The experiment should measure
-actual variance to resolve this.
+reduction may be closer to `π/(2d)`. The experiment should measure actual
+variance to resolve this.
 
 #### Norm architecture
 
 The TurboQuant array itself operates only on unit-norm B-dim sub-vectors. Norms
-are externalized into a separate child array, following the pattern established
-by the NormVector encoding (PR #7251).
+are externalized into a separate child array, following the pattern explored in
+the NormVector encoding prototype (PR #7251, closed — the concept will need to
+be implemented as part of this work or adapted from a different source).
 
 The per-block norms are stored as a single `FixedSizeListArray<F>` with
 `list_size = num_blocks`, where `F` matches or widens the input element type:
@@ -271,6 +294,13 @@ encoding to them. The cascading compressor treats norms like any other float
 column and is free to re-encode them with ALP, Pco, FastLanes, or other float
 compression schemes.
 
+Note: centroids and quantization always operate in f32 (the
+[current implementation][current-impl] converts all input to f32 before
+quantization). For f64 input, the decode path produces f32 reconstructions
+scaled by f64 norms — a mixed-precision multiply. This preserves the precision
+of the norms (which capture the bulk of the vector's magnitude) while accepting
+f32 precision for the unit-direction reconstruction.
+
 #### Quantized-domain operations with per-block norms
 
 All quantized-domain operations require reading the block norms for both
@@ -285,12 +315,19 @@ centroids[code_bₖ[j]]`. Per-block: compute unit-norm quantized dot product
   (sum of B centroid products), then weight by both vectors' block norms.
 - **Cosine similarity**: `cos(a, b) ≈ (Σ_k ‖aₖ‖·‖bₖ‖·unit_dotₖ) /
 (√(Σ_k ‖aₖ‖²) · √(Σ_k ‖bₖ‖²))`. Requires global norms reconstructed from
-  block norms. The norms tensor should be read once per scan query and cached.
+  block norms.
+- **L2 distance** (squared Euclidean): `‖a-b‖² = ‖a‖² + ‖b‖² - 2<a,b>
+= Σ_k ‖aₖ‖² + Σ_k ‖bₖ‖² - 2 × Σ_k ‖aₖ‖·‖bₖ‖·unit_dotₖ`. Reuses the
+  per-block dot product and per-block norms; this is the primary ANN metric.
+
+The norms tensor should be read once per scan query and cached.
 
 #### Encoding algorithm
 
 ```
-Input: x ∈ ℝ^d, bit_width b, block_size B (power of 2)
+Input: x ∈ ℝ^d, total_bits b, block_size B (power of 2)
+b_mse = b - 1 for QJL strategies, b_mse = b for MSE-only
+num_centroids = 2^b_mse
 k = ⌈d/B⌉
 
 # Block split and normalize
@@ -306,7 +343,7 @@ for i in 0..k:
 for i in 0..k:
     if nᵢ > 0:
         rᵢ = SORFᵢ(ûᵢ)             (3-round HD, independent per block)
-        cᵢ[j] = nearest_centroid(rᵢ[j])  (shared codebook)
+        cᵢ[j] = nearest_centroid(rᵢ[j])  (shared codebook, num_centroids levels)
     else:
         cᵢ[j] = 0
 
@@ -316,7 +353,11 @@ Store: codes (k × B per vector), block_norms (k per vector),
 # QJL stage (optional, one of four strategies)
 
 # --- Per-block strategies (Gaussian or SORF) ---
-# Operate in unit-norm space, per block:
+# Operate in unit-norm space, per block. Note: the current implementation
+# computes the QJL residual in original scale (r = x - x̂). With externalized
+# norms, we instead compute the unit-norm residual (rᵢ = ûᵢ - x̂_unitᵢ) and
+# let denormalization handle the scaling. These are mathematically equivalent:
+# nᵢ × correctionᵢ gives the same result either way.
 for i in 0..k:
     if nᵢ > 0:
         x̂ᵢ = decode_mse_block(cᵢ, centroids, SORFᵢ)
@@ -355,6 +396,7 @@ for i in 0..k:
 # QJL correction (if present)
 
 # --- Per-block strategies (Gaussian or SORF) ---
+# Scale factor uses B (block dimension) because Lemma 4 applies per-block.
 for i in 0..k:
     if γᵢ > 0:
         correctionᵢ = (√(π/2) / B) × γᵢ × Projᵢᵀ × sᵢ
@@ -528,17 +570,19 @@ giving ratio ≈ 5.8×. At N=1M, ratio ≈ 5.8×.
 All configurations use 5 total bits per coordinate. For QJL strategies, this is
 4-bit MSE + 1-bit QJL. For MSE-only, all 5 bits go to MSE (32 centroids).
 
-| Config                                | B   | Ratio (N=1K) | Ratio (N=100K) | Notes                         |
-| ------------------------------------- | --- | ------------ | -------------- | ----------------------------- |
-| Block MSE-only (5-bit MSE)            | 128 | 6.1×         | 6.1×           | No QJL; biased inner products |
-| Block + per-block SORF QJL            | 128 | 5.8×         | 5.8×           | Approximate; minimal overhead |
-| Block + per-block Gaussian QJL        | 128 | 3.3×         | 5.8×           | Correct; matrices amortize    |
-| [Current][current-impl] (padded SORF) | —   | 4.7×         | 4.7×           | 33% padding waste             |
+| Config                                | B   | Ratio (N=1K) | Ratio (N=100K) | Notes                              |
+| ------------------------------------- | --- | ------------ | -------------- | ---------------------------------- |
+| Block MSE-only (5-bit MSE)            | 128 | 6.1×         | 6.1×           | No QJL; biased inner products      |
+| Block + per-block SORF QJL            | 128 | 5.8×         | 5.8×           | Approximate; minimal overhead      |
+| Block + full-dim padded SORF QJL      | 128 | 5.7×         | 5.7×           | Lower variance; padded_d signs/vec |
+| Block + per-block Gaussian QJL        | 128 | 3.3×         | 5.8×           | Paper-correct; matrices amortize   |
+| [Current][current-impl] (padded SORF) | —   | 4.7×         | 4.7×           | 33% padding waste                  |
 
 Per-block SORF QJL has the best ratio at all column sizes (SORF signs are
-negligible overhead). Per-block Gaussian QJL is competitive only for large
-columns where the B²×k×4 byte matrices amortize. For small columns, MSE-only
-or per-block SORF QJL is preferable.
+negligible overhead). Full-dim padded SORF QJL is close behind (the extra
+padded_d − d = 256 sign bits per vector are a small cost). Per-block Gaussian
+QJL is competitive only for large columns where the B²×k×4 byte matrices
+amortize.
 
 ## Performance analysis
 
@@ -546,16 +590,18 @@ or per-block SORF QJL is preferable.
 
 With k blocks at B-dim, encoding requires per block:
 
-| Operation                   | FLOPs (B=128)                         |
-| --------------------------- | ------------------------------------- |
-| MSE SORF (3-round)          | 3 × 128 × log₂(128) + 3 × 128 ≈ 3,072 |
-| Centroid lookup             | 128 binary searches                   |
-| QJL Gaussian matmul (S × r) | B² = 16,384                           |
-| Norm computation            | 128 FMA + sqrt ≈ 129                  |
+| Operation                    | FLOPs (B=128)                         |
+| ---------------------------- | ------------------------------------- |
+| MSE SORF (3-round)           | 3 × 128 × log₂(128) + 3 × 128 ≈ 3,072 |
+| Centroid lookup              | 128 binary searches                   |
+| QJL Gaussian matmul (S × r)  | 2B² = 32,768 (multiply + add)         |
+| QJL SORF (if per-block SORF) | ≈ 3,072 (same as MSE)                 |
+| Norm computation             | 128 FMA + sqrt ≈ 129                  |
 
-For d=768, k=6: MSE total ≈ 18K FLOPs, QJL matmul ≈ 98K FLOPs. The QJL
-Gaussian matmul dominates encode cost — ~5× more expensive than the
-[current][current-impl] SORF-based QJL. Acceptable for offline encoding.
+For d=768, k=6: MSE total ≈ 18K FLOPs. QJL depends on strategy: Gaussian
+matmul ≈ 197K FLOPs (~10× more than SORF QJL at ≈ 18K). The Gaussian QJL
+dominates encode cost. SORF QJL adds negligible overhead. Acceptable for
+offline encoding in both cases.
 
 ### Decode throughput
 
@@ -563,13 +609,14 @@ Gaussian matmul dominates encode cost — ~5× more expensive than the
 | -------------------------------- | ----------------------- |
 | Codebook lookup                  | 128 table reads         |
 | Inverse SORF                     | ≈ 3,072                 |
-| QJL Gaussian matmul (Sᵀ × signs) | B² = 16,384             |
+| QJL Gaussian matmul (Sᵀ × signs) | 2B² = 32,768            |
+| QJL SORF (if per-block SORF)     | ≈ 3,072                 |
 | Denormalize                      | 128 multiplies          |
 
-For d=768: MSE decode ≈ 18K FLOPs, QJL decode ≈ 98K FLOPs. QJL decode is
-significantly more expensive due to the dense matmul. For scan workloads that
-only need inner products (not full reconstruction), the fused distance
-computation path avoids full decode entirely.
+For d=768, k=6: MSE decode ≈ 18K FLOPs. QJL decode: Gaussian ≈ 197K FLOPs,
+SORF ≈ 18K FLOPs. Gaussian QJL decode is ~10× more expensive than SORF QJL.
+For scan workloads that only need inner products (not full reconstruction), the
+fused distance computation path avoids full decode entirely.
 
 ### Scan throughput (PDX, Stage 2)
 
@@ -614,7 +661,7 @@ Compare all four strategies at d=768 with B ∈ {64, 128, 256}:
   B. Quantify the quality cost of the SORF approximation at small block
   dimensions. Test at 3, 4, 5 SORF rounds.
 - **Full-dimension padded SORF QJL** (current approach): measure for comparison.
-  Higher dimension gives better SORF-to-Haar convergence (30 mixing stages at
+  Higher dimension gives better SORF-to-Haar convergence (30 butterfly stages at
   d=1024) which may compensate for the padding waste. This is the key
   comparison — does the better convergence of full-dim SORF outweigh the 25%
   wasted sign bits?
