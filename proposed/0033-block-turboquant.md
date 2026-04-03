@@ -146,7 +146,7 @@ bound itself — they are well below the 2.72/4^b bound.
 
 ### Community findings on QJL
 
-Multiple independent TurboQuant implementations have converged on a significant
+Multiple independent TurboQuant implementations have repeatedly reported a
 practical finding for **KV-cache attention**: MSE-only often outperforms MSE+QJL
 at the same bit budget. The likely mechanism is a variance-bias tradeoff: QJL
 removes bias in raw inner-product estimation but adds variance, and the softmax
@@ -223,7 +223,9 @@ quantization with the computational savings of early termination.
 ### Block size strategy
 
 For each dimension d, choose B = the greatest power-of-2 ≥ 64 that evenly
-divides d. This eliminates stragglers entirely for common embedding dimensions:
+divides d. If no such B exists (e.g., d=96), fall back to the padded
+single-block path from Stage 1. For common embedding dimensions, this rule
+always produces a valid B and eliminates padding entirely:
 
 | Dimension d | Block size B | Blocks k | Notes                        |
 | ----------- | ------------ | -------- | ---------------------------- |
@@ -242,8 +244,8 @@ divides d. This eliminates stragglers entirely for common embedding dimensions:
   No block decomposition overhead, no per-block norms. These dimensions are
   already well-served by the current design.
 - **Non-power-of-2 dimensions** (768, 1536, 3072) decompose into k=3 blocks at
-  B=256 or B=512. Zero padding waste. Each block has its own SORF rotation and
-  shares a single centroid set.
+  B=256 or B=512. No padding waste (vs. 33% for the padded single-block path).
+  Each block has its own SORF rotation and shares a single centroid set.
 - **Stragglers are eliminated** for all common embedding dimensions. Dimensions
   that are not multiples of 64 (e.g., 100, 200) would need straggler handling,
   but these are rare in practice for modern model architectures.
@@ -362,17 +364,19 @@ only with a true random orthogonal rotation or with empirical SORF validation
 (see Experimental plan).
 
 Assuming the per-block MSE bound holds, for a vector split into blocks the
-following **algebraic** identity is exact:
+first line is an **algebraic** identity (exact); the inequality on the second
+line applies Theorem 1's **probabilistic** bound to each block and should be
+read as holding in **expectation** over independent per-block rotations, not
+almost surely:
 
-```
-‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)
-                   ≤ MSE_bound × Σ_k (‖xₖ‖² / ‖x‖²) = MSE_bound
-```
-
-The inequality applies Theorem 1's **probabilistic** bound (over the random
-rotation) to each block independently. The conclusion should be read in terms
-of **expectations**: `E[‖x - x̂‖² / ‖x‖²] ≤ MSE_bound` assuming independent
-per-block rotations. Note that TurboQuant's original analysis uses a single
+````
+‖x - x̂‖² / ‖x‖² = Σ_k (‖xₖ‖² / ‖x‖²) × (‖xₖ - x̂ₖ‖² / ‖xₖ‖²)      (exact)
+    E[...]         ≤ MSE_bound × Σ_k (‖xₖ‖² / ‖x‖²) = MSE_bound          (in expectation)
+``` The conclusion: `E[‖x - x̂‖² / ‖x‖²] ≤ MSE_bound` assuming independent
+per-block rotations. (Theorem 1 applies because each block is normalized to
+unit norm before rotation and quantization; the per-block encoding pipeline is:
+split → normalize → rotate → quantize, matching the theorem's unit-sphere
+assumption.) Note that TurboQuant's original analysis uses a single
 global rotation in high-d where coordinates are nearly independent; with
 smaller block dimension B, within-block coordinate dependence after rotation may
 be stronger even when marginals are correct — this is an additional motivation
@@ -431,41 +435,47 @@ centroids[code_bₖ[j]]`.
 
 #### Encoding algorithm
 
-```
+````
+
 Input: x ∈ ℝ^d, b_mse bits per coordinate, block_size B
-k = d / B  (exact division, no straggler for chosen B)
+k = d / B (exact division, no straggler for chosen B)
 num_centroids = 2^b_mse
 
 # Block split and normalize
+
 for i in 0..k:
-    xᵢ = x[i*B .. (i+1)*B]
-    nᵢ = ‖xᵢ‖
-    if nᵢ > 0:
-        ûᵢ = xᵢ / nᵢ
-    else:
-        ûᵢ = zeros(B)
+xᵢ = x[i*B .. (i+1)*B]
+nᵢ = ‖xᵢ‖
+if nᵢ > 0:
+ûᵢ = xᵢ / nᵢ
+else:
+ûᵢ = zeros(B)
 
 # MSE stage (per block, SORF rotation)
+
 for i in 0..k:
-    if nᵢ > 0:
-        rᵢ = SORFᵢ(ûᵢ)
-        cᵢ[j] = nearest_centroid(rᵢ[j])
-    else:
-        cᵢ[j] = 0
+if nᵢ > 0:
+rᵢ = SORFᵢ(ûᵢ)
+cᵢ[j] = nearest_centroid(rᵢ[j])
+else:
+cᵢ[j] = 0
 
 Store (all as internal children):
-  codes (k × B per vector), norms (k per vector),
-  centroids (2^b_mse, shared), SORF signs (k × 3 × B, shared)
+codes (k × B per vector), norms (k per vector),
+centroids (2^b_mse, shared), SORF signs (k × 3 × B, shared)
+
 ```
 
 #### Decoding algorithm
 
 ```
+
 for i in 0..k:
-    r̂ᵢ[j] = centroids[cᵢ[j]]
-    ûᵢ = SORF⁻¹ᵢ(r̂ᵢ)
-    x̂ᵢ = nᵢ × ûᵢ                    (nᵢ read from internal norms child)
+r̂ᵢ[j] = centroids[cᵢ[j]]
+ûᵢ = SORF⁻¹ᵢ(r̂ᵢ)
+x̂ᵢ = nᵢ × ûᵢ (nᵢ read from internal norms child)
 x̃ = concat(x̂₀, ..., x̂ₖ₋₁)
+
 ```
 
 ### Stage 3: PDX dimension-major layout
@@ -493,10 +503,12 @@ PDXArray back to FSL then decodes.
 **PDXArray design:**
 
 ```
+
 PDXArray<T> (general-purpose dimension-major layout for FixedSizeList)
 ├── metadata: { list_size, chunk_size (= 64) }
-├── elements: PrimitiveArray<T>    # transposed: 64 values per dim, contiguous
-├── validity: ...                  # same as FSL validity
+├── elements: PrimitiveArray<T> # transposed: 64 values per dim, contiguous
+├── validity: ... # same as FSL validity
+
 ```
 
 - `PDXArray::try_new(fsl)` — transposes a FixedSizeListArray into PDX layout
@@ -504,8 +516,10 @@ PDXArray<T> (general-purpose dimension-major layout for FixedSizeList)
   scalar_at, or non-aligned slice/take)
 - `PDXArray::elements_for_dim(dim, chunk)` — O(1) access to a contiguous slice
   of 64 values for one dimension within one chunk
-- Slice/take: un-transpose to FSL (simplest). Preserving PDX layout is possible
-  only for 64-vector-aligned ranges.
+- Slice/take: un-transpose to FSL (simplest). Un-transpose cost is
+  O(rows × list_size) per operation; consider 64-row-aligned fast paths for
+  hot scan workloads. Preserving PDX layout is possible only for
+  64-vector-aligned ranges.
 - The cascade compressor treats PDXArray as a valid encoding of FSL-typed data.
 
 **Benefits of PDXArray as a separate type:**
@@ -520,13 +534,15 @@ PDXArray<T> (general-purpose dimension-major layout for FixedSizeList)
 Within each 64-vector chunk, codes are stored dimension-major:
 
 ```
-TQ block 0, dim 0:        [v0 v1 v2 ... v63]
-TQ block 0, dim 1:        [v0 v1 v2 ... v63]
+
+TQ block 0, dim 0: [v0 v1 v2 ... v63]
+TQ block 0, dim 1: [v0 v1 v2 ... v63]
 ...
-TQ block 0, dim (B - 1):  [v0 v1 v2 ... v63]
-TQ block 1, dim 0:        [v0 v1 v2 ... v63]
+TQ block 0, dim (B - 1): [v0 v1 v2 ... v63]
+TQ block 1, dim 0: [v0 v1 v2 ... v63]
 ...
-```
+
+````
 
 The inner SIMD loop (64 vectors) has no inter-vector dependencies. TQ block
 boundaries only affect where norm weighting occurs — they don't affect the
@@ -558,7 +574,7 @@ for tq_block in 0..k {
         unit_dots[v] = 0.0;  // reset for next TQ block
     }
 }
-```
+````
 
 **Int8 layout variant.** The PDX implementation [pdx-impl] uses a different
 tiling for int8 data: "4 dims × 16 vecs" to leverage VPDPBUSD/UDOT hardware
@@ -598,7 +614,7 @@ validated.
 | Aspect                 | MSE-only                         | MSE + QJL                                                       |
 | ---------------------- | -------------------------------- | --------------------------------------------------------------- |
 | Bit budget             | All b bits → MSE (2^b centroids) | b-1 bits MSE + 1 bit QJL (2^(b-1) centroids)                    |
-| Inner product estimate | Biased (MSE quantization noise)  | Unbiased (QJL correction, Theorem 2 [1])                        |
+| Inner product estimate | Biased (MSE quantization noise)  | Unbiased (QJL correction; see TurboQuant_prod in [1])           |
 | Additional children    | None                             | QJL signs, QJL residual norms, QJL projection params            |
 | Encode cost            | SORF only                        | SORF + QJL projection (O(B²) for Gaussian, O(B log B) for SORF) |
 | Decode cost            | Inverse SORF only                | Inverse SORF + QJL inverse projection                           |
@@ -755,7 +771,7 @@ representative of modern ANN workloads.
 | SIFT                          | 128    | 1M     | Classic          | Low-d power-of-2 baseline, well-studied recall numbers |
 | arXiv embeddings              | 768    | 2.25M  | PDX paper [4]    | Same dim as Contriever, larger scale                   |
 | DEEP                          | 96     | 10M    | Image embeddings | Large scale; d=96 has no B ≥ 64 divisor → padded path  |
-| Synthetic Gaussian            | varies | varies | Internal         | Pessimistic baseline; validates theoretical bounds     |
+| Synthetic Gaussian            | varies | varies | Internal         | Theory anchor / sanity check; not universal worst case |
 
 **Metrics** (at b_mse ∈ {2, 3, 4, 5, 8}):
 
@@ -802,7 +818,7 @@ For common model dimensions, the most promising configurations are:
 | Dimension             | Recommendation              | Rationale                                                                  |
 | --------------------- | --------------------------- | -------------------------------------------------------------------------- |
 | 512, 1024, 2048, 4096 | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
-| 768, 1536, 3072       | 3-block MSE-only + PDX      | B=256 or 512. Zero padding waste. 3 blocks, shared centroids.              |
+| 768, 1536, 3072       | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
 | Arbitrary d (rare)    | Padded single-block         | Fall back to current approach. Padding overhead bounded by B-1 dims.       |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
@@ -861,7 +877,8 @@ updated to iterate over TQ blocks, weighting by per-block norms:
 unit_dot_k / (‖a‖ · ‖b‖)` with `‖a‖ = √(Σ_k norm_a_k²)`.
 - `dot_product_quantized_column`: same per-block weighting.
 - `l2_norm`: currently returns the stored norm directly (O(1)). Must change to
-  `√(Σ_k norm_k²)` — read the norms FSL child and compute.
+  `√(Σ_k norm_k²)` — read the norms child (`PrimitiveArray` for k=1,
+  `FixedSizeListArray` for k>1) and compute.
 - Both operands must have the **same block size B**, compatible centroids (same
   `b_mse` and B-dim codebook), and **bit-identical MSE rotation parameters**
   (`mse_rotation_signs` and same SORF construction) for the quantized
@@ -959,8 +976,8 @@ March 2026. https://eviox.tech/nexus/eviox_turboquant_corrections_study.pdf
 
 - https://github.com/tonbistudio/turboquant-pytorch — MSE-only (V3) vs
   MSE+QJL (V2); reports MSE-only wins for attention and generation quality.
-- https://github.com/ggml-org/llama.cpp/discussions/21155 — Quantized
-  attention analysis; MSE vs Prod comparison for KV-cache workloads.
+- https://github.com/ggml-org/llama.cpp/discussions/20969 — TurboQuant
+  discussion; quantized attention analysis and MSE vs Prod comparison.
 - https://github.com/0xSero/turboquant — Triton kernels; paper validation.
 - https://github.com/scos-lab/turboquant — Reference reproduction; MSE vs
   Prod/QJL comparison.
