@@ -249,9 +249,9 @@ always produces a valid B and eliminates padding entirely:
 - **Non-power-of-2 dimensions** (768, 1536, 3072) decompose into k=3 blocks at
   B=256 or B=512. No padding waste (vs. 33% for the padded single-block path).
   Each block has its own SORF rotation and shares a single centroid set.
-- **Stragglers are eliminated** for all common embedding dimensions. Dimensions
-  that are not multiples of 64 (e.g., 100, 200) would need straggler handling,
-  but these are rare in practice for modern model architectures.
+- **No qualifying B is rare** for common embedding dimensions. Dimensions where
+  no power-of-2 ≥ 64 divides d (e.g., 96, 100) fall back to Stage 1's padded
+  single-block path. These are uncommon in modern model architectures.
 - **The SORF approximation at B=256+ is expected to be adequate**: 3 rounds at
   B=256 provides 24 butterfly stages, and at B=512 provides 27 — both comparable
   to the current B=1024 (30 stages). This needs empirical validation; see
@@ -635,7 +635,8 @@ If pursued, four strategies should be compared:
 | Full-dim padded SORF | Approximate           | O(d log d) total | 3×padded_d bits |
 | MSE-only (no QJL)    | N/A                   | 0                | None            |
 
-The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] is proved specifically
+The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] (same camera-ready
+numbering caveat as Theorem 1) is proved specifically
 for Gaussian. SORF for QJL is an additional approximation (the
 [current implementation][current-impl] uses SORF for QJL). Per-block QJL can
 incur up to d/B times larger variance bound than full-dimension QJL (Lemma 4
@@ -792,10 +793,11 @@ datasets measure practical quality — which may be **better** than Gaussian
 (structured data benefits more from rotation) or **worse** (if the data has
 adversarial properties for the specific rotation).
 
-### Straggler handling (if needed)
+### Dimensions with no qualifying B
 
-Rare for common dimensions. If encountered: zero-pad to B (simplest). Follow-up:
-dense rotation at actual dimension.
+Rare for common embedding dimensions (e.g., d=96). These fall back to the
+Stage 1 padded single-block path (pad to next power-of-2, single SORF). No
+block decomposition is attempted.
 
 ## Phasing
 
@@ -826,7 +828,7 @@ For common model dimensions, the most promising configurations are:
 | ---------------------- | --------------------------- | -------------------------------------------------------------------------- |
 | 512, 1024, 2048, 4096  | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
 | 768, 1536, 3072        | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
-| No qualifying B (rare) | Padded single-block         | Fall back to Stage 1 padded path. Padding overhead bounded by B-1 dims.    |
+| No qualifying B (rare) | Padded single-block         | Fall back to Stage 1: pad to next power-of-2, single SORF.                 |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
