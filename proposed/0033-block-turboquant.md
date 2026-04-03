@@ -21,7 +21,7 @@ in three stages:
 QJL correction is deferred to a later stage and may ultimately be dropped.
 Community findings from 6+ independent TurboQuant implementations consistently
 show that MSE-only outperforms MSE+QJL for attention and ANN ranking in
-practice [7].
+practice [8].
 
 [current-impl]: https://github.com/vortex-data/vortex/pull/7167
 
@@ -80,14 +80,14 @@ bound itself — they are well below the 2.72/4^b bound.
 
 ### Community findings on QJL
 
-Multiple independent TurboQuant implementations [7] have converged on a
+Multiple independent TurboQuant implementations have converged on a
 significant practical finding: **MSE-only consistently outperforms MSE+QJL for
 attention and ANN ranking**. The mechanism is a variance-bias tradeoff:
 TurboQuant's QJL correction eliminates bias but increases variance, and softmax
 attention (and cosine/L2 ranking) amplifies variance more than bias. At the same
 total bit budget, allocating all bits to MSE (more centroids, lower variance)
 beats splitting between MSE + QJL (fewer centroids + 1-bit correction). This has
-been confirmed by 6+ groups across Python, C, and Rust implementations.
+been confirmed by 6+ groups across Python, C, and Rust implementations [8].
 
 This finding strongly supports making MSE-only the default strategy for our
 columnar storage use case (ANN search, cosine similarity ranking).
@@ -98,7 +98,8 @@ The SORF requires power-of-2 input dimension. For non-power-of-2 dimensions
 (e.g., 768-d embeddings), the input is zero-padded to the next power of 2
 (1024). This causes:
 
-- **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful.
+- **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful
+  (equivalently, 25% of stored codes are wasted on zero-padded dimensions).
 - **No scan-optimized layout**: row-major code storage prevents SIMD-over-vectors
   distance computation.
 
@@ -140,18 +141,22 @@ divides d. This eliminates stragglers entirely for common embedding dimensions:
 - **Stragglers are eliminated** for all common embedding dimensions. Dimensions
   that are not multiples of 64 (e.g., 100, 200) would need straggler handling,
   but these are rare in practice for modern model architectures.
-- **The SORF approximation at B=256+ is well-tested**: 3 rounds at B=256 provides
-  24 butterfly stages, and at B=512 provides 27 — both comparable to the current
-  B=1024 (30 stages).
+- **The SORF approximation at B=256+ is expected to be adequate**: 3 rounds at
+  B=256 provides 24 butterfly stages, and at B=512 provides 27 — both comparable
+  to the current B=1024 (30 stages). This needs empirical validation; see
+  Experimental plan.
 
 ### Stage 1: MSE-only TurboQuant (immediate — split from current PR)
 
-Merge the [current MSE-only TurboQuant implementation][current-impl] as a
-standalone encoding. This provides:
+Split the [current PR][current-impl] to extract and merge the MSE-only subset
+(removing QJL encoding, QJL array slots, and QJL-specific tests). The QJL code
+can be preserved on a separate branch for Phase 4. The MSE-only encoding
+provides:
 
 - SORF-based random rotation at the padded dimension
 - Max-Lloyd scalar quantization with shared centroids
-- Per-vector norm storage (single f32 per vector)
+- Per-vector norm storage (single f32, regardless of input dtype — the
+  dtype-matching norm behavior described in Stage 2 is a later change)
 - Slice, take, scalar_at compute pushdowns
 - Quantized-domain cosine similarity and dot product
 - File format integration via the compression scheme
@@ -173,8 +178,10 @@ table above). Each full block gets an independent B-dim SORF rotation.
   in PR #7251 (closed; concept will need reimplementation).
 - **Per-block SORF rotation signs.** Each block's SORF is independent (different
   seed). Signs are 3 × B bits per block.
-- **For power-of-2 dimensions**: B = d, k = 1. The block decomposition is a
-  no-op; the encoding is identical to Stage 1 except norms may be externalized.
+- **For power-of-2 dimensions**: B = d, k = 1. The encoding is functionally
+  identical to Stage 1. The norm remains a single value per vector (not a
+  FixedSizeList with list_size=1). Norm externalization is optional for k=1 and
+  can be deferred to when it provides concrete benefit (e.g., GPU decode).
 
 #### Norm architecture
 
@@ -310,21 +317,26 @@ transpose.
 
 ```rust
 let dist_table = precompute_product_table(&centroids);
-// At b=4: 16×16 = 256 floats = 1KB, fits in L1
+// At b_mse=4: 16×16 = 256 floats = 1KB, fits in L1
+
+let mut distances = [0.0f32; 64];
+let mut unit_dots = [0.0f32; 64];
+let mut offset = 0;
 
 for tq_block in 0..k {
     for dim in 0..B {
         let qd = query_codes[tq_block * B + dim];
         let row = &dist_table[qd as usize];
-        for v in 0..64 {  // SIMD-friendly
+        for v in 0..64 {  // SIMD-friendly: no inter-vector deps
             unit_dots[v] += row[codes[offset] as usize];
             offset += 1;
         }
     }
+    // Weight per-block unit-norm dot product by both vectors' block norms
     for v in 0..64 {
         distances[v] += query_norms[tq_block] * data_norms[v][tq_block]
                         * unit_dots[v];
-        unit_dots[v] = 0.0;
+        unit_dots[v] = 0.0;  // reset for next TQ block
     }
 }
 ```
@@ -441,7 +453,7 @@ approach, despite more blocks, because each block is smaller.
 - Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim padded SORF QJL
   vs. MSE-only
 - Key metric: ANN recall@k on standard benchmarks (SIFT, GloVe)
-- Per community findings, MSE-only is expected to win [7]
+- Per community findings, MSE-only is expected to win [8]
 
 ### Straggler handling (if needed)
 
@@ -455,7 +467,10 @@ to merge MSE-only (no QJL). This is a complete encoding for all dimensions
 (with padding for non-power-of-2).
 
 **Phase 2** — Block decomposition: Add block splitting for non-power-of-2
-dimensions. Externalize norms. B = largest power-of-2 ≥ 64 dividing d.
+dimensions. Externalize norms. B = largest power-of-2 ≥ 64 dividing d. The
+`TurboQuantScheme::compress()` method must be updated to: (a) choose B based on
+d, (b) split input into blocks, (c) normalize per-block, (d) encode each block,
+and (e) store per-block norms in the parent encoding layer.
 
 **Phase 3** — PDX layout: Dimension-major code transposition within 64-vector
 chunks. Distance computation kernels.
@@ -491,10 +506,10 @@ decoded_batch = diag(norms) × R⁻¹ × codebook_lookup_batch(codes)
 
 The codebook gather + inverse rotation + norm scaling can be fused into a single
 kernel following the double-buffered streaming pattern from Flash-KMeans [6].
-For distance computation without full decode, a precomputed B²-entry distance
-table (1 KB at b=4) fits in shared memory; the kernel streams code bytes from
-HBM with gather-reduce accumulation, using 4-8× less bandwidth than full float
-vectors.
+For distance computation without full decode, a precomputed (2^b_mse)²-entry
+distance table fits in shared memory (1 KB at b_mse=4, 4 KB at b_mse=5); the
+kernel streams code bytes from HBM with gather-reduce accumulation, using
+4-8× less bandwidth than full float vectors.
 
 At b=8, codes are raw int8 indices. Direct int8 tensor core GEMM requires
 approximately linear centroids (sacrificing Max-Lloyd optimality); viable for
@@ -523,5 +538,11 @@ arXiv:2603.09229, March 2026.
 
 [7] Pathare, T. et al. "TurboQuant: Implementation Corrections, Production
 Hardening, and Deployment Infrastructure." Eviox Tech Report v1.2.0,
-March 2026. Community implementations: tonbistudio/turboquant-pytorch,
-ggml-org/llama.cpp#20969, 0xSero/turboquant, others.
+March 2026.
+
+[8] Community TurboQuant implementations and findings. Key sources:
+tonbistudio/turboquant-pytorch (PyTorch, V3 MSE-only findings),
+ggml-org/llama.cpp#20969 (C/C++, quantized attention analysis),
+0xSero/turboquant (Triton kernels), vivekvar-dl/turboquant (pip package),
+scos-lab/turboquant (reference reproduction). Consensus: MSE-only beats
+MSE+QJL for attention and ANN ranking at all tested bit widths.
