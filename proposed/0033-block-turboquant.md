@@ -63,7 +63,7 @@ differences are:
 | Quantization type      | Scalar (per-coordinate, after rotation)                         | Vector (per-sub-vector, learned codebook)                |
 | Codebook               | Analytically derived from Beta distribution; **data-oblivious** | Learned via k-means on training data; **data-dependent** |
 | Rotation               | Random orthogonal within each sub-vector                        | Typically none (OPQ [10] adds a learned rotation)        |
-| Theoretical guarantees | Provable MSE bound (Theorem 1 [1])                              | Empirical quality only                                   |
+| Theoretical guarantees | Provable data-oblivious MSE bound (Theorem 1 [1])              | No comparable data-oblivious bound                       |
 | Codebook training      | None (centroids derived from theory)                            | Requires training pass over data                         |
 | Bits per sub-vector    | Scalar: b bits per coordinate                                   | Vector: typically 8 bits per sub-vector (256 codewords)  |
 
@@ -119,8 +119,9 @@ trait for the BtrBlocks cascading compressor. It matches `Vector` and
 dimension ≥ 3 (to be raised to ≥ 128 in Stage 1; see Minimum dimension below),
 using the default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
 
-**Input handling.** All float types (f16, f32, f64) are converted to f32 before
-quantization. Per-vector L2 norms are computed and stored as f32. Non-power-of-2
+**Input handling (pre-Stage 1).** All float types (f16, f32, f64) are converted
+to f32 before quantization. Per-vector L2 norms are computed and stored as f32
+(Stage 1 changes this to dtype-matching: f64 for f64 input). Non-power-of-2
 dimensions are zero-padded to the next power of 2 for SORF compatibility. The
 minimum dimension is 3 (d=2 causes a singularity in the Beta distribution
 exponent).
@@ -143,12 +144,17 @@ spacings (we cast to f32 before quantization). See [7] for the full list.
 
 There is an ambiguity in the paper's notation for the MSE bound constant. The
 formal proof gives `(√3 · π / 2) · 4^{-b}` where the constant √3·π/2 ≈ 2.72.
-The Eviox report [7] interprets the notation as `√(3π)/2 ≈ 1.535`, but this is
-incorrect: the measured distortion values from the paper (b=2: 0.117, b=3: 0.03)
-exceed the putative `√(3π)/2` bound (b=2: 0.096, b=3: 0.024), confirming that
-2.72 is the correct constant. The paper's "explicit values" (0.36, 0.117, 0.03,
-0.009) are the actual computed distortion of the optimal quantizer, not the
-bound itself — they are well below the 2.72/4^b bound.
+The Eviox report [7] (Item 7) deliberately adopts the alternative parsing
+`√(3π)/2 ≈ 1.535`, claiming it is "consistent with the formal proof." We treat
+`√3·π/2 ≈ 2.72` as the theorem constant because: (a) the paper's prose
+describes the constant as "≈ 2.7," which matches 2.72 not 1.535; and (b) the
+paper's reported distortion values (b=2: 0.117, b=3: 0.03) exceed the 1.535-
+based bound (b=2: 0.096, b=3: 0.024), ruling out `√(3π)/2` as a valid
+**upper** bound on the measured quantity. The definitive resolution requires
+checking the exact LaTeX grouping in the ICLR 2026 camera-ready proof. The
+paper's "explicit values" (0.36, 0.117, 0.03, 0.009) are the actual computed
+distortion of the optimal quantizer, not the bound itself — they are well below
+the 2.72/4^b bound.
 
 ### Community findings on QJL
 
@@ -269,13 +275,13 @@ efficiency:
 - **SORF mixing quality:** 3-round SORF at d=64 provides only 18 butterfly
   stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
   more from the analytical Beta, making Max-Lloyd centroids less optimal.
-- **Practical MSE:** At smaller d, the Beta marginal is wider (variance ~1/d),
-  leading to higher absolute MSE at the same bit width b. The gap between
-  practical MSE and the theoretical upper bound is an empirical question at
-  each d.
+- **Practical MSE:** At smaller d, the SORF mixing quality and coordinate-
+  independence approximations are weaker, potentially worsening practical
+  quantization quality beyond what the dimension-free theoretical bound
+  captures. The actual MSE at each d is an empirical question.
 - **Overhead ratio:** Per-vector norm (32 bits) is a larger fraction of the
-  compressed representation at small d. At d=32, b=5: norm is 20% of the
-  compressed size. At d=768: <1%.
+  compressed representation at small d. At d=32, b=5: codes=160 bits,
+  norm=32 bits, total=192 — norm is ~17% of compressed size. At d=768: <1%.
 - **Diminishing returns for high bit widths:** With fewer coordinates, the
   fine-grained centroid structure of high-b quantization has less to exploit.
 
@@ -986,6 +992,12 @@ can design the metadata for forward compatibility from day one.
 ID (`vortex.turboquant`). The metadata includes `block_size` and `num_blocks`
 fields from Stage 1 onward. Stage 1 always writes `num_blocks=1`, but the field
 exists so that Stage 2 decoders can read Stage 1 files without migration.
+
+**Decoder invariant:** `block_size` is always the per-block SORF dimension B.
+`codes.list_size` = `num_blocks × block_size`. In Stage 1, `num_blocks=1` and
+`block_size = padded_dim`, so `codes.list_size = padded_dim`. In Stage 2 with
+k>1, `block_size = B` (e.g., 256) and `codes.list_size = d` (e.g., 768). The
+decoder reconstructs `k = codes.list_size / block_size`.
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
