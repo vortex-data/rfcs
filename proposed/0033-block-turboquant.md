@@ -62,7 +62,7 @@ differences are:
 | Quantization type      | Scalar (per-coordinate, after rotation)                         | Vector (per-sub-vector, learned codebook)                |
 | Codebook               | Analytically derived from Beta distribution; **data-oblivious** | Learned via k-means on training data; **data-dependent** |
 | Rotation               | Random orthogonal within each sub-vector                        | Typically none (OPQ [10] adds a learned rotation)        |
-| Theoretical guarantees | Provable data-oblivious MSE bound (Theorem 1 [1])              | No comparable data-oblivious bound                       |
+| Theoretical guarantees | Provable data-oblivious MSE bound (Theorem 1 [1])               | No comparable data-oblivious bound                       |
 | Codebook training      | None (centroids derived from theory)                            | Requires training pass over data                         |
 | Bits per sub-vector    | Scalar: b bits per coordinate                                   | Vector: typically 8 bits per sub-vector (256 codewords)  |
 
