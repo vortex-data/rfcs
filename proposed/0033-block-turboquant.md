@@ -10,8 +10,9 @@ We propose evolving the [TurboQuant vector quantization encoding][current-impl]
 in three stages:
 
 1. **MSE-only TurboQuant** (immediate): merge the current PR as an MSE-only
-   encoding for d ≥ 128 (see Minimum dimension). This is a complete,
-   self-contained building block.
+   encoding with d ≥ 128 scheme selection (see Minimum dimension; smaller d
+   available via explicit construction). This is a complete, self-contained
+   building block.
 2. **Block decomposition** (next): for dimensions where a valid B exists
    (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
    power-of-2 dimensions, B = d (single block). Dimensions with no qualifying
@@ -112,11 +113,11 @@ norms) while sharing rotation signs and centroids. Quantized cosine similarity
 and dot product operate directly on codes and centroids without decompression.
 L2 norm returns the stored norm directly (O(1) readthrough).
 
-**Compression scheme.** `TurboQuantScheme` implements the `Scheme` trait for the
-BtrBlocks cascading compressor. It matches `Vector` and `FixedShapeTensor`
-extension arrays with non-nullable float elements and dimension ≥ 3 (to be
-raised to ≥ 128 in Stage 1; see Minimum dimension below), using the
-default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
+**Compression scheme (pre-Stage 1).** `TurboQuantScheme` implements the `Scheme`
+trait for the BtrBlocks cascading compressor. It matches `Vector` and
+`FixedShapeTensor` extension arrays with non-nullable float elements and
+dimension ≥ 3 (to be raised to ≥ 128 in Stage 1; see Minimum dimension below),
+using the default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
 
 **Input handling.** All float types (f16, f32, f64) are converted to f32 before
 quantization. Per-vector L2 norms are computed and stored as f32. Non-power-of-2
@@ -796,9 +797,13 @@ minimum of 128:
 - Measure overhead ratio (norm bits / total compressed bits) at each d
 
 The scheme minimum should be set at the smallest d where TurboQuant reliably
-beats rate-matched scalar quantization on recall@k across the benchmarking
-datasets. The current proposal of 128 is conservative; experiments may justify
-lowering to 64 or raising to 256.
+beats the scalar baseline on recall@k across the benchmarking datasets. Default
+scalar baseline: per-dimension linear min-max quantization at b bits per
+coordinate plus an f32 norm (matching TurboQuant's norm overhead). Report
+results at a reference N (e.g., N=100K vectors) where shared metadata is
+amortized; optionally show sensitivity to small N where shared costs dominate.
+The current proposal of 128 is conservative; experiments may justify lowering
+to 64 or raising to 256.
 
 ### MSE quality vs. block size
 
