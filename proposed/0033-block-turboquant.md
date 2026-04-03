@@ -10,7 +10,8 @@ We propose evolving the [TurboQuant vector quantization encoding][current-impl]
 in three stages:
 
 1. **MSE-only TurboQuant** (immediate): merge the current PR as an MSE-only
-   encoding. This is a complete, self-contained building block.
+   encoding for d ≥ 128 (see Minimum dimension). This is a complete,
+   self-contained building block.
 2. **Block decomposition** (next): for dimensions where a valid B exists
    (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
    power-of-2 dimensions, B = d (single block). Dimensions with no qualifying
@@ -786,10 +787,11 @@ Test TurboQuant quality at d ∈ {32, 64, 96, 128, 256} to validate the scheme
 minimum of 128:
 
 - Compare TurboQuant MSE distortion and ANN recall@k against scalar
-  quantization at matched bit rates (e.g., linear min-max quantization at the
-  same bits-per-coordinate as TurboQuant's b_mse setting)
+  quantization matched on **total compressed bits per vector** (codes + norm +
+  amortized shared metadata), not just bits-per-coordinate — this is critical
+  at small d where norm overhead is significant
 - Plot the crossover point: at what d does TurboQuant's recall@k drop below
-  rate-matched scalar quantization?
+  the rate-matched scalar baseline?
 - Test SORF coordinate distribution quality at each d (histogram vs. Beta)
 - Measure overhead ratio (norm bits / total compressed bits) at each d
 
@@ -856,8 +858,8 @@ block decomposition is attempted.
 ## Phasing
 
 **Phase 1** — MSE-only single-block TurboQuant: Split the [current PR][current-impl]
-to merge MSE-only (no QJL). This is a complete encoding for all dimensions
-(with padding for non-power-of-2).
+to merge MSE-only (no QJL). Scheme auto-selects for d ≥ 128; smaller d available
+via explicit construction. Padding for non-power-of-2 dimensions.
 
 **Phase 2** — Block decomposition: Add block splitting for dimensions where a
 valid B exists (greatest power-of-2 ≥ 64 dividing d). Per-block norms stored as
