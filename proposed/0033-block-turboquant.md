@@ -45,13 +45,52 @@ MSE stage — O(d²) storage and O(d²) per-vector. For the QJL stage, the paper
 uses a random Gaussian projection matrix S with i.i.d. N(0,1) entries (not an
 orthogonal rotation); this distinction matters for the unbiasedness proof.
 
-Our [current implementation][current-impl] substitutes a 3-round Structured
-Orthogonal Random Features (SORF) transform `HD₃·HD₂·HD₁` [5] for both the MSE
-rotation and the QJL projection, giving O(d) storage and O(d log d) per-vector.
-The 3-round SORF construction was introduced for kernel approximation [5] and
-approximates a random orthogonal matrix. Note that this is distinct from the
-single-round SRHT (`R·H·D`) analyzed by Tropp [3] and the FJLT (`P·H·D`) of
-Ailon-Chazelle [2], both of which are dimensionality-reducing projections.
+### Current Vortex implementation
+
+Our [current implementation][current-impl] (Rust, in the `vortex-tensor` crate)
+implements TurboQuant as a Vortex array encoding that compresses
+`FixedSizeList<float>` arrays — the storage format of `Vector` and
+`FixedShapeTensor` extension types. Key design choices and characteristics:
+
+**Rotation.** Instead of the paper's O(d²) QR rotation, we use a 3-round
+Structured Orthogonal Random Features (SORF) transform `HD₃·HD₂·HD₁` [5] for
+both the MSE rotation and the QJL projection, giving O(d) storage (3d sign bits,
+bitpacked) and O(d log d) per-vector. The rotation signs are stored as a
+bitpacked child array rather than recomputed from a seed at decode time. The
+3-round SORF was introduced for kernel approximation [5] and approximates a
+random orthogonal matrix. It is distinct from the single-round SRHT (`R·H·D`)
+analyzed by Tropp [3] and the FJLT (`P·H·D`) of Ailon-Chazelle [2], both of
+which are dimensionality-reducing projections rather than rotation
+approximations.
+
+**Centroids.** Max-Lloyd centroids are computed via numerical integration
+(trapezoid rule, 1000 points per interval) of the marginal Beta distribution at
+the padded dimension, using the `HalfIntExponent` type for exact integer/half-
+integer exponent arithmetic. Centroids are cached in a global `DashMap` keyed by
+`(dimension, bit_width)` and stored as a shared `PrimitiveArray<f32>` child.
+
+**Array structure.** The `TurboQuantArray` stores up to 7 child slots: codes
+(`FixedSizeListArray<u8>`, one per vector, list_size = padded_dim), norms
+(`PrimitiveArray<f32>`), centroids (shared), MSE rotation signs (shared,
+bitpacked), and optionally 3 QJL children (signs, residual norms, QJL rotation
+signs). Codes are stored as u8 centroid indices; the cascade compressor
+(BitPacked encoding) handles packing to the actual bit width on disk.
+
+**Compute pushdowns.** Slice and take propagate to per-row children (codes,
+norms) while sharing rotation signs and centroids. Quantized cosine similarity
+and dot product operate directly on codes and centroids without decompression.
+L2 norm returns the stored norm directly (O(1) readthrough).
+
+**Compression scheme.** `TurboQuantScheme` implements the `Scheme` trait for the
+BtrBlocks cascading compressor. It matches `Vector` and `FixedShapeTensor`
+extension arrays with non-nullable float elements and dimension ≥ 3, using the
+default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
+
+**Input handling.** All float types (f16, f32, f64) are converted to f32 before
+quantization. Per-vector L2 norms are computed and stored as f32. Non-power-of-2
+dimensions are zero-padded to the next power of 2 for SORF compatibility. The
+minimum dimension is 3 (d=2 causes a singularity in the Beta distribution
+exponent).
 
 ### Reference implementation bugs
 
