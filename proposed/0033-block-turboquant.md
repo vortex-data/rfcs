@@ -113,7 +113,8 @@ L2 norm returns the stored norm directly (O(1) readthrough).
 
 **Compression scheme.** `TurboQuantScheme` implements the `Scheme` trait for the
 BtrBlocks cascading compressor. It matches `Vector` and `FixedShapeTensor`
-extension arrays with non-nullable float elements and dimension ≥ 3, using the
+extension arrays with non-nullable float elements and dimension ≥ 3 (to be
+raised to ≥ 128 in Stage 1; see Minimum dimension below), using the
 default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
 
 **Input handling.** All float types (f16, f32, f64) are converted to f32 before
@@ -257,6 +258,37 @@ always produces a valid B and eliminates padding entirely:
   to the current B=1024 (30 stages). This needs empirical validation; see
   Experimental plan.
 
+### Minimum dimension
+
+The compression scheme should only select TurboQuant for vectors with
+dimension ≥ 128. Below this threshold, several factors degrade quality and
+efficiency:
+
+- **SORF mixing quality:** 3-round SORF at d=64 provides only 18 butterfly
+  stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
+  more from the analytical Beta, making Max-Lloyd centroids less optimal.
+- **Practical MSE:** At smaller d, the Beta marginal is wider (variance ~1/d),
+  so the Max-Lloyd quantizer achieves distortion closer to the theoretical
+  bound — worse in absolute terms than at higher d.
+- **Overhead ratio:** Per-vector norm (32 bits) is a larger fraction of the
+  compressed representation at small d. At d=32, b=5: norm is 20% of the
+  compressed size. At d=768: <1%.
+- **Diminishing returns for high bit widths:** With fewer coordinates, the
+  fine-grained centroid structure of high-b quantization has less to exploit.
+
+The threshold of 128 is conservative:
+
+- d=128 (SIFT) is the smallest common embedding dimension.
+- SORF at d=128 has 21 butterfly stages — tested and adequate in the current
+  implementation.
+- The block-size rule produces B=128 for d=128 (single block, no decomposition).
+
+The array-level minimum remains d=3 (for the Beta distribution to be
+well-defined), so users can still explicitly construct a TurboQuantArray at
+smaller dimensions. The scheme minimum (128) controls automatic selection only.
+
+The exact threshold should be validated experimentally — see Experimental plan.
+
 ### Stage 1: MSE-only TurboQuant (immediate — split from current PR)
 
 Split the [current PR][current-impl] to extract and merge the MSE-only subset.
@@ -271,10 +303,11 @@ The QJL code can be preserved on a separate branch for Phase 4.
 | Scheme default | 5-bit QJL (4-bit MSE + 1-bit QJL)           | **5-bit MSE-only** (32 centroids)                     |
 | Norms dtype    | Always f32                                  | **Same-or-wider**: f64 for f64 input, f32 for f32/f16 |
 | Metadata       | `has_qjl: bool`                             | **Removed** (always MSE-only)                         |
+| Scheme minimum | dimension ≥ 3                               | **dimension ≥ 128** (see Minimum dimension below)     |
 
 **Unchanged from current PR:** SORF rotation, Max-Lloyd centroids,
 zero-padding for non-power-of-2, slice/take/scalar_at pushdowns, quantized
-cosine similarity and dot product, compression scheme integration, minimum dim=3.
+cosine similarity and dot product, compression scheme integration.
 
 **Added to metadata (for forward compat):** `block_size: u32` (always =
 padded_dim), `num_blocks: u32` (always = 1). These fields are inert in Stage 1
@@ -743,6 +776,21 @@ approach, despite more blocks, because each block is smaller.
 4. PDX scan throughput vs. row-major (Stage 3)
 
 ## Experimental plan
+
+### Minimum dimension threshold
+
+Test TurboQuant quality at d ∈ {32, 64, 96, 128, 256} to validate the scheme
+minimum of 128:
+
+- Compare TurboQuant MSE distortion and ANN recall@k against scalar
+  quantization (SQ8, linear min-max to uint8) at the same compressed bit budget
+- Plot the crossover point: at what d does TurboQuant's recall@k drop below SQ8?
+- Test SORF coordinate distribution quality at each d (histogram vs. Beta)
+- Measure overhead ratio (norm bits / total compressed bits) at each d
+
+The scheme minimum should be set at the smallest d where TurboQuant reliably
+beats SQ8 on recall@k across the benchmarking datasets. The current proposal
+of 128 is conservative; experiments may justify lowering to 64 or raising to 256.
 
 ### MSE quality vs. block size
 
