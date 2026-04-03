@@ -268,8 +268,9 @@ efficiency:
   stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
   more from the analytical Beta, making Max-Lloyd centroids less optimal.
 - **Practical MSE:** At smaller d, the Beta marginal is wider (variance ~1/d),
-  so the Max-Lloyd quantizer achieves distortion closer to the theoretical
-  bound — worse in absolute terms than at higher d.
+  leading to higher absolute MSE at the same bit width b. The gap between
+  practical MSE and the theoretical upper bound is an empirical question at
+  each d.
 - **Overhead ratio:** Per-vector norm (32 bits) is a larger fraction of the
   compressed representation at small d. At d=32, b=5: norm is 20% of the
   compressed size. At d=768: <1%.
@@ -278,7 +279,7 @@ efficiency:
 
 The threshold of 128 is conservative:
 
-- d=128 (SIFT) is the smallest common embedding dimension.
+- d=128 (SIFT) is the smallest dimension in our recommended benchmark table.
 - SORF at d=128 has 21 butterfly stages — tested and adequate in the current
   implementation.
 - The block-size rule produces B=128 for d=128 (single block, no decomposition).
@@ -314,7 +315,9 @@ padded_dim), `num_blocks: u32` (always = 1). These fields are inert in Stage 1
 but enable Stage 2 decoders to read Stage 1 files. (PDX is handled via the
 codes child type, not a metadata flag — see Stage 3.)
 
-This is a complete, useful encoding for all dimensions. Power-of-2 dimensions
+This is a complete, useful encoding for all dimensions ≥ 3 (automatic scheme
+selection applies only for d ≥ 128; smaller d remains available via explicit
+array construction). Power-of-2 dimensions
 have zero padding waste; non-power-of-2 dimensions have the padding overhead
 described above.
 
@@ -783,14 +786,17 @@ Test TurboQuant quality at d ∈ {32, 64, 96, 128, 256} to validate the scheme
 minimum of 128:
 
 - Compare TurboQuant MSE distortion and ANN recall@k against scalar
-  quantization (SQ8, linear min-max to uint8) at the same compressed bit budget
-- Plot the crossover point: at what d does TurboQuant's recall@k drop below SQ8?
+  quantization at matched bit rates (e.g., linear min-max quantization at the
+  same bits-per-coordinate as TurboQuant's b_mse setting)
+- Plot the crossover point: at what d does TurboQuant's recall@k drop below
+  rate-matched scalar quantization?
 - Test SORF coordinate distribution quality at each d (histogram vs. Beta)
 - Measure overhead ratio (norm bits / total compressed bits) at each d
 
 The scheme minimum should be set at the smallest d where TurboQuant reliably
-beats SQ8 on recall@k across the benchmarking datasets. The current proposal
-of 128 is conservative; experiments may justify lowering to 64 or raising to 256.
+beats rate-matched scalar quantization on recall@k across the benchmarking
+datasets. The current proposal of 128 is conservative; experiments may justify
+lowering to 64 or raising to 256.
 
 ### MSE quality vs. block size
 
@@ -820,14 +826,14 @@ representative of modern ANN workloads.
 
 **Recommended datasets:**
 
-| Dataset                       | Dim    | Size   | Source           | Why                                                    |
-| ----------------------------- | ------ | ------ | ---------------- | ------------------------------------------------------ |
-| Contriever                    | 768    | ~1M    | PDX paper [4]    | Key non-power-of-2 target; real embeddings             |
-| OpenAI text-embedding-3-large | 1536   | ~1M    | Common in RAG    | High-d production embeddings                           |
-| SIFT                          | 128    | 1M     | Classic          | Low-d power-of-2 baseline, well-studied recall numbers |
-| arXiv embeddings              | 768    | 2.25M  | PDX paper [4]    | Same dim as Contriever, larger scale                   |
-| DEEP                          | 96     | 10M    | Image embeddings | Large scale; d=96 has no B ≥ 64 divisor → padded path  |
-| Synthetic Gaussian            | varies | varies | Internal         | Theory anchor / sanity check; not universal worst case |
+| Dataset                       | Dim    | Size   | Source           | Why                                                                                                                                       |
+| ----------------------------- | ------ | ------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Contriever                    | 768    | ~1M    | PDX paper [4]    | Key non-power-of-2 target; real embeddings                                                                                                |
+| OpenAI text-embedding-3-large | 1536   | ~1M    | Common in RAG    | High-d production embeddings                                                                                                              |
+| SIFT                          | 128    | 1M     | Classic          | Low-d power-of-2 baseline, well-studied recall numbers                                                                                    |
+| arXiv embeddings              | 768    | 2.25M  | PDX paper [4]    | Same dim as Contriever, larger scale                                                                                                      |
+| DEEP                          | 96     | 10M    | Image embeddings | Large scale; d=96 < scheme min (128) and has no B ≥ 64 — requires explicit TurboQuantArray construction or benchmark-only scheme override |
+| Synthetic Gaussian            | varies | varies | Internal         | Theory anchor / sanity check; not universal worst case                                                                                    |
 
 **Metrics** (at b_mse ∈ {2, 3, 4, 5, 8}):
 
