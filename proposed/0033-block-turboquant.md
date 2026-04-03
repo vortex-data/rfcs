@@ -15,8 +15,8 @@ in three stages:
    blocks of size B = the largest power-of-2 ≥ 64 that divides d. For
    power-of-2 dimensions, B = d (single block, same as current). Per-block
    norms stored as internal children.
-3. **PDX layout** (later): within each block, transpose codes into groups of
-   64 vectors for SIMD scan performance.
+3. **PDX layout** (later): transpose codes into dimension-major order within
+   groups of 64 vectors for SIMD scan performance.
 
 QJL correction is deferred to a later stage and may ultimately be dropped.
 Community findings from 6+ independent TurboQuant implementations consistently
@@ -40,10 +40,31 @@ embeddings. It works by:
 3. Optionally adding a 1-bit QJL (Quantized Johnson-Lindenstrauss) correction
    on the residual for unbiased inner product estimation (Theorem 2 in [1]).
 
-The paper prescribes a full random orthogonal rotation (QR of Gaussian) for the
-MSE stage — O(d²) storage and O(d²) per-vector. For the QJL stage, the paper
-uses a random Gaussian projection matrix S with i.i.d. N(0,1) entries (not an
-orthogonal rotation); this distinction matters for the unbiasedness proof.
+The paper prescribes a full random orthogonal rotation (QR decomposition of a
+matrix with i.i.d. N(0,1) entries, yielding a Haar-uniform orthogonal matrix)
+for the MSE stage — O(d²) storage and O(d²) per-vector. For the QJL stage, the
+paper uses a random Gaussian projection matrix S with i.i.d. N(0,1) entries (not
+an orthogonal rotation); this distinction matters for the unbiasedness proof.
+
+**Comparison to Product Quantization.** TurboQuant's block decomposition (Stage
+2 of this RFC) is structurally similar to Product Quantization (PQ) [9]: both
+partition a vector into sub-vectors and quantize each independently. The key
+differences are:
+
+|                        | TurboQuant                                                      | PQ                                                       |
+| ---------------------- | --------------------------------------------------------------- | -------------------------------------------------------- |
+| Quantization type      | Scalar (per-coordinate, after rotation)                         | Vector (per-sub-vector, learned codebook)                |
+| Codebook               | Analytically derived from Beta distribution; **data-oblivious** | Learned via k-means on training data; **data-dependent** |
+| Rotation               | Random orthogonal within each sub-vector                        | Typically none (OPQ [10] adds a learned rotation)        |
+| Theoretical guarantees | Provable MSE bound (Theorem 1 [1])                              | Empirical quality only                                   |
+| Indexing time          | Zero (codebook precomputed from distribution)                   | Requires training pass over data                         |
+| Bits per sub-vector    | Scalar: b bits per coordinate                                   | Vector: typically 8 bits per sub-vector (256 codewords)  |
+
+TurboQuant trades PQ's flexibility (data-dependent codebooks can exploit
+structure) for data-obliviousness (no training, provable bounds, zero indexing
+time). For uniformly distributed embeddings, TurboQuant's analytically optimal
+centroids should match or exceed PQ's learned codebooks. For highly structured
+data, PQ may still win empirically.
 
 ### Current Vortex implementation
 
@@ -240,9 +261,9 @@ zero-padding for non-power-of-2, slice/take/scalar_at pushdowns, quantized
 cosine similarity and dot product, compression scheme integration, minimum dim=3.
 
 **Added to metadata (for forward compat):** `block_size: u32` (always =
-padded_dim), `num_blocks: u32` (always = 1), `is_pdx: bool` (always = false).
-These fields are inert in Stage 1 but enable Stage 2/3 decoders to read
-Stage 1 files.
+padded_dim), `num_blocks: u32` (always = 1). These fields are inert in Stage 1
+but enable Stage 2 decoders to read Stage 1 files. (PDX is handled via the
+codes child type, not a metadata flag — see Stage 3.)
 
 This is a complete, useful encoding for all dimensions. Power-of-2 dimensions
 have zero padding waste; non-power-of-2 dimensions have the padding overhead
@@ -363,9 +384,9 @@ SORF) are suitable.
 random orthogonal rotation to make coordinates independent. If we integrate
 ADSampling-style dimension pruning (see Stage 3), the same rotation could serve
 both purposes: producing the Beta distribution for quantization AND enabling
-hypothesis-testing for early pruning. This would avoid rotating the data twice
-and is a natural future optimization when combining block-TurboQuant with
-PDX-style scans.
+hypothesis-testing for early pruning. This would avoid rotating the data twice.
+Note that the query must also be rotated at query time with the same rotation
+matrix (stored as a shared child); ADSampling already requires this.
 
 #### Quantized-domain operations
 
@@ -421,23 +442,52 @@ x̃ = concat(x̂₀, ..., x̂ₖ₋₁)
 
 ### Stage 3: PDX dimension-major layout
 
-Transpose code storage from row-major to dimension-major within groups of 64
-vectors [4]. The 64-vector group size is independent of B.
+Introduce a new `PDXArray` encoding type that wraps any `FixedSizeListArray`
+with a dimension-major layout within groups of 64 vectors [4]. PDXArray is
+**not TurboQuant-specific** — it is a general-purpose layout optimization for
+any FixedSizeList of scalar elements (raw float vectors, scalar-quantized
+vectors, TurboQuant codes, etc.).
 
 **Changes vs. Stage 2:**
 
-| Aspect                 | Stage 2                                          | Stage 3                                                           |
-| ---------------------- | ------------------------------------------------ | ----------------------------------------------------------------- |
-| Codes layout           | Row-major (all codes for one vector contiguous)  | **Dimension-major within 64-vector chunks**                       |
-| Metadata               | `is_pdx = false`                                 | **`is_pdx = true`**                                               |
-| Distance kernel        | Per-vector loop with per-element centroid lookup | **SIMD-friendly 64-vector inner loop with distance-table lookup** |
-| Decode path            | Direct inverse SORF per vector                   | **Un-transpose 64-vector chunk first**, then inverse SORF         |
-| QJL signs (if present) | Row-major                                        | **Also transposed** (same PDX layout as codes)                    |
+| Aspect           | Stage 2                                          | Stage 3                                                           |
+| ---------------- | ------------------------------------------------ | ----------------------------------------------------------------- |
+| Codes child type | `FixedSizeListArray<u8>`                         | **`PDXArray<u8>`** (wraps FSL with transposed layout)             |
+| TQ metadata      | `is_pdx` field                                   | **Removed** — TQ checks if codes child is PDXArray                |
+| Distance kernel  | Per-vector loop with per-element centroid lookup | **SIMD-friendly 64-vector inner loop with distance-table lookup** |
+| Decode path      | Direct inverse SORF per vector                   | **PDXArray.to_fsl() first**, then inverse SORF                    |
 
 **Unchanged from Stage 2:** Block size B, centroid computation, norm storage,
-SORF rotation, all encoding logic (PDX transpose is applied after encoding).
-The encode path produces row-major codes then transposes; the decode path
-un-transposes then decodes.
+SORF rotation, all encoding logic. The encode path produces row-major codes
+(FSL), then the compressor wraps them in a PDXArray; the decode path converts
+PDXArray back to FSL then decodes.
+
+**PDXArray design:**
+
+```
+PDXArray<T> (general-purpose dimension-major layout for FixedSizeList)
+├── metadata: { list_size, chunk_size (= 64) }
+├── elements: PrimitiveArray<T>    # transposed: 64 values per dim, contiguous
+├── validity: ...                  # same as FSL validity
+```
+
+- `PDXArray::try_new(fsl)` — transposes a FixedSizeListArray into PDX layout
+- `PDXArray::to_fsl()` — un-transposes back to row-major FSL (for decode,
+  scalar_at, or non-aligned slice/take)
+- `PDXArray::elements_for_dim(dim, chunk)` — O(1) access to a contiguous slice
+  of 64 values for one dimension within one chunk
+- Slice/take: un-transpose to FSL (simplest). Preserving PDX layout is possible
+  only for 64-vector-aligned ranges.
+- The cascade compressor treats PDXArray as a valid encoding of FSL-typed data.
+
+**Benefits of PDXArray as a separate type:**
+
+- PDX logic tested and maintained independently of TurboQuant
+- Other encodings (raw float vectors, scalar quantization, future encodings)
+  get PDX scan performance for free
+- TurboQuant doesn't need an `is_pdx` metadata flag — it checks its codes
+  child's type at runtime
+- The distance kernel operates on PDXArray's dimension-contiguous slices
 
 Within each 64-vector chunk, codes are stored dimension-major:
 
@@ -484,12 +534,15 @@ for tq_block in 0..k {
 
 **Int8 layout variant.** The PDX implementation [pdx-impl] uses a different
 tiling for int8 data: "4 dims × 16 vecs" to leverage VPDPBUSD/UDOT hardware
-dot-product instructions. For TurboQuant codes at b_mse ≤ 8, codes are u8
-centroid indices (not linear values), so VPDPBUSD doesn't apply directly — we
-need the distance-table-lookup path shown above. However, if we support a linear
-quantization mode (b_mse=8 with uniform centroids), the "4 dims × 16 vecs"
-layout could enable direct hardware dot-product on the codes, bypassing the
-lookup table entirely. This is a potential Stage 3 optimization to evaluate.
+dot-product instructions (which process 4 unsigned×signed byte pairs per
+operation). For TurboQuant codes at b_mse ≤ 8, codes are uint8 centroid indices,
+so VPDPBUSD doesn't apply directly — we need the distance-table-lookup path
+shown above. However, at b_mse=8 with high B, the Max-Lloyd centroids are
+near-uniformly spaced (see GPU section), potentially enabling direct hardware
+dot-product on the codes. Whether this requires a separate linear quantization
+mode or works with the existing Max-Lloyd centroids is an empirical question. The
+"4 dims × 16 vecs" layout would be a Stage 3 optimization to evaluate alongside
+the "1 dim × 64 vecs" float-style layout.
 
 **ADSampling integration.** The PDX dimension-pruning approach (ADSampling [4])
 is complementary to TurboQuant's block structure. During a scan, the pruner
@@ -500,12 +553,12 @@ boundaries (as shown in the kernel above), which our design already provides.
 
 **Open design questions:**
 
-- Slice/take on PDX-transposed codes: produce row-major (simpler) or preserve
-  PDX (aligned 64-vector slices only)?
-- Is PDX a property of the encoding or a separate layout layer?
-- How does the compressor see the transposed codes?
-- Should we support the "4 dims × 16 vecs" int8 layout variant alongside the
-  "1 dim × 64 vecs" float-style layout?
+- Should PDXArray live in `vortex-array` (general infrastructure) or
+  `vortex-tensor` (vector-specific)?
+- Should the cascade compressor automatically PDX-transpose FSL children when
+  it detects a scan-heavy workload, or should PDX be opt-in?
+- Should we support the "4 dims × 16 vecs" uint8 layout variant (for hardware
+  dot-product) alongside the "1 dim × 64 vecs" float-style layout?
 
 ### QJL correction (deferred — experimental)
 
@@ -546,10 +599,11 @@ bit widths, so QJL may not be worth the complexity.
 ```
 TurboQuantArray
 ├── metadata: { dimension, b_mse, block_size (= padded_dim),
-│               num_blocks (= 1), is_pdx (= false) }
+│               num_blocks (= 1) }
 │
 │  # Per-row children
 ├── codes: FixedSizeListArray<u8>           # list_size = padded_dim
+│          (or PDXArray<u8> after Stage 3)
 ├── norms: PrimitiveArray<F>               # len = num_rows (F = f64 for f64, f32 otherwise)
 │
 │  # Shared children
@@ -558,16 +612,19 @@ TurboQuantArray
 ```
 
 Same structure as the [current PR][current-impl] minus the 3 QJL slots, plus
-the forward-compatible metadata fields and dtype-matching norms.
+the forward-compatible metadata fields and dtype-matching norms. The codes child
+is `FixedSizeListArray` in Stages 1-2 and may be swapped to `PDXArray` in Stage
+3 — TurboQuant checks the child type at runtime, not via a metadata flag.
 
 ### Stage 2 (block decomposition)
 
 ```
 TurboQuantArray (self-contained, handles blocks internally)
-├── metadata: { dimension, b_mse, block_size, num_blocks, is_pdx }
+├── metadata: { dimension, b_mse, block_size, num_blocks }
 │
 │  # Per-row children (sliced/taken on row operations)
 ├── codes: FixedSizeListArray<u8>           # list_size = k × B
+│          (or PDXArray<u8> after Stage 3)
 ├── norms: PrimitiveArray<F>                # len = num_rows (k=1)
 │      or  FixedSizeListArray<F>            # list_size = k (k>1)
 │
@@ -578,7 +635,8 @@ TurboQuantArray (self-contained, handles blocks internally)
 
 ## Compression ratio
 
-For f32 input, b_mse bits MSE, k = d/B blocks, N vectors:
+For f32 input, b_mse bits MSE, k = d/B blocks, N vectors (for f64 input,
+replace 32 with 64 in the norms row — ratios decrease accordingly):
 
 | Component   | Bits per vector |
 | ----------- | --------------- |
@@ -605,7 +663,9 @@ improvement. For d=1024 the encoding is identical to current.
 
 ### Encode/decode throughput
 
-SORF at B dimensions: 3 × B × log₂(B) + 3 × B FLOPs per block. For k blocks:
+SORF at B dimensions: 3 × B × log₂(B) butterflies + 3 × B sign applications
+per block (plus B normalization multiplies, omitted for simplicity). For k
+blocks:
 
 | B              | SORF FLOPs/block          | k (d=768) | Total MSE FLOPs |
 | -------------- | ------------------------- | --------- | --------------- |
@@ -637,8 +697,40 @@ approach, despite more blocks, because each block is smaller.
 
 - Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim padded SORF QJL
   vs. MSE-only
-- Key metric: ANN recall@k on standard benchmarks (SIFT, GloVe)
+- Key metric: ANN recall@k on the datasets above (Contriever, OpenAI, SIFT)
 - Per community findings, MSE-only is expected to win [8]
+
+### Benchmarking datasets
+
+The current test suite uses i.i.d. Gaussian vectors, which is a pessimistic
+baseline for TurboQuant: real embeddings have structure (clusters, anisotropy)
+that rotation-based quantization can exploit, while Gaussian vectors are already
+rotationally invariant (the rotation is a no-op in distribution). Recent work
+(VIBE [11]) argues that traditional benchmarks (SIFT, GloVe) are no longer
+representative of modern ANN workloads.
+
+**Recommended datasets:**
+
+| Dataset                       | Dim    | Size   | Source           | Why                                                    |
+| ----------------------------- | ------ | ------ | ---------------- | ------------------------------------------------------ |
+| Contriever                    | 768    | ~1M    | PDX paper [4]    | Key non-power-of-2 target; real embeddings             |
+| OpenAI text-embedding-3-large | 1536   | ~1M    | Common in RAG    | High-d production embeddings                           |
+| SIFT                          | 128    | 1M     | Classic          | Low-d power-of-2 baseline, well-studied recall numbers |
+| arXiv embeddings              | 768    | 2.25M  | PDX paper [4]    | Same dim as Contriever, larger scale                   |
+| DEEP                          | 96     | 10M    | Image embeddings | Large scale                                            |
+| Synthetic Gaussian            | varies | varies | Internal         | Pessimistic baseline; validates theoretical bounds     |
+
+**Metrics** (at b_mse ∈ {2, 3, 4, 5, 8}):
+
+- Recall@10, Recall@100 (ANN ranking quality)
+- Normalized MSE distortion (reconstruction quality)
+- Inner product mean signed relative error (bias measurement)
+- Encode/decode throughput (vectors/sec)
+
+The Gaussian baseline validates that theoretical bounds hold. The real-embedding
+datasets measure practical quality — which may be **better** than Gaussian
+(structured data benefits more from rotation) or **worse** (if the data has
+adversarial properties for the specific rotation).
 
 ### Straggler handling (if needed)
 
@@ -657,8 +749,10 @@ internal children. The `TurboQuantScheme::compress()` method must be updated to:
 (a) choose B based on d, (b) split input into blocks, (c) normalize per-block,
 (d) encode each block, and (e) store per-block norms as an internal child array.
 
-**Phase 3** — PDX layout: Dimension-major code transposition within 64-vector
-chunks. Distance computation kernels.
+**Phase 3** — PDXArray + scan kernels: Introduce `PDXArray` as a general-purpose
+dimension-major layout for `FixedSizeListArray`. TurboQuant's codes child is
+swapped from FSL to PDXArray by the compressor. Distance computation kernels
+operate on PDXArray's dimension-contiguous slices.
 
 **Phase 4** (experimental) — QJL: If the experimental plan shows QJL improves
 recall@k beyond MSE-only, add per-block Gaussian or SORF QJL. Based on
@@ -696,9 +790,60 @@ distance table fits in shared memory (1 KB at b_mse=4, 4 KB at b_mse=5); the
 kernel streams code bytes from HBM with gather-reduce accumulation, using
 4-8× less bandwidth than full float vectors.
 
-At b=8, codes are raw int8 indices. Direct int8 tensor core GEMM requires
-approximately linear centroids (sacrificing Max-Lloyd optimality); viable for
-ANN ranking but not reconstruction.
+At b_mse=8, codes are uint8 indices (0-255). Direct int8 tensor core GEMM
+(using codes as the unsigned operand in VPDPBUSD) requires approximately linear
+centroids — but at high B the Max-Lloyd centroids are already near-uniform
+(the Beta distribution is highly concentrated, approaching Gaussian, for which
+high-resolution optimal quantization is approximately uniform). Whether the
+existing Max-Lloyd centroids are "linear enough" for hardware dot-product
+instructions is an empirical question worth testing before introducing a
+separate linear quantization mode.
+
+## Integration with Vortex scan engine
+
+TurboQuant's quantized-domain operations must integrate with Vortex's expression
+evaluation and scan pushdown infrastructure. The current implementation provides
+this via `ScalarFnVTable` implementations in `vortex-tensor`.
+
+**Current integration path.** The `CosineSimilarity`, `DotProduct`, and `L2Norm`
+scalar functions check whether their input storage arrays are TurboQuant-encoded
+(via `TurboQuant::try_match()`). If both operands are TurboQuant and the
+`ApproxOptions::Approximate` flag is set, the scalar function dispatches to the
+quantized-domain kernel (e.g., `cosine_similarity_quantized_column`), bypassing
+full decompression. Otherwise, it falls back to the exact path (decompress →
+compute on floats).
+
+**Stage 2 changes.** With block decomposition, the quantized kernels must be
+updated to iterate over TQ blocks, weighting by per-block norms:
+
+- `cosine_similarity_quantized_column`: currently computes a single unit-norm
+  dot product per row pair. Must change to `Σ_k norm_a_k · norm_b_k ·
+unit_dot_k / (‖a‖ · ‖b‖)` with `‖a‖ = √(Σ_k norm_a_k²)`.
+- `dot_product_quantized_column`: same per-block weighting.
+- `l2_norm`: currently returns the stored norm directly (O(1)). Must change to
+  `√(Σ_k norm_k²)` — read the norms FSL child and compute.
+- Both operands must have the **same block size B** and compatible centroids for
+  the quantized path to apply. If block sizes differ, fall back to exact.
+
+**Stage 3 changes.** The PDX distance kernel (shown in Stage 3 pseudocode) is a
+new execution path that operates on `PDXArray`-typed codes. It should be exposed
+as an alternative `ScalarFnVTable` implementation that activates when the codes
+child is a `PDXArray` and the scan is over a contiguous 64-vector-aligned range.
+For non-aligned ranges or single-vector access (`scalar_at`), the PDXArray is
+converted to FSL first via `PDXArray::to_fsl()`.
+
+**Expression tree integration.** The typical ANN scan expression is:
+
+```
+top_k(cosine_similarity(column, constant_query), k=10)
+```
+
+The `constant_query` is broadcast to match the column length. The
+`CosineSimilarity` scalar function receives both the column (TurboQuant-encoded)
+and the query (ConstantArray wrapping a single vector). For the quantized path,
+the query is first encoded with the column's rotation and centroids to produce
+query codes and query block norms, then the PDX kernel runs over the column's
+codes without decompressing them.
 
 ## Migration and compatibility
 
@@ -706,10 +851,9 @@ TurboQuant has not shipped yet, so there are no existing files to migrate. We
 can design the metadata for forward compatibility from day one.
 
 **Strategy: single array ID, versioned metadata.** All stages use the same array
-ID (`vortex.turboquant`). The metadata includes `block_size`, `num_blocks`, and
-`is_pdx` fields from Stage 1 onward. Stage 1 always writes `num_blocks=1,
-is_pdx=false`, but the fields exist so that Stage 2 and 3 decoders can read
-Stage 1 files without migration.
+ID (`vortex.turboquant`). The metadata includes `block_size` and `num_blocks`
+fields from Stage 1 onward. Stage 1 always writes `num_blocks=1`, but the field
+exists so that Stage 2 decoders can read Stage 1 files without migration.
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
@@ -723,18 +867,20 @@ The decoder distinguishes k=1 from k>1 by reading `num_blocks` from metadata.
 A k=1 decoder is backward-compatible with Stage 1 files. A k>1 decoder is a new
 code path that only applies to files written by Stage 2+.
 
-**Stage 3 (PDX) is additive.** The `is_pdx` flag in metadata tells the decoder
-whether codes are row-major or dimension-major. Stage 1/2 files have
-`is_pdx=false`; Stage 3 files have `is_pdx=true`. The decoder un-transposes
-PDX files on read if needed. No migration required.
+**Stage 3 (PDXArray) is additive.** PDX is not a TurboQuant metadata flag — it's
+a separate array type (`PDXArray`) that wraps the codes child. Stage 1/2 files
+have `FixedSizeListArray` codes; Stage 3 files have `PDXArray` codes. The
+TurboQuant decoder checks the child type and un-transposes PDXArray on decode if
+needed. `PDXArray` itself is registered as a new encoding, independent of
+TurboQuant.
 
 **Incremental shipping:**
 
-| Stage        | Ships to users?  | Reads Stage 1 files?   | Notes                               |
-| ------------ | ---------------- | ---------------------- | ----------------------------------- |
-| 1 (MSE-only) | Yes, immediately | N/A (first version)    | New encoding, no backcompat concern |
-| 2 (blocks)   | Yes              | Yes (k=1 is identical) | k>1 files need Stage 2+ decoder     |
-| 3 (PDX)      | Yes              | Yes (is_pdx=false)     | PDX files need Stage 3 decoder      |
+| Stage        | Ships to users?  | Reads Stage 1 files?       | Notes                               |
+| ------------ | ---------------- | -------------------------- | ----------------------------------- |
+| 1 (MSE-only) | Yes, immediately | N/A (first version)        | New encoding, no backcompat concern |
+| 2 (blocks)   | Yes              | Yes (k=1 is identical)     | k>1 files need Stage 2+ decoder     |
+| 3 (PDX)      | Yes              | Yes (FSL codes still work) | PDX codes need PDXArray registered  |
 
 Each stage is independently shippable. Users can upgrade incrementally. Files
 written by earlier stages are always readable by later decoders.
@@ -770,3 +916,12 @@ ggml-org/llama.cpp#20969 (C/C++, quantized attention analysis),
 0xSero/turboquant (Triton kernels), vivekvar-dl/turboquant (pip package),
 scos-lab/turboquant (reference reproduction). Consensus: MSE-only beats
 MSE+QJL for attention and ANN ranking at all tested bit widths.
+
+[9] Jégou, H., Douze, M. and Schmid, C. "Product Quantization for Nearest
+Neighbor Search." IEEE Trans. PAMI 33(1):117-128, 2011.
+
+[10] Ge, T., He, K., Ke, Q. and Sun, J. "Optimized Product Quantization."
+IEEE Trans. PAMI 36(4):744-755, 2014.
+
+[11] Kuffo, L. et al. "VIBE: Vector Index Benchmark for Embeddings."
+arXiv:2505.17810, May 2025.
