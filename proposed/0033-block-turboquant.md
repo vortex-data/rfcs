@@ -450,12 +450,12 @@ vectors, TurboQuant codes, etc.).
 
 **Changes vs. Stage 2:**
 
-| Aspect           | Stage 2                                          | Stage 3                                                           |
-| ---------------- | ------------------------------------------------ | ----------------------------------------------------------------- |
-| Codes child type | `FixedSizeListArray<u8>`                         | **`PDXArray<u8>`** (wraps FSL with transposed layout)             |
-| TQ metadata      | `is_pdx` field                                   | **Removed** — TQ checks if codes child is PDXArray                |
-| Distance kernel  | Per-vector loop with per-element centroid lookup | **SIMD-friendly 64-vector inner loop with distance-table lookup** |
-| Decode path      | Direct inverse SORF per vector                   | **PDXArray.to_fsl() first**, then inverse SORF                    |
+| Aspect           | Stage 2                                          | Stage 3                                                                         |
+| ---------------- | ------------------------------------------------ | ------------------------------------------------------------------------------- |
+| Codes child type | `FixedSizeListArray<u8>`                         | **`PDXArray<u8>`** (wraps FSL with transposed layout)                           |
+| Codes detection  | N/A (codes always FSL)                           | **TQ checks child type**: FSL → row-major decode, PDXArray → un-transpose first |
+| Distance kernel  | Per-vector loop with per-element centroid lookup | **SIMD-friendly 64-vector inner loop with distance-table lookup**               |
+| Decode path      | Direct inverse SORF per vector                   | **PDXArray.to_fsl() first**, then inverse SORF                                  |
 
 **Unchanged from Stage 2:** Block size B, centroid computation, norm storage,
 SORF rotation, all encoding logic. The encode path produces row-major codes
@@ -717,7 +717,7 @@ representative of modern ANN workloads.
 | OpenAI text-embedding-3-large | 1536   | ~1M    | Common in RAG    | High-d production embeddings                           |
 | SIFT                          | 128    | 1M     | Classic          | Low-d power-of-2 baseline, well-studied recall numbers |
 | arXiv embeddings              | 768    | 2.25M  | PDX paper [4]    | Same dim as Contriever, larger scale                   |
-| DEEP                          | 96     | 10M    | Image embeddings | Large scale                                            |
+| DEEP                          | 96     | 10M    | Image embeddings | Large scale; d=96 has no B ≥ 64 divisor → padded path  |
 | Synthetic Gaussian            | varies | varies | Internal         | Pessimistic baseline; validates theoretical bounds     |
 
 **Metrics** (at b_mse ∈ {2, 3, 4, 5, 8}):
@@ -923,5 +923,5 @@ Neighbor Search." IEEE Trans. PAMI 33(1):117-128, 2011.
 [10] Ge, T., He, K., Ke, Q. and Sun, J. "Optimized Product Quantization."
 IEEE Trans. PAMI 36(4):744-755, 2014.
 
-[11] Kuffo, L. et al. "VIBE: Vector Index Benchmark for Embeddings."
-arXiv:2505.17810, May 2025.
+[11] Jääsaari, E., Hyvönen, V., Ceccarello, M., Roos, T. and Aumüller, M.
+"VIBE: Vector Index Benchmark for Embeddings." arXiv:2505.17810, May 2025.
