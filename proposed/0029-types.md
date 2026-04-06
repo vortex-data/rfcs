@@ -128,7 +128,7 @@ Observe that every physical array (a specific encoding combined with actual data
 array. A `VarBinView` array can map to either `Utf8` or `Binary`, depending on whether its contents
 are valid UTF-8. Call this projection `π : Array → DType`.
 
-A **section** is a right-inverse of this projection: a function `s : DType → Encoding` that injects
+A **section** is a right-inverse of this projection: a function `s : DType → Array` that injects
 each logical type back into the space of physical encodings, such that projecting back recovers the
 original `DType` (`π(s(d)) = d`). In other words, a section answers the question: "given a logical
 type, which physical encoding should I use to represent it?"
