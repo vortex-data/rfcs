@@ -9,15 +9,10 @@
 We propose evolving the [TurboQuant vector quantization encoding][current-impl]
 in stages:
 
-1. **MSE-only TurboQuant** — a complete, self-contained building block.
-   - **Stage 1a** (merged — [PR #7269][current-impl]): MSE-only encoding with
-     8-bit default, d ≥ 128 scheme selection, and 3-round SORF rotation. The
-     [original QJL-inclusive PR][original-impl] was closed in favor of this
-     MSE-only approach.
-   - **Stage 1b** (next): restructure rotation signs as `FixedSizeListArray` to
-     support variable SORF rounds, and address outstanding review items from
-     Stage 1a.
-2. **Block decomposition** (next): for dimensions where a valid B exists
+1. **MSE-only TurboQuant** (in progress — [PR #7269][current-impl]): a complete,
+   self-contained building block. Power-of-2 dimensions only, 8-bit default,
+   `FixedSizeListArray` rotation signs supporting variable SORF rounds.
+2. **Block decomposition**: for dimensions where a valid B exists
    (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
    power-of-2 dimensions, B = d (single block). Dimensions with no qualifying
    B fall back to scheme-level padding to power-of-2. Per-block norms stored as internal
@@ -80,7 +75,7 @@ simple deployment, and theoretical guarantees matter most, while PQ or OPQ may
 still win empirically when a learned vector codebook can exploit dataset-specific
 structure.
 
-### Current Vortex implementation (post-Stage 1a)
+### Current Vortex implementation
 
 The [current implementation][current-impl] (Rust, in the `vortex-tensor` crate,
 merged via [PR #7269][current-impl]) implements MSE-only TurboQuant as a Vortex
@@ -132,7 +127,7 @@ and unsuitable for Max-Lloyd centroids designed for concentrated distributions).
 
 **Metadata.** Currently serialized as a raw single byte (bit_width). This lacks
 framing and versioning and cannot be extended backward-compatibly; migrating to
-a structured/extensible format is a Stage 1b item (the upcoming vtable refactor
+a structured/extensible format is a Stage 1 item (the upcoming vtable refactor
 may eliminate the need for separate serialized metadata entirely).
 
 The Eviox corrections study [7] identified several bugs in the paper's reference
@@ -146,23 +141,20 @@ due to softmax amplifying QJL variance. For ANN ranking the evidence is less
 settled; MSE-only is the default pending dedicated benchmarks (see Appendix B
 for details).
 
-### Current limitations (Stage 1a)
+### Current limitations
 
-The SORF requires power-of-2 input dimension. In Stage 1a, non-power-of-2
-dimensions (e.g., 768-d embeddings) are zero-padded internally to the next
-power of 2 (1024). This causes:
+The SORF requires power-of-2 input dimension. The current implementation
+zero-pads non-power-of-2 dimensions (e.g., 768 → 1024) internally; Stage 1
+moves this padding to the scheme level by requiring power-of-2 at the TQ array
+level (see Stage 1). For non-power-of-2 dimensions, this means:
 
 - **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful
   (equivalently, 25% of stored codes are wasted on zero-padded dimensions).
 - **No scan-optimized layout**: row-major code storage prevents SIMD-over-vectors
   distance computation.
 
-Stage 1b eliminates internal padding by requiring power-of-2 dimensions at
-the TQ array level. Between Stage 1b and Stage 2, the scheme still pads
-non-power-of-2 dimensions externally (e.g., 768 → 1024) before constructing
-the TQ array — the same storage cost as Stage 1a, but with padding logic moved
-from the TQ array to the scheme. Stage 2's block decomposition then eliminates
-this padding entirely (e.g., 768 → 3×256 blocks).
+Stage 2's block decomposition eliminates this padding entirely for dimensions
+with a qualifying B (e.g., 768 → 3×256 blocks).
 
 ### PDX
 
@@ -260,7 +252,7 @@ efficiency:
 - **SORF mixing quality:** 3-round SORF at d=64 provides only 18 butterfly
   stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
   more from the analytical Beta, making Max-Lloyd centroids less optimal. Stage
-  1b's variable-round rotation signs (see Stage 1b) may allow compensating with
+  Stage 1's variable-round rotation signs (see Stage 1) may allow compensating with
   additional SORF rounds at lower dimensions — this should be benchmarked.
 - **Practical MSE:** At smaller d, the SORF mixing quality and coordinate-
   independence approximations are weaker, potentially worsening practical
@@ -279,103 +271,78 @@ The threshold of 128 is conservative:
   implementation.
 - The block-size rule produces B=128 for d=128 (single block, no decomposition).
 
-In Stage 1a, the array-level minimum is d=3 (for the Beta distribution to be
-well-defined). In Stage 1b, the TQ array requires power-of-2 dimensions, making
-the array minimum d=4 (the smallest power-of-2 where the Beta exponent
-(d-3)/2 > 0). The scheme minimum (128) controls automatic selection; smaller
-power-of-2 dimensions remain available via explicit construction.
+The TQ array requires power-of-2 dimensions (see Stage 1), making the array
+minimum d=4 (the smallest power-of-2 where the Beta exponent (d-3)/2 > 0).
+The scheme minimum (128) controls automatic selection; smaller power-of-2
+dimensions remain available via explicit construction.
 
 The exact threshold should be validated experimentally — see Experimental plan.
 
-### Stage 1a: MSE-only TurboQuant (merged — [PR #7269][current-impl])
+### Stage 1: MSE-only TurboQuant (in progress — [PR #7269][current-impl])
 
-Stage 1a is the MSE-only baseline, now merged. It provides a complete encoding
-for all dimensions ≥ 3 (automatic scheme selection for d ≥ 128 only; Stage 1b
-restricts to power-of-2 dimensions). Key properties:
+Stage 1 delivers MSE-only TurboQuant as a complete, self-contained building
+block. The [initial implementation][current-impl] is merged; the
+[original QJL-inclusive PR][original-impl] was closed in favor of this MSE-only
+approach. Work remaining to complete Stage 1 is described below.
+
+The goal is to arrive at a wire format that we believe is ready for
+backward-compatibility guarantees — one we would be comfortable freezing — without
+formally committing to stability until confirmed by Stage 2 implementation and
+benchmarking.
+
+**Target properties:**
 
 - **MSE-only, no QJL.** 4 child slots: codes, norms, centroids, rotation_signs.
-  The [original QJL-inclusive PR][original-impl] was closed; QJL code can be
-  resurrected from that branch if Phase 4 is pursued.
+  QJL code can be resurrected from the [original PR][original-impl] if Phase 4
+  is pursued.
 - **8-bit default** (256 centroids). Near-lossless: normalized MSE ~4e-5,
   ~4× compression on f32. Lower bit widths available via `TurboQuantConfig`.
-- **3-round SORF rotation**, Max-Lloyd centroids. Non-power-of-2 dimensions
-  are zero-padded internally (Stage 1b removes this; see below).
+- **Power-of-2 dimensions only.** The TQ array requires its dimension to be a
+  power of 2 (enforced at construction time). This eliminates internal
+  zero-padding logic and simplifies the decoder invariant
+  (`codes.list_size` always equals `dimension`). Non-power-of-2 dimensions are
+  handled *outside* the TQ array: Stage 2's block decomposition splits them
+  into power-of-2 blocks (e.g., 768 → 3×256), and the rare "no qualifying B"
+  case (e.g., d=96) is padded at the scheme/compressor level.
+- **Variable-round SORF rotation.** Rotation signs are stored as a
+  `FixedSizeListArray` where each element is a
+  `FixedSizeList(u8, dim, NonNullable)` — one bitpacked diagonal per SORF
+  round. The array length R equals the number of rounds (default 3). This
+  makes the round count a property of the array shape rather than a hard-coded
+  constant. More rounds may improve mixing quality at lower dimensions or lower
+  bit widths (see Experimental plan: "Test 3, 4, 5 SORF rounds at each B").
+  Signs are stored in inverse-friendly (read-optimized) order.
 - **Scheme auto-selection** for dimension ≥ 128 (see Minimum dimension).
+  Smaller power-of-2 dimensions remain available via explicit construction.
 - **Compute pushdowns**: slice/take/scalar_at, quantized cosine similarity and
   dot product, compression scheme integration.
-- **Metadata**: raw single byte (bit_width only) — no framing or versioning.
+- **Dtype-matching norms**: f64 for f64 input, f32 for f32/f16.
+- **Codes and centroids remain separate children.** The codes
+  (`FixedSizeListArray<u8>`) and centroids (`PrimitiveArray<f32>`) are
+  independent child slots. Operations that need a unified view (e.g.,
+  `canonicalize`) can construct a `DictArray` from codes and centroids and
+  apply the inverse rotation to produce a canonical decoded form.
 
-**Known items deferred to Stage 1b:**
+**Forward-compatible metadata:** `block_size: u32` (always = dimension in
+Stage 1), `num_blocks: u32` (always = 1), `num_rounds: u32` (= R, default 3).
+These fields are inert in Stage 1 but enable Stage 2 decoders to read Stage 1
+files. The serialization format is TBD — the upcoming vtable refactor may make
+the current raw-byte metadata unnecessary by encoding these fields directly in
+the vtable. If the refactor does not land first, a structured format (e.g.,
+protobuf) is needed. (PDX is handled via the codes child type, not a metadata
+flag — see Stage 3.)
 
-- Require power-of-2 dimensions; remove internal zero-padding logic
-  (see Stage 1b).
-- Metadata needs structured format (vtable refactor may subsume; see Stage 1b).
-- Rotation signs should become `FixedSizeListArray` for variable SORF rounds
-  (see Stage 1b).
-- Norms dtype should match input (f64 for f64; currently always f32).
-- `new_unchecked` visibility: restrict to `pub(crate)`.
-- f64-to-f32 truncation in encode path: needs comment or checked cast.
+**Remaining work** (relative to the [initial implementation][current-impl]):
+
+- Require power-of-2 dimensions; remove internal zero-padding logic.
+- Restructure rotation signs from flat `PrimitiveArray<u8>` to
+  `FixedSizeListArray` (variable SORF rounds, as described above).
+- Dtype-matching norms (currently always f32).
+- Structured metadata (currently a raw single byte).
+- Restrict `new_unchecked` visibility to `pub(crate)`.
+- f64-to-f32 truncation in encode path: add comment or checked cast.
 - CENTROID_CACHE: document intentional unbounded-ness.
-- MSE bound caveat: note Theorem 1 is proved for Haar matrices, not SORF.
-
-### Stage 1b: Array representation cleanup (next)
-
-Stage 1b restructures the array representation to support variable SORF rounds
-and cleaner code/centroid modeling, and addresses outstanding review items from
-Stage 1a. The goal is to arrive at a wire format that we believe is ready for
-backward-compatibility guarantees — one we would be comfortable freezing — without
-formally committing to stability yet (in case we discover issues during Stage 2
-or benchmarking).
-
-**Changes vs. Stage 1a:**
-
-| Aspect              | Stage 1a (current)                              | Stage 1b                                                                                  |
-| ------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Dimension           | Any d ≥ 3 (non-power-of-2 zero-padded)          | **Power-of-2 only** (padding removed from TQ array)                                      |
-| Rotation signs      | `PrimitiveArray<u8>`, len = 3 × padded_dim bits | **`FixedSizeListArray`** with dtype `FixedSizeList(u8, dim, NonNullable)`, len = R        |
-| SORF rounds         | Hard-coded to 3                                 | **Variable** (R = len of rotation signs array; default 3)                                 |
-| Metadata            | Raw single byte                                 | **Structured** (format TBD; vtable refactor may subsume)                                  |
-| Norms dtype         | Always f32                                      | **Same-or-wider**: f64 for f64 input, f32 for f32/f16                                     |
-| `new_unchecked`     | `pub`                                           | **`pub(crate)`**                                                                          |
-
-**Power-of-2 dimension requirement.** The TQ array requires its dimension to be
-a power of 2 (enforced at construction time). This eliminates the zero-padding
-logic, the `padded_dim` vs `dimension` distinction, and the "trailing structural
-zeros" edge case in the wire format. Non-power-of-2 dimensions are handled
-*outside* the TQ array: Stage 2's block decomposition splits them into
-power-of-2 blocks (e.g., 768 → 3×256), and the rare "no qualifying B" case
-(e.g., d=96) is padded at the scheme/compressor level before constructing the
-TQ array. Since `codes.list_size` always equals `dimension`, the decoder
-invariant simplifies.
-
-**Rotation signs as `FixedSizeListArray`.** Rather than storing all rotation
-sign diagonals in a single flat `PrimitiveArray<u8>` that is implicitly 3-way
-partitioned, the rotation signs become a `FixedSizeListArray` where each element
-is a `FixedSizeList(u8, dim, NonNullable)` — one bitpacked diagonal per element.
-The array length R equals the number of SORF rounds (default 3). Signs are
-stored in inverse-friendly (read-optimized) order, as in Stage 1a.
-
-This structure makes the number of SORF rounds a property of the array shape
-rather than a hard-coded constant. More rounds may improve mixing quality at
-lower dimensions or lower bit widths where the coordinate distribution deviates
-more from the analytical Beta — this should be benchmarked (see Experimental
-plan: "Test 3, 4, 5 SORF rounds at each B").
-
-**Codes and centroids remain separate children.** The codes
-(`FixedSizeListArray<u8>`) and centroids (`PrimitiveArray<f32>`) remain as
-independent child slots. However, operations that need a unified view (e.g.,
-`canonicalize`) can construct a `DictArray` from codes and centroids — e.g.,
-`DictArray::new_unchecked(codes, centroids)` — and then apply the inverse
-rotation to produce a canonical decoded form.
-
-**Forward-compatible metadata:** The metadata should expose `block_size: u32`
-(always = dimension in Stage 1b), `num_blocks: u32` (always = 1),
-`num_rounds: u32` (= R, default 3). These fields are inert in Stage 1b but
-enable Stage 2 decoders to read Stage 1b files. The serialization format is TBD
-— the upcoming vtable refactor may make the current raw-byte metadata
-unnecessary by encoding these fields directly in the vtable. If the refactor
-does not land first, a structured format (e.g., protobuf) is needed. (PDX is
-handled via the codes child type, not a metadata flag — see Stage 3.)
+- Note MSE bound caveat: Theorem 1 is proved for Haar matrices, not SORF.
 
 ### Stage 2: Block decomposition
 
@@ -399,9 +366,9 @@ For dimensions where the block-size rule produces a valid B (see table above),
 the scheme splits the input into k = d/B blocks of size B. Each block is a
 power-of-2 TQ array with an independent B-dim SORF rotation.
 
-**Changes vs. Stage 1b (with TQ blocks):**
+**Changes vs. Stage 1 (with TQ blocks):**
 
-| Aspect                | Stage 1b                                    | Stage 2                                                                      |
+| Aspect                | Stage 1                                     | Stage 2                                                                      |
 | --------------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
 | Block count           | k = 1 (single power-of-2 block)            | **k = d/B** (multiple blocks)                                               |
 | SORF dimension        | dim (power-of-2)                            | **B** (e.g., 256 for d=768)                                                  |
@@ -413,14 +380,14 @@ power-of-2 TQ array with an independent B-dim SORF rotation.
 | Quantized dot product | Single sum over dim centroids               | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
 | L2 norm readthrough   | O(1) — return stored norm                   | **O(k)** — compute √(Σ_k norm_k²)                                            |
 
-**Unchanged from Stage 1b:** SORF construction (R-round HD, default R=3),
+**Unchanged from Stage 1:** SORF construction (R-round HD, default R=3),
 Max-Lloyd algorithm, f32 internal quantization, slice/take semantics (per-row
 data sliced, shared data cloned), `FixedSizeListArray` rotation sign storage,
 compression scheme trait.
 
 **For power-of-2 dimensions**: B = d, k = 1. The encoding produces an identical
-wire format to Stage 1b (single norm, single SORF, single codes block). A
-Stage 2 encoder writing k=1 data is fully backward-compatible with Stage 1b
+wire format to Stage 1 (single norm, single SORF, single codes block). A
+Stage 2 encoder writing k=1 data is fully backward-compatible with Stage 1
 decoders.
 
 **Key design properties:**
@@ -465,7 +432,7 @@ now.
 Per-block norms are stored as an **internal child** of the TurboQuant array:
 
 - For k = 1 (power-of-2 dims): `PrimitiveArray<F>` with len = num_rows
-  (identical to Stage 1b's single-norm layout).
+  (identical to Stage 1's single-norm layout).
 - For k > 1: `FixedSizeListArray<F>` with list_size = k, len = num_rows.
 
 The norm dtype `F` matches or widens the input element type:
@@ -536,7 +503,7 @@ no theoretical backing: [5] proves near-unbiasedness for kernel approximation
 (Theorem 3) and pairwise near-orthogonality (Theorem 4), but does **not** prove
 distributional closeness to Haar measure, does not analyze convergence rate as
 a function of rounds × dimension, and leaves tight variance bounds for SORF as
-an open problem. The variable-round rotation signs (Stage 1b) enable testing
+an open problem. The variable-round rotation signs (Stage 1) enable testing
 more rounds at smaller B or lower bit widths where mixing quality matters more.
 Empirical validation is needed.
 
@@ -774,31 +741,12 @@ this path.
 
 ## Array layout
 
-### Stage 1a (MSE-only single block — current, merged)
-
-```
-TurboQuantArray
-├── metadata: { bit_width } (raw single byte)
-│
-│  # Per-row children
-├── codes: FixedSizeListArray<u8>           # list_size = padded_dim
-├── norms: PrimitiveArray<f32>              # len = num_rows
-│
-│  # Shared children
-├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
-├── mse_rotation_signs: PrimitiveArray<u8>  # len = ceil(3 × padded_dim / 8) (bitpacked)
-```
-
-This is the structure as merged in [PR #7269][current-impl]: 4 slots (codes,
-norms, centroids, rotation_signs), MSE-only, 8-bit default.
-
-### Stage 1b (array representation cleanup)
+### Stage 1 (MSE-only single block)
 
 ```
 TurboQuantArray (dimension must be power-of-2)
 ├── metadata: { dimension, b_mse, block_size (= dimension),
 │               num_blocks (= 1), num_rounds (= R, default 3) }
-│               (format TBD; vtable refactor may subsume)
 │
 │  # Per-row children
 ├── codes: FixedSizeListArray<u8>           # list_size = dimension
@@ -812,12 +760,9 @@ TurboQuantArray (dimension must be power-of-2)
 │     # each element = one bitpacked sign diagonal, inverse-friendly order
 ```
 
-Stage 1b changes vs. 1a: power-of-2 dimension required (no padding), rotation
-signs become a `FixedSizeListArray` (one element per SORF round, variable R),
-norms dtype matches input, metadata moves to a structured format. The codes
-child is `FixedSizeListArray` in Stages 1b-2 and may be swapped to `PDXArray`
-in Stage 3 — TurboQuant checks the child type at runtime, not via a metadata
-flag.
+The codes child is `FixedSizeListArray` in Stages 1-2 and may be swapped to
+`PDXArray` in Stage 3 — TurboQuant checks the child type at runtime, not via
+a metadata flag.
 
 ### Stage 2 (block decomposition)
 
@@ -862,7 +807,7 @@ replace 32 with 64 in the norms row — ratios decrease accordingly):
 | ------------- | ---- | --- | ----------------------- | ----- | ------------------------ |
 | 768           | 256  | 3   | 3×256×8 + 3×32 = 6240   | 3.9×  | Block decomp; no padding |
 | 1024          | 1024 | 1   | 1024×8 + 32 = 8224      | 4.0×  | Single block (= current) |
-| 768 (Stage 1a)| 1024 | 1   | 1024×8 + 32 = 8224      | 3.0×  | Padded; 33% overhead     |
+| 768 (padded)| 1024 | 1   | 1024×8 + 32 = 8224      | 3.0×  | Padded; 33% overhead     |
 
 **At b_mse=5 (32 centroids):**
 
@@ -870,7 +815,7 @@ replace 32 with 64 in the norms row — ratios decrease accordingly):
 | ------------- | ---- | --- | ----------------------- | ----- | ------------------------ |
 | 768           | 256  | 3   | 3×256×5 + 3×32 = 3936   | 6.2×  | Block decomp; no padding |
 | 1024          | 1024 | 1   | 1024×5 + 32 = 5152      | 6.4×  | Single block (= current) |
-| 768 (Stage 1a)| 1024 | 1   | 1024×5 + 32 = 5152      | 4.8×  | Padded; 33% overhead     |
+| 768 (padded)| 1024 | 1   | 1024×5 + 32 = 5152      | 4.8×  | Padded; 33% overhead     |
 
 Block decomposition improves the compression ratio at both bit widths. At b=8
 for d=768: from ~3.0× (padded) to ~3.9× (block decomp). At b=5 for d=768: from
@@ -895,7 +840,7 @@ omitted). For k blocks, R=3:
 | 512            | 3×512×9 + 1536 = 15,360   | —         | —               |
 | 1024 (current) | 3×1024×10 + 3072 = 33,792 | 1         | 33,792          |
 
-Block decomposition at d=768 is ~40% fewer FLOPs than the Stage 1a padded
+Block decomposition at d=768 is ~40% fewer FLOPs than the padded single-block
 approach, despite more blocks, because each block is smaller.
 
 ### Benchmarking plan
@@ -996,14 +941,11 @@ heterogeneous per-block encodings.
 
 ## Phasing
 
-**Phase 1a** (done) — MSE-only single-block TurboQuant: Merged as
-[PR #7269][current-impl]. 8-bit default, d ≥ 128 scheme auto-selection, 3-round
-SORF, 4 child slots. The [original QJL PR][original-impl] was closed.
-
-**Phase 1b** (next) — Array representation cleanup: Restructure rotation signs
-as `FixedSizeListArray` (variable SORF rounds), dtype-matching norms, restrict
-`new_unchecked` visibility, structured metadata (format pending vtable refactor).
-Address remaining review items from Phase 1a (see Stage 1a deferred items).
+**Phase 1** (in progress) — MSE-only single-block TurboQuant: Initial
+implementation merged as [PR #7269][current-impl]. Remaining: power-of-2
+dimension requirement, `FixedSizeListArray` rotation signs (variable SORF
+rounds), dtype-matching norms, structured metadata, and review items (see
+Stage 1: Remaining work).
 
 **Phase 2** — Block decomposition: Add block splitting for dimensions where a
 valid B exists (greatest power-of-2 ≥ 64 dividing d). Per-block norms stored as
@@ -1028,7 +970,7 @@ For common model dimensions, the most promising configurations are:
 | ---------------------- | --------------------------- | -------------------------------------------------------------------------- |
 | 512, 1024, 2048, 4096  | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
 | 768, 1536, 3072        | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
-| No qualifying B (rare) | Padded single-block         | Fall back to Stage 1b: pad to next power-of-2, single SORF.               |
+| No qualifying B (rare) | Padded single-block         | Pad to next power-of-2 at scheme level, single SORF.                      |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
@@ -1123,40 +1065,35 @@ codes without decompressing them.
 
 ## Migration and compatibility
 
-Stage 1a is now shipped (merged in [PR #7269][current-impl]) with raw single-byte
-metadata. Stage 1b introduces structured metadata and a new rotation signs layout,
-which is a breaking change from Stage 1a's wire format. Since TurboQuant has not
-been included in a release yet, this is acceptable — no user-facing files need
-migration. The Stage 1b wire format is intended to be one we believe is ready
-for backward-compatibility guarantees, without formally committing to stability
-until we have confidence from Stage 2 implementation and benchmarking.
+TurboQuant has not been included in a release yet, so the wire format can still
+change freely. The Stage 1 target wire format is intended to be one we believe
+is ready for backward-compatibility guarantees, without formally committing to
+stability until confirmed by Stage 2 implementation and benchmarking.
 
 **Strategy: single array ID, versioned metadata.** All stages use the same array
-ID (`vortex.turboquant`). From Stage 1b onward, the metadata includes
-`block_size`, `num_blocks`, and `num_rounds` fields. Stage 1b always writes
-`num_blocks=1`, but the field exists so that Stage 2 decoders can read Stage 1b
-files without migration.
+ID (`vortex.turboquant`). The metadata includes `block_size`, `num_blocks`, and
+`num_rounds` fields. Stage 1 always writes `num_blocks=1`, but the field exists
+so that Stage 2 decoders can read Stage 1 files without migration.
 
-**Decoder invariant:** From Stage 1b onward, dimension is always power-of-2 and
-`codes.list_size` = `dimension` = `num_blocks × block_size`. The decoder
-**validates** this equality (reject files where it does not hold).
-`num_rounds` must equal `rotation_signs.len / num_blocks`.
+**Decoder invariant:** Dimension is always power-of-2 and `codes.list_size` =
+`dimension` = `num_blocks × block_size`. The decoder **validates** this equality
+(reject files where it does not hold). `num_rounds` must equal
+`rotation_signs.len / num_blocks`.
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
 
-- Stage 1a: norms child is `PrimitiveArray<f32>`, one norm per vector.
-- Stage 1b: norms child is `PrimitiveArray<F>`, one norm per vector (F = f64
+- Stage 1: norms child is `PrimitiveArray<F>`, one norm per vector (F = f64
   for f64 input, f32 otherwise).
-- Stage 2 with k=1 (power-of-2 dims): same as Stage 1b, identical wire format.
+- Stage 2 with k=1 (power-of-2 dims): same as Stage 1, identical wire format.
 - Stage 2 with k>1: norms child is `FixedSizeListArray<F>`, k norms per vector.
 
 The decoder distinguishes k=1 from k>1 by reading `num_blocks` from metadata.
-A k=1 decoder is backward-compatible with Stage 1b files. A k>1 decoder is a
+A k=1 decoder is backward-compatible with Stage 1 files. A k>1 decoder is a
 new code path that only applies to files written by Stage 2+.
 
 **Stage 3 (PDXArray) is additive.** PDX is not a TurboQuant metadata flag — it's
-a separate array type (`PDXArray`) that wraps the codes child. Stage 1b/2 files
+a separate array type (`PDXArray`) that wraps the codes child. Stage 1/2 files
 have `FixedSizeListArray` codes; Stage 3 files have `PDXArray` codes. The
 TurboQuant decoder checks the child type and un-transposes PDXArray on decode if
 needed. `PDXArray` itself is registered as a new encoding, independent of
@@ -1164,12 +1101,11 @@ TurboQuant.
 
 **Incremental shipping:**
 
-| Stage         | Ships to users?  | Reads prior stage files?    | Notes                                |
-| ------------- | ---------------- | --------------------------- | ------------------------------------ |
-| 1a (MSE-only) | Yes (merged)     | N/A (first version)         | Raw byte metadata, 3-round SORF     |
-| 1b (cleanup)  | Yes              | No (breaking: new metadata) | Variable rounds, structured metadata, new norms |
-| 2 (blocks)    | Yes              | Yes (k=1 is identical)      | k>1 files need Stage 2+ decoder      |
-| 3 (PDX)      | Yes              | Yes (FSL codes still work) | PDX codes need PDXArray registered  |
+| Stage     | Ships to users?  | Reads prior stage files?    | Notes                              |
+| --------- | ---------------- | --------------------------- | ---------------------------------- |
+| 1 (MSE)   | Yes              | N/A (first stable version)  | Single block, variable SORF rounds |
+| 2 (blocks) | Yes             | Yes (k=1 is identical)      | k>1 files need Stage 2+ decoder    |
+| 3 (PDX)   | Yes              | Yes (FSL codes still work)  | PDX codes need PDXArray registered |
 
 Each stage is independently shippable. Users can upgrade incrementally. Files
 written by earlier stages are always readable by later decoders.
