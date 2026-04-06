@@ -10,12 +10,13 @@ We propose evolving the [TurboQuant vector quantization encoding][current-impl]
 in stages:
 
 1. **MSE-only TurboQuant** (in progress — [PR #7269][current-impl]): a complete,
-   self-contained building block. Power-of-2 dimensions only, 8-bit default,
-   `FixedSizeListArray` rotation signs supporting variable SORF rounds.
+   self-contained building block. 8-bit default, internal zero-padding for
+   non-power-of-2 dimensions, `FixedSizeListArray` rotation signs supporting
+   variable SORF rounds.
 2. **Block decomposition**: for dimensions where a valid B exists
    (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
    power-of-2 dimensions, B = d (single block). Dimensions with no qualifying
-   B fall back to scheme-level padding to power-of-2. Per-block norms stored as internal
+   B fall back to internal zero-padding to power-of-2. Per-block norms stored as internal
    children.
 3. **PDX layout** (later): transpose codes into dimension-major order within
    groups of 64 vectors for SIMD scan performance.
@@ -143,18 +144,18 @@ for details).
 
 ### Current limitations
 
-The SORF requires power-of-2 input dimension. The current implementation
-zero-pads non-power-of-2 dimensions (e.g., 768 → 1024) internally; Stage 1
-moves this padding to the scheme level by requiring power-of-2 block size at
-the TQ array level (see Stage 1). For non-power-of-2 dimensions, this means:
+The SORF requires power-of-2 input dimension. The TQ array handles this by
+zero-padding non-power-of-2 dimensions to the next power of 2 internally
+(e.g., 768 → 1024). For non-power-of-2 dimensions, this means:
 
 - **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful
   (equivalently, 25% of stored codes are wasted on zero-padded dimensions).
 - **No scan-optimized layout**: row-major code storage prevents SIMD-over-vectors
   distance computation.
 
-Stage 2's block decomposition eliminates this padding entirely for dimensions
-with a qualifying B (e.g., 768 → 3×256 blocks).
+Stage 2's block decomposition eliminates this padding for dimensions with a
+qualifying B (e.g., 768 → 3×256 blocks), since each block is natively
+power-of-2.
 
 ### PDX
 
@@ -210,8 +211,8 @@ quantization with the computational savings of early termination.
 ### Block size strategy
 
 For each dimension d, choose B = the greatest power-of-2 ≥ 64 that evenly
-divides d. If no such B exists (e.g., d=96), the scheme pads to the next
-power-of-2 before constructing a single-block TQ array. For common embedding
+divides d. If no such B exists (e.g., d=96), the TQ array falls back to
+internal zero-padding (single padded block, as in Stage 1). For common embedding
 dimensions, this rule always produces a valid B and avoids padding entirely:
 
 | Dimension d | Block size B | Blocks k | Notes                        |
@@ -234,8 +235,8 @@ dimensions, this rule always produces a valid B and avoids padding entirely:
   B=256 or B=512. No padding waste.
   Each block has its own SORF rotation and shares a single centroid set.
 - **No qualifying B is rare** for common embedding dimensions. Dimensions where
-  no power-of-2 ≥ 64 divides d (e.g., 96, 100) are padded at the scheme level
-  to the next power-of-2. A future straggler-block extension could handle these
+  no power-of-2 ≥ 64 divides d (e.g., 96, 100) fall back to internal
+  zero-padding. A future straggler-block extension could handle these
   without padding (see Stage 2: Straggler blocks). These dimensions are uncommon
   in modern model architectures.
 - **The SORF approximation at B=256+ is expected to be adequate**: 3 rounds at
@@ -271,11 +272,11 @@ The threshold of 128 is conservative:
   implementation.
 - The block-size rule produces B=128 for d=128 (single block, no decomposition).
 
-The TQ array requires power-of-2 block size (see Stage 1). In Stage 1
-(single block), this means dimension must be power-of-2, making the array
-minimum d=4 (the smallest power-of-2 where the Beta exponent (d-3)/2 > 0).
-The scheme minimum (128) controls automatic selection; smaller power-of-2
-dimensions remain available via explicit construction.
+The array-level minimum is d=4 (the smallest power-of-2 where the Beta
+exponent (d-3)/2 > 0; at d=2 the marginal is the arcsine distribution, which
+is unsuitable for Max-Lloyd centroids). The scheme minimum (128) controls
+automatic selection; smaller power-of-2 dimensions remain available via
+explicit construction.
 
 The exact threshold should be validated experimentally — see Experimental plan.
 
@@ -298,19 +299,16 @@ benchmarking.
   is pursued.
 - **8-bit default** (256 centroids). Near-lossless: normalized MSE ~4e-5,
   ~4× compression on f32. Lower bit widths available via `TurboQuantConfig`.
-- **Power-of-2 block size.** The TQ array requires `block_size` to be a power
-  of 2 (enforced at construction time). In Stage 1, `block_size = dimension`
-  (single block), so this also means power-of-2 dimension. In Stage 2,
-  `dimension = num_blocks × block_size` can be non-power-of-2 (e.g., 768 =
-  3 × 256). This eliminates internal zero-padding logic and simplifies the
-  decoder invariant. Non-power-of-2 dimensions are handled *outside* the TQ
-  array in Stage 1 (the scheme pads to the next power-of-2), and *inside* via
-  block decomposition in Stage 2 (e.g., 768 → 3×256 blocks). The rare
-  "no qualifying B" case (e.g., d=96) is padded at the scheme/compressor level.
+- **Power-of-2 block size with internal padding.** The TQ array requires
+  `block_size` to be a power of 2. Non-power-of-2 dimensions are zero-padded
+  internally to the next power of 2 (e.g., 768 → 1024), so `codes.list_size`
+  (= `padded_dim`) may exceed `dimension`. Stage 2's block decomposition
+  eliminates this padding for dimensions with a qualifying B (e.g., 768 →
+  3×256 blocks, each natively power-of-2).
 - **Variable-round SORF rotation.** Rotation signs are stored as a
   `FixedSizeListArray` where each element is a
-  `FixedSizeList(u8, dim, NonNullable)` — one bitpacked diagonal per SORF
-  round. The array length R equals the number of rounds (default 3). This
+  `FixedSizeList(u8, padded_dim, NonNullable)` — one bitpacked diagonal per
+  SORF round. The array length R equals the number of rounds (default 3). This
   makes the round count a property of the array shape rather than a hard-coded
   constant. More rounds may improve mixing quality at lower dimensions or lower
   bit widths (see Experimental plan: "Test 3, 4, 5 SORF rounds at each B").
@@ -326,9 +324,10 @@ benchmarking.
   `canonicalize`) can construct a `DictArray` from codes and centroids and
   apply the inverse rotation to produce a canonical decoded form.
 
-**Forward-compatible metadata:** `block_size: u32` (always = dimension in
-Stage 1), `num_blocks: u32` (always = 1), `num_rounds: u32` (= R, default 3).
-These fields are inert in Stage 1 but enable Stage 2 decoders to read Stage 1
+**Forward-compatible metadata:** `dimension: u32`, `block_size: u32` (=
+padded_dim in Stage 1), `num_blocks: u32` (always = 1 in Stage 1),
+`num_rounds: u32` (= R, default 3). These fields are inert in Stage 1 but
+enable Stage 2 decoders to read Stage 1
 files. The serialization format is TBD — the upcoming vtable refactor may make
 the current raw-byte metadata unnecessary by encoding these fields directly in
 the vtable. If the refactor does not land first, a structured format (e.g.,
@@ -337,7 +336,6 @@ flag — see Stage 3.)
 
 **Remaining work** (relative to the [initial implementation][current-impl]):
 
-- Require power-of-2 dimensions; remove internal zero-padding logic.
 - Restructure rotation signs from flat `PrimitiveArray<u8>` to
   `FixedSizeListArray` (variable SORF rounds, as described above).
 - Dtype-matching norms (currently always f32).
@@ -374,7 +372,7 @@ power-of-2 TQ array with an independent B-dim SORF rotation.
 | Aspect                | Stage 1                                     | Stage 2                                                                      |
 | --------------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
 | Block count           | k = 1 (single power-of-2 block)            | **k = d/B** (multiple blocks)                                               |
-| SORF dimension        | dim (power-of-2)                            | **B** (e.g., 256 for d=768)                                                  |
+| SORF dimension        | padded_dim (next power-of-2 ≥ dim)          | **B** (e.g., 256 for d=768)                                                  |
 | Rotation signs        | `FSL`, len = R, element dim = dim           | **`FSL`, len = k × R**, element dim = B                                      |
 | Centroids             | Computed for dim distribution               | **Computed for B-dim distribution** (different codebook!)                    |
 | Norms child           | `PrimitiveArray<F>`, 1 per vector           | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
@@ -407,7 +405,8 @@ decoders.
 #### Straggler blocks (future work)
 
 The current block-size rule requires B to evenly divide d, so dimensions with no
-qualifying power-of-2 B ≥ 64 (e.g., d=96) fall back to scheme-level padding.
+qualifying power-of-2 B ≥ 64 (e.g., d=96) fall back to internal zero-padding
+(single padded block, as in Stage 1).
 A natural extension is **straggler blocks**: allow k blocks where k-1 are
 full-size B and the final block covers the remaining d - (k-1)×B dimensions.
 
@@ -427,7 +426,7 @@ encoding as the main blocks. Options include:
 
 This is deferred: the block-size rule already handles all common embedding
 dimensions (768, 1024, 1536, etc.) without stragglers, and the rare
-no-qualifying-B case (d=96) is adequately served by scheme-level padding for
+no-qualifying-B case (d=96) is adequately served by internal zero-padding for
 now.
 
 #### Norm architecture
@@ -747,21 +746,26 @@ this path.
 ### Stage 1 (MSE-only single block)
 
 ```
-TurboQuantArray (dimension must be power-of-2)
-├── metadata: { dimension, b_mse, block_size (= dimension),
+TurboQuantArray
+├── metadata: { dimension, b_mse,
+│               block_size (= padded_dim, next power-of-2 ≥ dimension),
 │               num_blocks (= 1), num_rounds (= R, default 3) }
 │
 │  # Per-row children
-├── codes: FixedSizeListArray<u8>           # list_size = dimension
+├── codes: FixedSizeListArray<u8>           # list_size = padded_dim
 │          (or PDXArray<u8> after Stage 3)
 ├── norms: PrimitiveArray<F>               # len = num_rows (F = f64 for f64, f32 otherwise)
 │
 │  # Shared children
 ├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
 ├── mse_rotation_signs: FixedSizeListArray  # len = R (default 3)
-│     element dtype: FixedSizeList(u8, dimension, NonNullable)
+│     element dtype: FixedSizeList(u8, padded_dim, NonNullable)
 │     # each element = one bitpacked sign diagonal, inverse-friendly order
 ```
+
+For power-of-2 dimensions, `padded_dim = dimension` (no waste). For
+non-power-of-2 (e.g., d=768), `padded_dim = 1024` (33% overhead, eliminated
+by Stage 2 block decomposition).
 
 The codes child is `FixedSizeListArray` in Stages 1-2 and may be swapped to
 `PDXArray` in Stage 3 — TurboQuant checks the child type at runtime, not via
@@ -938,7 +942,7 @@ adversarial properties for the specific rotation).
 ### Dimensions with no qualifying B
 
 Rare for common embedding dimensions (e.g., d=96). Currently these fall back to
-scheme-level padding to the next power-of-2, then a single-block TQ array. See
+internal zero-padding to the next power-of-2 (single padded block). See
 "Straggler blocks (future work)" in Stage 2 for a potential alternative using
 heterogeneous per-block encodings.
 
@@ -973,7 +977,7 @@ For common model dimensions, the most promising configurations are:
 | ---------------------- | --------------------------- | -------------------------------------------------------------------------- |
 | 512, 1024, 2048, 4096  | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
 | 768, 1536, 3072        | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
-| No qualifying B (rare) | Padded single-block         | Pad to next power-of-2 at scheme level, single SORF.                      |
+| No qualifying B (rare) | Padded single-block         | Internal zero-padding to next power-of-2, single SORF.                    |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
@@ -1078,12 +1082,14 @@ ID (`vortex.turboquant`). The metadata includes `block_size`, `num_blocks`, and
 `num_rounds` fields. Stage 1 always writes `num_blocks=1`, but the field exists
 so that Stage 2 decoders can read Stage 1 files without migration.
 
-**Decoder invariant:** `block_size` is always power-of-2. `codes.list_size` =
-`dimension` = `num_blocks × block_size`. The decoder **validates** these
-equalities (reject files where they do not hold). `num_rounds` must equal
-`rotation_signs.len / num_blocks`. In Stage 1, `num_blocks=1` so
-`dimension = block_size` (both power-of-2). In Stage 2, `dimension` may be
-non-power-of-2 (e.g., 768 = 3 × 256).
+**Decoder invariant:** `block_size` is always power-of-2.
+`codes.list_size` = `num_blocks × block_size`. Note that `dimension` (the
+original input dimension) may differ from `codes.list_size` in Stage 1 when
+internal padding applies (e.g., dimension=768, block_size=1024, list_size=1024).
+In Stage 2, `dimension = num_blocks × block_size` (no padding, since B is
+chosen to divide d exactly). The decoder **validates** that
+`codes.list_size == num_blocks × block_size` (reject files where this does not
+hold). `num_rounds` must equal `rotation_signs.len / num_blocks`.
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
