@@ -15,7 +15,7 @@ in stages:
      [original QJL-inclusive PR][original-impl] was closed in favor of this
      MSE-only approach.
    - **Stage 1b** (next): restructure rotation signs as `FixedSizeListArray` to
-     support variable SRHT rounds, and address outstanding review items from
+     support variable SORF rounds, and address outstanding review items from
      Stage 1a.
 2. **Block decomposition** (next): for dimensions where a valid B exists
    (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
@@ -127,59 +127,24 @@ normalized MSE ~4e-5, achieving ~4× compression on f32).
 quantization. Per-vector L2 norms are computed and stored as f32. Non-power-of-2
 dimensions are zero-padded to the next power of 2 for SORF compatibility. The
 minimum dimension for scheme auto-selection is 128; the array-level minimum
-remains 3 (d=2 causes a singularity in the Beta distribution exponent).
+remains 3 (at d=2 the marginal is the arcsine distribution, which is U-shaped
+and unsuitable for Max-Lloyd centroids designed for concentrated distributions).
 
 **Metadata.** Currently serialized as a raw single byte (bit_width). This lacks
 framing and versioning and cannot be extended backward-compatibly; migrating to
 a structured/extensible format is a Stage 1b item (the upcoming vtable refactor
 may eliminate the need for separate serialized metadata entirely).
 
-### Reference implementation bugs
+The Eviox corrections study [7] identified several bugs in the paper's reference
+Python implementation; none affect our implementation (see Appendix A). There is
+also a notational ambiguity in the MSE bound constant; we use `√3·π/2 ≈ 2.72`
+(see Appendix A for the full analysis).
 
-The Eviox corrections study [7] identified six material bugs in the paper's
-reference Python implementation. The most critical is a mathematical error in
-the QJL scale factor: the reference code used `√(π/(2d))` instead of
-`√(π/2)/d` (Definition 1 in [1]), differing by a factor of √d (≈11× at d=128).
-Our [current implementation][current-impl] uses the correct formula
-(`sqrt(FRAC_PI_2) / padded_dim` in Rust), so this bug does **not** affect us.
-
-Other notable Eviox findings: (a) the reference code recomputes codebooks at
-every instantiation (we cache in a `DashMap`); (b) the reference uses float16
-for codebook distance computation, causing misassignment at small centroid
-spacings (we cast to f32 before quantization). See [7] for the full list.
-
-### Theorem 1 constant
-
-There is an ambiguity in the paper's notation for the MSE bound constant. The
-formal proof gives `(√3 · π / 2) · 4^{-b}` where the constant √3·π/2 ≈ 2.72.
-The Eviox report [7] (Item 7) deliberately adopts the alternative parsing
-`√(3π)/2 ≈ 1.535`, claiming it is "consistent with the formal proof." We treat
-`√3·π/2 ≈ 2.72` as the theorem constant because: (a) the paper's prose
-describes the constant as "≈ 2.7," which matches 2.72 not 1.535; and (b) the
-paper's reported distortion values (b=2: 0.117, b=3: 0.03) exceed the 1.535-
-based bound (b=2: 0.096, b=3: 0.024), ruling out `√(3π)/2` as a valid
-**upper** bound on the measured quantity. The definitive resolution requires
-checking the exact LaTeX grouping in the ICLR 2026 camera-ready proof. The
-paper's "explicit values" (0.36, 0.117, 0.03, 0.009) are the actual computed
-distortion of the optimal quantizer, not the bound itself — they are well below
-the 2.72/4^b bound.
-
-### Community findings on QJL
-
-Multiple independent TurboQuant implementations have repeatedly reported a
-practical finding for **KV-cache attention**: MSE-only often outperforms MSE+QJL
-at the same bit budget. The likely mechanism is a variance-bias tradeoff: QJL
-removes bias in raw inner-product estimation but adds variance, and the softmax
-nonlinearity amplifies variance more than it penalizes bias. In that setting,
-allocating all bits to MSE (more centroids, lower quantization variance) can beat
-splitting the budget between MSE + QJL. This behavior has been reported by
-multiple groups across Python, C, and Rust implementations [8].
-
-For ANN search, cosine ranking, and other non-softmax vector-search workloads,
-the evidence is currently less settled. MSE-only is still a reasonable default
-because it is simpler and better supported by the current implementation work,
-but the ANN question should be treated as empirical until evaluated on ANN
-datasets with recall@k and ranking metrics (see Experimental plan).
+Multiple independent TurboQuant implementations report that MSE-only often
+outperforms MSE+QJL for KV-cache attention at the same bit budget [8], likely
+due to softmax amplifying QJL variance. For ANN ranking the evidence is less
+settled; MSE-only is the default pending dedicated benchmarks (see Appendix B
+for details).
 
 ### Current limitations (Stage 1a)
 
@@ -193,22 +158,29 @@ power of 2 (1024). This causes:
   distance computation.
 
 Stage 1b eliminates internal padding by requiring power-of-2 dimensions at
-the TQ array level. Stage 2's block decomposition then handles non-power-of-2
-dimensions (e.g., 768 → 3×256 blocks) without padding waste.
+the TQ array level. Between Stage 1b and Stage 2, the scheme still pads
+non-power-of-2 dimensions externally (e.g., 768 → 1024) before constructing
+the TQ array — the same storage cost as Stage 1a, but with padding logic moved
+from the TQ array to the scheme. Stage 2's block decomposition then eliminates
+this padding entirely (e.g., 768 → 3×256 blocks).
 
 ### PDX
 
 PDX [4] is a data layout for vector similarity search. The paper (SIGMOD '25)
 describes a dimension-major layout within fixed-size blocks of 64 vectors,
 enabling the compiler to auto-vectorize the inner distance loop over vectors
-rather than dimensions. In the paper, this yields average speedups of about 40%
-over SIMD-optimized row-major kernels for the direct kernel comparison, while
-dimension-pruning methods (ADSampling, BSA) recover much larger gains (2-7×)
-when paired with the PDX layout [4]. The block size of 64 is empirically optimal
-across AVX-512, AVX2, and NEON architectures [4].
+rather than dimensions. The paper reports an average 2× speedup for
+auto-vectorized PDX distance kernels vs. explicitly SIMD-optimized row-major
+baselines (SimSIMD, FAISS) across four architectures, with larger gains at low
+dimensionality (5.5× at D ≤ 32) and ~1.5× at D > 32 [4, Table 4].
+Dimension-pruning methods (ADSampling, BSA) recover much larger end-to-end
+gains (2-7×) when paired with the PDX layout [4]. The block size of 64 is
+empirically optimal across AVX-512, AVX2, and NEON architectures [4, Table 5].
 
-**PDX implementation evolution.** The [open-source implementation][pdx-impl]
-has evolved beyond the paper in several ways relevant to this RFC:
+**PDX open-source implementation.** The [open-source implementation][pdx-impl]
+has evolved beyond the paper in several ways relevant to this RFC. _Note: the
+following describes the code repository, not the paper — the paper operates
+exclusively on float32 and does not discuss int8 layouts._
 
 - **8-bit scalar quantization** (`IndexPDXIVFTreeSQ8`): Maps floats to 0-255 via
   linear min-max scaling. The int8 layout differs from float32: dimensions are
@@ -216,16 +188,15 @@ has evolved beyond the paper in several ways relevant to this RFC:
   instructions (VPDPBUSD on x86, UDOT/SDOT on ARM) that process 4 byte pairs
   per operation. This is a different tiling than the paper's "1 dim × 64 vecs."
 - **ADSampling with random rotation**: The pruner applies a random orthogonal
-  rotation (QR of Gaussian, or DCT when FFTW is available) to the entire
-  collection as a preprocessing step. This makes coordinates approximately
-  independent, enabling dimension-by-dimension hypothesis testing for early
-  pruning. The rotation serves a similar purpose to TurboQuant's rotation —
-  making the coordinate distribution known — but for pruning rather than
-  quantization.
+  rotation to the entire collection as a preprocessing step. This makes
+  coordinates approximately independent, enabling dimension-by-dimension
+  hypothesis testing for early pruning. The rotation serves a similar purpose
+  to TurboQuant's rotation — making the coordinate distribution known — but for
+  pruning rather than quantization.
 - **Dimension zones**: Consecutive dimensions are grouped into zones; at query
   time, zones are ranked by "distance-to-means" and the most discriminative
-  zones are scanned first, enabling faster pruning.
-- **Future: 1-bit vectors** are mentioned as planned.
+  zones are scanned first, enabling faster pruning (~30% faster than
+  per-dimension pruning [4]).
 
 **Implications for our design.** The PDX paper's float32 layout ("1 dim × 64
 vecs") maps cleanly to our quantized-code scan kernel, where the inner loop
@@ -240,7 +211,7 @@ could skip entire TQ blocks (B dimensions at a time) if the partial distance
 already exceeds the candidate threshold. This combines the storage efficiency of
 quantization with the computational savings of early termination.
 
-[pdx-impl]: https://github.com/cwida/PDX "specific files: `include/pdx/quantizers/scalar.hpp` for SQ8, `include/pdx/pruners/adsampling.hpp` for ADSampling/DCT, `include/pdx/layout.hpp` for int8 interleaving, `include/pdx/distance_computers/avx512_computers.hpp` for VPDPBUSD kernels"
+[pdx-impl]: https://github.com/cwida/PDX "specific files: `include/pdx/quantizers/scalar.hpp` for SQ8, `include/pdx/pruners/adsampling.hpp` for ADSampling, `include/pdx/layout.hpp` for int8 interleaving, `include/pdx/distance_computers/avx512_computers.hpp` for VPDPBUSD kernels"
 
 ## Proposal
 
@@ -290,7 +261,7 @@ efficiency:
   stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
   more from the analytical Beta, making Max-Lloyd centroids less optimal. Stage
   1b's variable-round rotation signs (see Stage 1b) may allow compensating with
-  additional SRHT rounds at lower dimensions — this should be benchmarked.
+  additional SORF rounds at lower dimensions — this should be benchmarked.
 - **Practical MSE:** At smaller d, the SORF mixing quality and coordinate-
   independence approximations are weaker, potentially worsening practical
   quantization quality beyond what the dimension-free theoretical bound
@@ -339,17 +310,17 @@ restricts to power-of-2 dimensions). Key properties:
 - Require power-of-2 dimensions; remove internal zero-padding logic
   (see Stage 1b).
 - Metadata needs structured format (vtable refactor may subsume; see Stage 1b).
-- Rotation signs should become `FixedSizeListArray` for variable SRHT rounds
+- Rotation signs should become `FixedSizeListArray` for variable SORF rounds
   (see Stage 1b).
 - Norms dtype should match input (f64 for f64; currently always f32).
 - `new_unchecked` visibility: restrict to `pub(crate)`.
 - f64-to-f32 truncation in encode path: needs comment or checked cast.
 - CENTROID_CACHE: document intentional unbounded-ness.
-- MSE bound caveat: note Theorem 1 is proved for Haar matrices, not SORF/SRHT.
+- MSE bound caveat: note Theorem 1 is proved for Haar matrices, not SORF.
 
 ### Stage 1b: Array representation cleanup (next)
 
-Stage 1b restructures the array representation to support variable SRHT rounds
+Stage 1b restructures the array representation to support variable SORF rounds
 and cleaner code/centroid modeling, and addresses outstanding review items from
 Stage 1a. The goal is to arrive at a wire format that we believe is ready for
 backward-compatibility guarantees — one we would be comfortable freezing — without
@@ -362,7 +333,7 @@ or benchmarking).
 | ------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | Dimension           | Any d ≥ 3 (non-power-of-2 zero-padded)          | **Power-of-2 only** (padding removed from TQ array)                                      |
 | Rotation signs      | `PrimitiveArray<u8>`, len = 3 × padded_dim bits | **`FixedSizeListArray`** with dtype `FixedSizeList(u8, dim, NonNullable)`, len = R        |
-| SRHT rounds         | Hard-coded to 3                                 | **Variable** (R = len of rotation signs array; default 3)                                 |
+| SORF rounds         | Hard-coded to 3                                 | **Variable** (R = len of rotation signs array; default 3)                                 |
 | Metadata            | Raw single byte                                 | **Structured** (format TBD; vtable refactor may subsume)                                  |
 | Norms dtype         | Always f32                                      | **Same-or-wider**: f64 for f64 input, f32 for f32/f16                                     |
 | `new_unchecked`     | `pub`                                           | **`pub(crate)`**                                                                          |
@@ -381,10 +352,10 @@ invariant simplifies.
 sign diagonals in a single flat `PrimitiveArray<u8>` that is implicitly 3-way
 partitioned, the rotation signs become a `FixedSizeListArray` where each element
 is a `FixedSizeList(u8, dim, NonNullable)` — one bitpacked diagonal per element.
-The array length R equals the number of SRHT rounds (default 3). Signs are
+The array length R equals the number of SORF rounds (default 3). Signs are
 stored in inverse-friendly (read-optimized) order, as in Stage 1a.
 
-This structure makes the number of SRHT rounds a property of the array shape
+This structure makes the number of SORF rounds a property of the array shape
 rather than a hard-coded constant. More rounds may improve mixing quality at
 lower dimensions or lower bit widths where the coordinate distribution deviates
 more from the analytical Beta — this should be benchmarked (see Experimental
@@ -415,10 +386,14 @@ structural transforms over arrays, not specific to any particular encoding. Like
 PDX (Stage 3), block decomposition is a layout concern that can wrap arbitrary
 child encodings.
 
-In the initial implementation, all blocks use TurboQuant MSE-only encoding with
-independent SORF rotations. However, the block decomposition itself is
-encoding-agnostic: each block is a child array that could in principle use a
-different encoding. This matters for future straggler-block support (see below).
+In the initial implementation, block decomposition is embedded inside
+`TurboQuantArray` — all blocks use TQ MSE-only encoding with independent SORF
+rotations, and TQ-specific children (centroids, rotation signs) are stored
+alongside the blocks. However, the *concept* of block decomposition is
+encoding-agnostic: a future refactor could extract it into a general-purpose
+`BlockDecomposedFSLArray` that wraps k independently-encoded child arrays. This
+matters for straggler-block support (see below), where the straggler may use a
+different encoding than the main blocks.
 
 For dimensions where the block-size rule produces a valid B (see table above),
 the scheme splits the input into k = d/B blocks of size B. Each block is a
@@ -456,7 +431,7 @@ decoders.
   MSE-only, but the structure allows heterogeneous child encodings in future.
 - **One shared centroid set** for all TQ blocks at the same B-dim distribution.
 - **Per-block SORF rotation signs.** Each block's SORF is independent (different
-  seed). Signs are R × B bits per block (R = number of SRHT rounds, default 3),
+  seed). Signs are R × B bits per block (R = number of SORF rounds, default 3),
   stored as a `FixedSizeListArray` with len = k × R.
 
 #### Straggler blocks (future work)
@@ -556,38 +531,24 @@ quantizer more to exploit. See Experimental plan.
 **SORF approximation.** The R-round SORF `HD_R·...·HD₂·HD₁` [5] provides
 log₂(B) butterfly stages per round × R rounds = R·log₂(B) total. At R=3
 (default): 18 at B=64, 24 at B=256, 27 at B=512. At R=5: 30 at B=64, 40 at
-B=256. This is a rough heuristic for mixing quality — [5] does not analyze
-convergence rate as a function of rounds × dimension. The variable-round
-rotation signs (Stage 1b) enable testing more rounds at smaller B or lower
-bit widths where mixing quality matters more. Empirical validation is needed.
+B=256. Counting butterfly stages is a rough heuristic for mixing quality with
+no theoretical backing: [5] proves near-unbiasedness for kernel approximation
+(Theorem 3) and pairwise near-orthogonality (Theorem 4), but does **not** prove
+distributional closeness to Haar measure, does not analyze convergence rate as
+a function of rounds × dimension, and leaves tight variance bounds for SORF as
+an open problem. The variable-round rotation signs (Stage 1b) enable testing
+more rounds at smaller B or lower bit widths where mixing quality matters more.
+Empirical validation is needed.
 
 **Fallback: dense rotation.** If SORF proves insufficient at the chosen B, use a
 B × B random orthogonal matrix (QR of Gaussian). Storage at B=256: 256 KB per
 block. For d=768 with k=3: 768 KB total. Amortizes for large columns (100K+
 vectors). Each block must have an **independent** rotation matrix.
 
-**Why not DCT?** The PDX implementation [pdx-impl] uses DCT (via FFTW) as a fast
-rotation for ADSampling. DCT is O(B log B) and invertible, but it is a **fixed
-structured transform**, not a random rotation — it does not produce the Beta
-marginal distribution `(1-x²)^((B-3)/2)` (in block dimension B) that
-TurboQuant's Max-Lloyd centroids are optimized for. ADSampling only needs
-approximate coordinate independence
-(for hypothesis-testing pruning), so DCT suffices there. TurboQuant needs a
-specific known marginal distribution, so only random orthogonal rotations (QR or
-SORF) are suitable.
-
-**Shared rotation with ADSampling (speculative).** Both TurboQuant and
-ADSampling apply a random orthogonal rotation to make coordinates independent.
-If we integrate ADSampling-style dimension pruning (see Stage 3), the same
-rotation could in principle serve both purposes. However, this is not automatic
-under the Stage 2 block-decomposed design: ADSampling is formulated around a
-single full-dimensional random projection whose coordinates can be sequentially
-sampled, whereas Stage 2 introduces per-block rotations and per-block norm
-weighting. Reusing one rotation across both systems should be treated as a
-**future research direction** that requires new analysis or direct empirical
-validation. If it proves viable, it would avoid rotating the data twice. The
-query would also need to be rotated at query time with the same stored
-transform.
+DCT and other fixed structured transforms are not suitable for TurboQuant's
+rotation (they do not produce the required Beta marginal). Sharing a rotation
+with ADSampling-style pruning is a speculative future direction. See Appendix C
+for details on both.
 
 #### Quantized-domain operations
 
@@ -631,7 +592,7 @@ cᵢ[j] = 0
 
 Store (all as internal children):
 codes (k × B per vector), norms (k per vector),
-centroids (2^b_mse, shared), SORF signs (k × R × B, shared; R = SRHT rounds)
+centroids (2^b_mse, shared), SORF signs (k × R × B, shared; R = SORF rounds)
 
 ```
 
@@ -794,7 +755,7 @@ If pursued, four strategies should be compared:
 | Strategy             | Theoretical           | Speed            | Storage         |
 | -------------------- | --------------------- | ---------------- | --------------- |
 | Per-block Gaussian   | Correct (Lemma 4 [1]) | O(B²)/block      | k×B²×4 bytes    |
-| Per-block SORF       | Approximate           | O(B log B)/block | k×3×B bits      |
+| Per-block SORF       | Approximate           | O(B log B)/block | k×R×B bits      |
 | Full-dim SORF        | Approximate           | O(d log d) total | R×d bits        |
 | MSE-only (no QJL)    | N/A                   | 0                | None            |
 
@@ -852,7 +813,7 @@ TurboQuantArray (dimension must be power-of-2)
 ```
 
 Stage 1b changes vs. 1a: power-of-2 dimension required (no padding), rotation
-signs become a `FixedSizeListArray` (one element per SRHT round, variable R),
+signs become a `FixedSizeListArray` (one element per SORF round, variable R),
 norms dtype matches input, metadata moves to a structured format. The codes
 child is `FixedSizeListArray` in Stages 1b-2 and may be swapped to `PDXArray`
 in Stage 3 — TurboQuant checks the child type at runtime, not via a metadata
@@ -925,7 +886,7 @@ without amortization when publishing ratios.
 
 SORF at B dimensions (heuristic — real cost is dominated by memory bandwidth
 and constant factors): R × B × log₂(B) butterflies + R × B sign applications
-per block (R = SRHT rounds, default 3; plus B normalization multiplies,
+per block (R = SORF rounds, default 3; plus B normalization multiplies,
 omitted). For k blocks, R=3:
 
 | B              | SORF FLOPs/block          | k (d=768) | Total MSE FLOPs |
@@ -1040,7 +1001,7 @@ heterogeneous per-block encodings.
 SORF, 4 child slots. The [original QJL PR][original-impl] was closed.
 
 **Phase 1b** (next) — Array representation cleanup: Restructure rotation signs
-as `FixedSizeListArray` (variable SRHT rounds), dtype-matching norms, restrict
+as `FixedSizeListArray` (variable SORF rounds), dtype-matching norms, restrict
 `new_unchecked` visibility, structured metadata (format pending vtable refactor).
 Address remaining review items from Phase 1a (see Stage 1a deferred items).
 
@@ -1090,9 +1051,13 @@ kernel using an IO-aware streaming pattern analogous to Flash-KMeans [6] — not
 the same algorithm (Flash-KMeans is GPU k-means), but a similar systems goal:
 reduce HBM traffic and avoid full materialization.
 For distance computation without full decode, a precomputed (2^b_mse)²-entry
-distance table fits in shared memory (1 KB at b_mse=4, 4 KB at b_mse=5); the
-kernel streams code bytes from HBM with gather-reduce accumulation, using
-4-8× less bandwidth than full float vectors.
+distance table fits in shared memory at low bit widths (1 KB at b_mse=4, 4 KB
+at b_mse=5). At the default b_mse=8, the table is 256² × 4 = 256 KB, which
+exceeds typical GPU shared memory (48-228 KB); the distance-table approach is
+therefore practical only at b ≤ 5 on GPU, or requires tiling/streaming for
+b=8. On CPU, the table fits in L2 at all bit widths. The kernel streams code
+bytes from HBM with gather-reduce accumulation, using 4-8× less bandwidth
+than full float vectors.
 
 At b_mse=8, codes are uint8 indices (0-255). Direct low-precision GEMM on
 hardware accelerators (tensor cores on GPU, byte-dot-product instructions on
@@ -1236,6 +1201,7 @@ arXiv:2603.09229, March 2026.
 [7] Pathare, T. et al. "TurboQuant: Implementation Corrections, Production
 Hardening, and Deployment Infrastructure." Eviox Tech Report v1.2.0,
 March 2026. https://eviox.tech/nexus/eviox_turboquant_corrections_study.pdf
+_(Note: this URL may require Eviox account access; not publicly indexed.)_
 
 [8] Community TurboQuant implementation reports (primarily KV-cache attention):
 
@@ -1258,3 +1224,78 @@ IEEE Trans. PAMI 36(4):744-755, 2014.
 
 [11] Jääsaari, E., Hyvönen, V., Ceccarello, M., Roos, T. and Aumüller, M.
 "VIBE: Vector Index Benchmark for Embeddings." arXiv:2505.17810, May 2025.
+
+## Appendix A: Reference implementation bugs and Theorem 1 constant
+
+### Reference implementation bugs
+
+The Eviox corrections study [7] identified six material bugs in the paper's
+reference Python implementation. The most critical is a mathematical error in
+the QJL scale factor: the reference code used `√(π/(2d))` instead of
+`√(π/2)/d` (Definition 1 in [1]), differing by a factor of √d (≈11× at d=128).
+Our [current implementation][current-impl] uses the correct formula
+(`sqrt(FRAC_PI_2) / padded_dim` in Rust), so this bug does **not** affect us.
+
+Other notable Eviox findings: (a) the reference code recomputes codebooks at
+every instantiation (we cache in a `DashMap`); (b) the reference uses float16
+for codebook distance computation, causing misassignment at small centroid
+spacings (we cast to f32 before quantization). See [7] for the full list.
+
+### Theorem 1 constant
+
+There is an ambiguity in the paper's notation for the MSE bound constant. The
+formal proof gives `(√3 · π / 2) · 4^{-b}` where the constant √3·π/2 ≈ 2.72.
+The Eviox report [7] (Item 7) deliberately adopts the alternative parsing
+`√(3π)/2 ≈ 1.535`, claiming it is "consistent with the formal proof." We treat
+`√3·π/2 ≈ 2.72` as the theorem constant because: (a) the paper's prose
+describes the constant as "≈ 2.7," which matches 2.72 not 1.535; and (b) the
+paper's reported distortion values (b=2: 0.117, b=3: 0.03) exceed the 1.535-
+based bound (b=2: 0.096, b=3: 0.024), ruling out `√(3π)/2` as a valid
+**upper** bound on the measured quantity. The definitive resolution requires
+checking the exact LaTeX grouping in the ICLR 2026 camera-ready proof. The
+paper's "explicit values" (0.36, 0.117, 0.03, 0.009) are the actual computed
+distortion of the optimal quantizer, not the bound itself — they are well below
+the 2.72/4^b bound.
+
+## Appendix B: Community findings on QJL
+
+Multiple independent TurboQuant implementations have repeatedly reported a
+practical finding for **KV-cache attention**: MSE-only often outperforms MSE+QJL
+at the same bit budget. The likely mechanism is a variance-bias tradeoff: QJL
+removes bias in raw inner-product estimation but adds variance, and the softmax
+nonlinearity amplifies variance more than it penalizes bias. In that setting,
+allocating all bits to MSE (more centroids, lower quantization variance) can beat
+splitting the budget between MSE + QJL. This behavior has been reported by
+multiple groups across Python, C, and Rust implementations [8].
+
+For ANN search, cosine ranking, and other non-softmax vector-search workloads,
+the evidence is currently less settled. MSE-only is still a reasonable default
+because it is simpler and better supported by the current implementation work,
+but the ANN question should be treated as empirical until evaluated on ANN
+datasets with recall@k and ranking metrics (see Experimental plan).
+
+## Appendix C: Alternative rotation strategies
+
+### Why not DCT?
+
+DCT is O(B log B) and invertible, but it is a **fixed structured transform**,
+not a random rotation — it does not produce the Beta marginal distribution
+`(1-x²)^((B-3)/2)` (in block dimension B) that TurboQuant's Max-Lloyd centroids
+are optimized for. ADSampling only needs approximate coordinate independence
+(for hypothesis-testing pruning), so a fixed orthogonal transform like DCT
+suffices there. TurboQuant needs a specific known marginal distribution, so only
+random orthogonal rotations (QR or SORF) are suitable.
+
+### Shared rotation with ADSampling (speculative)
+
+Both TurboQuant and ADSampling apply a random orthogonal rotation to make
+coordinates independent. If we integrate ADSampling-style dimension pruning
+(see Stage 3), the same rotation could in principle serve both purposes.
+However, this is not automatic under the Stage 2 block-decomposed design:
+ADSampling is formulated around a single full-dimensional random projection
+whose coordinates can be sequentially sampled, whereas Stage 2 introduces
+per-block rotations and per-block norm weighting. Reusing one rotation across
+both systems should be treated as a **future research direction** that requires
+new analysis or direct empirical validation. If it proves viable, it would avoid
+rotating the data twice. The query would also need to be rotated at query time
+with the same stored transform.
