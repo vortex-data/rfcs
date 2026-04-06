@@ -272,11 +272,12 @@ The threshold of 128 is conservative:
   implementation.
 - The block-size rule produces B=128 for d=128 (single block, no decomposition).
 
-The array-level minimum is d=4 (the smallest power-of-2 where the Beta
-exponent (d-3)/2 > 0; at d=2 the marginal is the arcsine distribution, which
-is unsuitable for Max-Lloyd centroids). The scheme minimum (128) controls
-automatic selection; smaller power-of-2 dimensions remain available via
-explicit construction.
+Whether TQ works well at all below d=64 is an open question — SORF mixing
+quality degrades rapidly at small dimensions, and the overhead ratio makes TQ
+increasingly uncompetitive vs. simpler scalar quantization. The scheme minimum
+of 128 is conservative; the experimental plan should determine the true
+minimum (likely in the 64-128 range). Padding modest amounts (e.g., 96 → 128)
+is probably acceptable; padding large fractions (e.g., 32 → 64) is not.
 
 The exact threshold should be validated experimentally — see Experimental plan.
 
@@ -373,12 +374,12 @@ power-of-2 TQ array with an independent B-dim SORF rotation.
 | --------------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
 | Block count           | k = 1 (single power-of-2 block)            | **k = d/B** (multiple blocks)                                               |
 | SORF dimension        | padded_dim (next power-of-2 ≥ dim)          | **B** (e.g., 256 for d=768)                                                  |
-| Rotation signs        | `FSL`, len = R, element dim = dim           | **`FSL`, len = k × R**, element dim = B                                      |
-| Centroids             | Computed for dim distribution               | **Computed for B-dim distribution** (different codebook!)                    |
+| Rotation signs        | `FSL`, len = R, element dim = padded_dim    | **`FSL`, len = k × R**, element dim = B                                      |
+| Centroids             | Computed for padded_dim distribution        | **Computed for B-dim distribution** (different codebook!)                    |
 | Norms child           | `PrimitiveArray<F>`, 1 per vector           | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
-| Codes list_size       | dim                                         | **k × B** (= d)                                                              |
+| Codes list_size       | padded_dim                                  | **k × B** (= d)                                                              |
 | Scheme compress()     | Single SORF → quantize                      | **Choose B → split → per-block normalize/rotate/quantize**                   |
-| Quantized dot product | Single sum over dim centroids               | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
+| Quantized dot product | Single sum over padded_dim centroids        | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
 | L2 norm readthrough   | O(1) — return stored norm                   | **O(k)** — compute √(Σ_k norm_k²)                                            |
 
 **Unchanged from Stage 1:** SORF construction (R-round HD, default R=3),
@@ -412,17 +413,26 @@ full-size B and the final block covers the remaining d - (k-1)×B dimensions.
 
 Because the block decomposition is encoding-agnostic (each block is an
 independently-encoded child array), the straggler block need not use the same
-encoding as the main blocks. Options include:
+encoding as the main blocks. For example, d=800 could be decomposed as 3×256
+= 768 TQ-encoded dimensions plus a 32-dimension straggler. SORF is unlikely
+to be effective at such small straggler dimensions (see Minimum dimension),
+so the straggler would use a different strategy:
 
-- **Padded TQ**: pad the straggler to the next power-of-2, encode with standard
-  TQ. Simple but wastes storage on the padded dimensions.
+- **Uncompressed**: store the straggler dimensions as raw floats. Simplest;
+  the overhead is modest (32 × 4 = 128 bytes per vector for a 32-dim
+  straggler).
+- **Padded TQ**: pad the straggler to the next power-of-2 (e.g., 32 → 64),
+  encode with standard TQ. Only viable if the padded dimension is large enough
+  for SORF to be effective (≥ 64, probably ≥ 128).
 - **Exact-rotation TQ**: use a dense random orthogonal matrix (QR of Gaussian)
   instead of SORF for the straggler block. Eliminates the power-of-2 constraint
-  at the cost of O(B_s²) rotation, where B_s is the straggler size. Acceptable
-  for small stragglers.
-- **Different encoding entirely**: the straggler could use scalar quantization,
-  PQ, or raw float storage. The block decomposition structure supports
+  at the cost of O(B_s²) rotation, where B_s is the straggler size.
+- **Scalar quantization or PQ**: the block decomposition structure supports
   heterogeneous child encodings.
+
+Note that for some dimensions (e.g., d=800), padding the entire vector to the
+next power-of-2 (1024) may be preferable to block decomposition with a
+straggler, depending on the overhead tradeoff. This is an empirical question.
 
 This is deferred: the block-size rule already handles all common embedding
 dimensions (768, 1024, 1536, etc.) without stragglers, and the rare
@@ -949,10 +959,9 @@ heterogeneous per-block encodings.
 ## Phasing
 
 **Phase 1** (in progress) — MSE-only single-block TurboQuant: Initial
-implementation merged as [PR #7269][current-impl]. Remaining: power-of-2
-dimension requirement, `FixedSizeListArray` rotation signs (variable SORF
-rounds), dtype-matching norms, structured metadata, and review items (see
-Stage 1: Remaining work).
+implementation merged as [PR #7269][current-impl]. Remaining:
+`FixedSizeListArray` rotation signs (variable SORF rounds), dtype-matching
+norms, structured metadata, and review items (see Stage 1: Remaining work).
 
 **Phase 2** — Block decomposition: Add block splitting for dimensions where a
 valid B exists (greatest power-of-2 ≥ 64 dividing d). Per-block norms stored as
