@@ -358,7 +358,7 @@ child encodings.
 In the initial implementation, block decomposition is embedded inside
 `TurboQuantArray` — all blocks use TQ MSE-only encoding with independent SORF
 rotations, and TQ-specific children (centroids, rotation signs) are stored
-alongside the blocks. However, the *concept* of block decomposition is
+alongside the blocks. However, the _concept_ of block decomposition is
 encoding-agnostic: a future refactor could extract it into a general-purpose
 `BlockDecomposedFSLArray` that wraps k independently-encoded child arrays. This
 matters for straggler-block support (see below), where the straggler may use a
@@ -370,17 +370,17 @@ power-of-2 TQ array with an independent B-dim SORF rotation.
 
 **Changes vs. Stage 1 (with TQ blocks):**
 
-| Aspect                | Stage 1                                     | Stage 2                                                                      |
-| --------------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
-| Block count           | k = 1 (single power-of-2 block)            | **k = d/B** (multiple blocks)                                               |
-| SORF dimension        | padded_dim (next power-of-2 ≥ dim)          | **B** (e.g., 256 for d=768)                                                  |
-| Rotation signs        | `FSL`, len = R, element dim = padded_dim    | **`FSL`, len = k × R**, element dim = B                                      |
-| Centroids             | Computed for padded_dim distribution        | **Computed for B-dim distribution** (different codebook!)                    |
-| Norms child           | `PrimitiveArray<F>`, 1 per vector           | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
-| Codes list_size       | padded_dim                                  | **k × B** (= d)                                                              |
-| Scheme compress()     | Single SORF → quantize                      | **Choose B → split → per-block normalize/rotate/quantize**                   |
-| Quantized dot product | Single sum over padded_dim centroids        | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
-| L2 norm readthrough   | O(1) — return stored norm                   | **O(k)** — compute √(Σ_k norm_k²)                                            |
+| Aspect                | Stage 1                                  | Stage 2                                                                      |
+| --------------------- | ---------------------------------------- | ---------------------------------------------------------------------------- |
+| Block count           | k = 1 (single power-of-2 block)          | **k = d/B** (multiple blocks)                                                |
+| SORF dimension        | padded_dim (next power-of-2 ≥ dim)       | **B** (e.g., 256 for d=768)                                                  |
+| Rotation signs        | `FSL`, len = R, element dim = padded_dim | **`FSL`, len = k × R**, element dim = B                                      |
+| Centroids             | Computed for padded_dim distribution     | **Computed for B-dim distribution** (different codebook!)                    |
+| Norms child           | `PrimitiveArray<F>`, 1 per vector        | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
+| Codes list_size       | padded_dim                               | **k × B** (= d)                                                              |
+| Scheme compress()     | Single SORF → quantize                   | **Choose B → split → per-block normalize/rotate/quantize**                   |
+| Quantized dot product | Single sum over padded_dim centroids     | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
+| L2 norm readthrough   | O(1) — return stored norm                | **O(k)** — compute √(Σ_k norm_k²)                                            |
 
 **Unchanged from Stage 1:** SORF construction (R-round HD, default R=3),
 Max-Lloyd algorithm, f32 internal quantization, slice/take semantics (per-row
@@ -731,12 +731,12 @@ validated.
 
 If pursued, four strategies should be compared:
 
-| Strategy             | Theoretical           | Speed            | Storage         |
-| -------------------- | --------------------- | ---------------- | --------------- |
-| Per-block Gaussian   | Correct (Lemma 4 [1]) | O(B²)/block      | k×B²×4 bytes    |
-| Per-block SORF       | Approximate           | O(B log B)/block | k×R×B bits      |
-| Full-dim SORF        | Approximate           | O(d log d) total | R×d bits        |
-| MSE-only (no QJL)    | N/A                   | 0                | None            |
+| Strategy           | Theoretical           | Speed            | Storage      |
+| ------------------ | --------------------- | ---------------- | ------------ |
+| Per-block Gaussian | Correct (Lemma 4 [1]) | O(B²)/block      | k×B²×4 bytes |
+| Per-block SORF     | Approximate           | O(B log B)/block | k×R×B bits   |
+| Full-dim SORF      | Approximate           | O(d log d) total | R×d bits     |
+| MSE-only (no QJL)  | N/A                   | 0                | None         |
 
 The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] is proved specifically
 for Gaussian. SORF for QJL is an additional approximation (the
@@ -820,19 +820,19 @@ replace 32 with 64 in the norms row — ratios decrease accordingly):
 
 **At b_mse=8 (default, near-lossless):**
 
-| d             | B    | k   | Per-vec bits            | Ratio | Notes                    |
-| ------------- | ---- | --- | ----------------------- | ----- | ------------------------ |
-| 768           | 256  | 3   | 3×256×8 + 3×32 = 6240   | 3.9×  | Block decomp; no padding |
-| 1024          | 1024 | 1   | 1024×8 + 32 = 8224      | 4.0×  | Single block (= current) |
-| 768 (padded)| 1024 | 1   | 1024×8 + 32 = 8224      | 3.0×  | Padded; 33% overhead     |
+| d            | B    | k   | Per-vec bits          | Ratio | Notes                    |
+| ------------ | ---- | --- | --------------------- | ----- | ------------------------ |
+| 768          | 256  | 3   | 3×256×8 + 3×32 = 6240 | 3.9×  | Block decomp; no padding |
+| 1024         | 1024 | 1   | 1024×8 + 32 = 8224    | 4.0×  | Single block (= current) |
+| 768 (padded) | 1024 | 1   | 1024×8 + 32 = 8224    | 3.0×  | Padded; 33% overhead     |
 
 **At b_mse=5 (32 centroids):**
 
-| d             | B    | k   | Per-vec bits            | Ratio | Notes                    |
-| ------------- | ---- | --- | ----------------------- | ----- | ------------------------ |
-| 768           | 256  | 3   | 3×256×5 + 3×32 = 3936   | 6.2×  | Block decomp; no padding |
-| 1024          | 1024 | 1   | 1024×5 + 32 = 5152      | 6.4×  | Single block (= current) |
-| 768 (padded)| 1024 | 1   | 1024×5 + 32 = 5152      | 4.8×  | Padded; 33% overhead     |
+| d            | B    | k   | Per-vec bits          | Ratio | Notes                    |
+| ------------ | ---- | --- | --------------------- | ----- | ------------------------ |
+| 768          | 256  | 3   | 3×256×5 + 3×32 = 3936 | 6.2×  | Block decomp; no padding |
+| 1024         | 1024 | 1   | 1024×5 + 32 = 5152    | 6.4×  | Single block (= current) |
+| 768 (padded) | 1024 | 1   | 1024×5 + 32 = 5152    | 4.8×  | Padded; 33% overhead     |
 
 Block decomposition improves the compression ratio at both bit widths. At b=8
 for d=768: from ~3.0× (padded) to ~3.9× (block decomp). At b=5 for d=768: from
@@ -986,7 +986,7 @@ For common model dimensions, the most promising configurations are:
 | ---------------------- | --------------------------- | -------------------------------------------------------------------------- |
 | 512, 1024, 2048, 4096  | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
 | 768, 1536, 3072        | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
-| No qualifying B (rare) | Padded single-block         | Internal zero-padding to next power-of-2, single SORF.                    |
+| No qualifying B (rare) | Padded single-block         | Internal zero-padding to next power-of-2, single SORF.                     |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
@@ -1121,11 +1121,11 @@ TurboQuant.
 
 **Incremental shipping:**
 
-| Stage     | Ships to users?  | Reads prior stage files?    | Notes                              |
-| --------- | ---------------- | --------------------------- | ---------------------------------- |
-| 1 (MSE)   | Yes              | N/A (first stable version)  | Single block, variable SORF rounds |
-| 2 (blocks) | Yes             | Yes (k=1 is identical)      | k>1 files need Stage 2+ decoder    |
-| 3 (PDX)   | Yes              | Yes (FSL codes still work)  | PDX codes need PDXArray registered |
+| Stage      | Ships to users? | Reads prior stage files?   | Notes                              |
+| ---------- | --------------- | -------------------------- | ---------------------------------- |
+| 1 (MSE)    | Yes             | N/A (first stable version) | Single block, variable SORF rounds |
+| 2 (blocks) | Yes             | Yes (k=1 is identical)     | k>1 files need Stage 2+ decoder    |
+| 3 (PDX)    | Yes             | Yes (FSL codes still work) | PDX codes need PDXArray registered |
 
 Each stage is independently shippable. Users can upgrade incrementally. Files
 written by earlier stages are always readable by later decoders.
