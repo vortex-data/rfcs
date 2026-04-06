@@ -2,21 +2,25 @@
 
 **Authors:** Will Manning
 **Status:** Proposal
-**Date:** 2026-04-02
+**Date:** 2026-04-02 (updated 2026-04-06)
 
 ## Summary
 
 We propose evolving the [TurboQuant vector quantization encoding][current-impl]
-in three stages:
+in stages:
 
-1. **MSE-only TurboQuant** (immediate): merge the current PR as an MSE-only
-   encoding with d ≥ 128 scheme selection (see Minimum dimension; smaller d
-   available via explicit construction). This is a complete, self-contained
-   building block.
+1. **MSE-only TurboQuant** — a complete, self-contained building block.
+   - **Stage 1a** (merged — [PR #7269][current-impl]): MSE-only encoding with
+     8-bit default, d ≥ 128 scheme selection, and 3-round SORF rotation. The
+     [original QJL-inclusive PR][original-impl] was closed in favor of this
+     MSE-only approach.
+   - **Stage 1b** (next): restructure rotation signs as `FixedSizeListArray` to
+     support variable SRHT rounds, and address outstanding review items from
+     Stage 1a.
 2. **Block decomposition** (next): for dimensions where a valid B exists
    (greatest power-of-2 ≥ 64 dividing d), split into blocks of size B. For
    power-of-2 dimensions, B = d (single block). Dimensions with no qualifying
-   B fall back to padded single-block. Per-block norms stored as internal
+   B fall back to scheme-level padding to power-of-2. Per-block norms stored as internal
    children.
 3. **PDX layout** (later): transpose codes into dimension-major order within
    groups of 64 vectors for SIMD scan performance.
@@ -28,7 +32,8 @@ For ANN ranking and vector-search workloads, the evidence is currently less
 complete, so QJL should remain an empirical question rather than a settled
 conclusion.
 
-[current-impl]: https://github.com/vortex-data/vortex/pull/7167
+[current-impl]: https://github.com/spiraldb/vortex/pull/7269
+[original-impl]: https://github.com/spiraldb/vortex/pull/7167
 
 ## Background
 
@@ -75,23 +80,24 @@ simple deployment, and theoretical guarantees matter most, while PQ or OPQ may
 still win empirically when a learned vector codebook can exploit dataset-specific
 structure.
 
-### Current Vortex implementation
+### Current Vortex implementation (post-Stage 1a)
 
-Our [current implementation][current-impl] (Rust, in the `vortex-tensor` crate)
-implements TurboQuant as a Vortex array encoding that compresses
-`FixedSizeList<float>` arrays — the storage format of `Vector` and
-`FixedShapeTensor` extension types. Key design choices and characteristics:
+The [current implementation][current-impl] (Rust, in the `vortex-tensor` crate,
+merged via [PR #7269][current-impl]) implements MSE-only TurboQuant as a Vortex
+array encoding that compresses `FixedSizeList<float>` arrays — the storage
+format of `Vector` and `FixedShapeTensor` extension types. The
+[original QJL-inclusive PR][original-impl] was closed in favor of this MSE-only
+approach. Key design choices and characteristics:
 
 **Rotation.** Instead of the paper's O(d²) QR rotation, we use a 3-round
-Structured Orthogonal Random Features (SORF) transform `HD₃·HD₂·HD₁` [5] for
-both the MSE rotation and the QJL projection, giving O(d) storage (3d sign bits,
-bitpacked) and O(d log d) per-vector. The rotation signs are stored as a
-bitpacked child array rather than recomputed from a seed at decode time. The
-3-round SORF was introduced for kernel approximation [5] and approximates a
-random orthogonal matrix. It is distinct from the single-round SRHT (`R·H·D`)
-analyzed by Tropp [3] and the FJLT (`P·H·D`) of Ailon-Chazelle [2], both of
-which are dimensionality-reducing projections rather than rotation
-approximations.
+Structured Orthogonal Random Features (SORF) transform `HD₃·HD₂·HD₁` [5],
+giving O(d) storage (3d sign bits, bitpacked) and O(d log d) per-vector. The
+rotation signs are stored as a bitpacked child array rather than recomputed from
+a seed at decode time. The 3-round SORF was introduced for kernel approximation
+[5] and approximates a random orthogonal matrix. It is distinct from the
+single-round SRHT (`R·H·D`) analyzed by Tropp [3] and the FJLT (`P·H·D`) of
+Ailon-Chazelle [2], both of which are dimensionality-reducing projections rather
+than rotation approximations.
 
 **Centroids.** Max-Lloyd centroids are computed via numerical integration
 (trapezoid rule, 1000 points per interval) of the marginal Beta distribution at
@@ -99,30 +105,34 @@ the padded dimension, using the `HalfIntExponent` type for exact integer/half-
 integer exponent arithmetic. Centroids are cached in a global `DashMap` keyed by
 `(dimension, bit_width)` and stored as a shared `PrimitiveArray<f32>` child.
 
-**Array structure.** The `TurboQuantArray` stores up to 7 child slots: codes
+**Array structure.** The `TurboQuantArray` stores 4 child slots: codes
 (`FixedSizeListArray<u8>`, one per vector, list_size = padded_dim), norms
-(`PrimitiveArray<f32>`), centroids (shared), MSE rotation signs (shared,
-bitpacked), and optionally 3 QJL children (signs, residual norms, QJL rotation
-signs). Codes are stored as u8 centroid indices; the cascade compressor
-(BitPacked encoding) handles packing to the actual bit width on disk.
+(`PrimitiveArray<f32>`), centroids (`PrimitiveArray<f32>`, shared), and MSE
+rotation signs (`PrimitiveArray<u8>`, shared, bitpacked). Codes are stored as
+u8 centroid indices; the cascade compressor (BitPacked encoding) handles packing
+to the actual bit width on disk.
 
 **Compute pushdowns.** Slice and take propagate to per-row children (codes,
 norms) while sharing rotation signs and centroids. Quantized cosine similarity
 and dot product operate directly on codes and centroids without decompression.
 L2 norm returns the stored norm directly (O(1) readthrough).
 
-**Compression scheme (pre-Stage 1).** `TurboQuantScheme` implements the `Scheme`
-trait for the BtrBlocks cascading compressor. It matches `Vector` and
-`FixedShapeTensor` extension arrays with non-nullable float elements and
-dimension ≥ 3 (to be raised to ≥ 128 in Stage 1; see Minimum dimension below),
-using the default config (5-bit QJL = 4-bit MSE + 1-bit QJL, seed 42).
+**Compression scheme.** `TurboQuantScheme` implements the `Scheme` trait for the
+BtrBlocks cascading compressor. It matches `Vector` and `FixedShapeTensor`
+extension arrays with non-nullable float elements and dimension ≥ 128,
+using 8-bit MSE-only as the default (256 centroids, near-lossless with
+normalized MSE ~4e-5, achieving ~4× compression on f32).
 
-**Input handling (pre-Stage 1).** All float types (f16, f32, f64) are converted
-to f32 before quantization. Per-vector L2 norms are computed and stored as f32
-(Stage 1 changes this to dtype-matching: f64 for f64 input). Non-power-of-2
+**Input handling.** All float types (f16, f32, f64) are converted to f32 before
+quantization. Per-vector L2 norms are computed and stored as f32. Non-power-of-2
 dimensions are zero-padded to the next power of 2 for SORF compatibility. The
-minimum dimension is 3 (d=2 causes a singularity in the Beta distribution
-exponent).
+minimum dimension for scheme auto-selection is 128; the array-level minimum
+remains 3 (d=2 causes a singularity in the Beta distribution exponent).
+
+**Metadata.** Currently serialized as a raw single byte (bit_width). This lacks
+framing and versioning and cannot be extended backward-compatibly; migrating to
+a structured/extensible format is a Stage 1b item (the upcoming vtable refactor
+may eliminate the need for separate serialized metadata entirely).
 
 ### Reference implementation bugs
 
@@ -171,16 +181,20 @@ because it is simpler and better supported by the current implementation work,
 but the ANN question should be treated as empirical until evaluated on ANN
 datasets with recall@k and ranking metrics (see Experimental plan).
 
-### Current limitations
+### Current limitations (Stage 1a)
 
-The SORF requires power-of-2 input dimension. For non-power-of-2 dimensions
-(e.g., 768-d embeddings), the input is zero-padded to the next power of 2
-(1024). This causes:
+The SORF requires power-of-2 input dimension. In Stage 1a, non-power-of-2
+dimensions (e.g., 768-d embeddings) are zero-padded internally to the next
+power of 2 (1024). This causes:
 
 - **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful
   (equivalently, 25% of stored codes are wasted on zero-padded dimensions).
 - **No scan-optimized layout**: row-major code storage prevents SIMD-over-vectors
   distance computation.
+
+Stage 1b eliminates internal padding by requiring power-of-2 dimensions at
+the TQ array level. Stage 2's block decomposition then handles non-power-of-2
+dimensions (e.g., 768 → 3×256 blocks) without padding waste.
 
 ### PDX
 
@@ -233,9 +247,9 @@ quantization with the computational savings of early termination.
 ### Block size strategy
 
 For each dimension d, choose B = the greatest power-of-2 ≥ 64 that evenly
-divides d. If no such B exists (e.g., d=96), fall back to the padded
-single-block path from Stage 1. For common embedding dimensions, this rule
-always produces a valid B and eliminates padding entirely:
+divides d. If no such B exists (e.g., d=96), the scheme pads to the next
+power-of-2 before constructing a single-block TQ array. For common embedding
+dimensions, this rule always produces a valid B and avoids padding entirely:
 
 | Dimension d | Block size B | Blocks k | Notes                        |
 | ----------- | ------------ | -------- | ---------------------------- |
@@ -254,11 +268,13 @@ always produces a valid B and eliminates padding entirely:
   No block decomposition overhead, no per-block norms. These dimensions are
   already well-served by the current design.
 - **Non-power-of-2 dimensions** (768, 1536, 3072) decompose into k=3 blocks at
-  B=256 or B=512. No padding waste (vs. 33% for the padded single-block path).
+  B=256 or B=512. No padding waste.
   Each block has its own SORF rotation and shares a single centroid set.
 - **No qualifying B is rare** for common embedding dimensions. Dimensions where
-  no power-of-2 ≥ 64 divides d (e.g., 96, 100) fall back to Stage 1's padded
-  single-block path. These are uncommon in modern model architectures.
+  no power-of-2 ≥ 64 divides d (e.g., 96, 100) are padded at the scheme level
+  to the next power-of-2. A future straggler-block extension could handle these
+  without padding (see Stage 2: Straggler blocks). These dimensions are uncommon
+  in modern model architectures.
 - **The SORF approximation at B=256+ is expected to be adequate**: 3 rounds at
   B=256 provides 24 butterfly stages, and at B=512 provides 27 — both comparable
   to the current B=1024 (30 stages). This needs empirical validation; see
@@ -272,7 +288,9 @@ efficiency:
 
 - **SORF mixing quality:** 3-round SORF at d=64 provides only 18 butterfly
   stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
-  more from the analytical Beta, making Max-Lloyd centroids less optimal.
+  more from the analytical Beta, making Max-Lloyd centroids less optimal. Stage
+  1b's variable-round rotation signs (see Stage 1b) may allow compensating with
+  additional SRHT rounds at lower dimensions — this should be benchmarked.
 - **Practical MSE:** At smaller d, the SORF mixing quality and coordinate-
   independence approximations are weaker, potentially worsening practical
   quantization quality beyond what the dimension-free theoretical bound
@@ -290,88 +308,189 @@ The threshold of 128 is conservative:
   implementation.
 - The block-size rule produces B=128 for d=128 (single block, no decomposition).
 
-The array-level minimum remains d=3 (for the Beta distribution to be
-well-defined), so users can still explicitly construct a TurboQuantArray at
-smaller dimensions. The scheme minimum (128) controls automatic selection only.
+In Stage 1a, the array-level minimum is d=3 (for the Beta distribution to be
+well-defined). In Stage 1b, the TQ array requires power-of-2 dimensions, making
+the array minimum d=4 (the smallest power-of-2 where the Beta exponent
+(d-3)/2 > 0). The scheme minimum (128) controls automatic selection; smaller
+power-of-2 dimensions remain available via explicit construction.
 
 The exact threshold should be validated experimentally — see Experimental plan.
 
-### Stage 1: MSE-only TurboQuant (immediate — split from current PR)
+### Stage 1a: MSE-only TurboQuant (merged — [PR #7269][current-impl])
 
-Split the [current PR][current-impl] to extract and merge the MSE-only subset.
-The QJL code can be preserved on a separate branch for Phase 4.
+Stage 1a is the MSE-only baseline, now merged. It provides a complete encoding
+for all dimensions ≥ 3 (automatic scheme selection for d ≥ 128 only; Stage 1b
+restricts to power-of-2 dimensions). Key properties:
 
-**Changes vs. current PR:**
+- **MSE-only, no QJL.** 4 child slots: codes, norms, centroids, rotation_signs.
+  The [original QJL-inclusive PR][original-impl] was closed; QJL code can be
+  resurrected from that branch if Phase 4 is pursued.
+- **8-bit default** (256 centroids). Near-lossless: normalized MSE ~4e-5,
+  ~4× compression on f32. Lower bit widths available via `TurboQuantConfig`.
+- **3-round SORF rotation**, Max-Lloyd centroids. Non-power-of-2 dimensions
+  are zero-padded internally (Stage 1b removes this; see below).
+- **Scheme auto-selection** for dimension ≥ 128 (see Minimum dimension).
+- **Compute pushdowns**: slice/take/scalar_at, quantized cosine similarity and
+  dot product, compression scheme integration.
+- **Metadata**: raw single byte (bit_width only) — no framing or versioning.
 
-| Aspect         | Current PR                                  | Stage 1                                               |
-| -------------- | ------------------------------------------- | ----------------------------------------------------- |
-| QJL support    | Full (encode, decode, QJL slots, QJL tests) | **Removed**                                           |
-| Array slots    | 7 (4 MSE + 3 QJL)                           | **4** (codes, norms, centroids, rotation_signs)       |
-| Scheme default | 5-bit QJL (4-bit MSE + 1-bit QJL)           | **5-bit MSE-only** (32 centroids)                     |
-| Norms dtype    | Always f32                                  | **Same-or-wider**: f64 for f64 input, f32 for f32/f16 |
-| Metadata       | `has_qjl: bool`                             | **Removed** (always MSE-only)                         |
-| Scheme minimum | dimension ≥ 3                               | **dimension ≥ 128** (see Minimum dimension below)     |
+**Known items deferred to Stage 1b:**
 
-**Unchanged from current PR:** SORF rotation, Max-Lloyd centroids,
-zero-padding for non-power-of-2, slice/take/scalar_at pushdowns, quantized
-cosine similarity and dot product, compression scheme integration.
+- Require power-of-2 dimensions; remove internal zero-padding logic
+  (see Stage 1b).
+- Metadata needs structured format (vtable refactor may subsume; see Stage 1b).
+- Rotation signs should become `FixedSizeListArray` for variable SRHT rounds
+  (see Stage 1b).
+- Norms dtype should match input (f64 for f64; currently always f32).
+- `new_unchecked` visibility: restrict to `pub(crate)`.
+- f64-to-f32 truncation in encode path: needs comment or checked cast.
+- CENTROID_CACHE: document intentional unbounded-ness.
+- MSE bound caveat: note Theorem 1 is proved for Haar matrices, not SORF/SRHT.
 
-**Added to metadata (for forward compat):** `block_size: u32` (always =
-padded_dim), `num_blocks: u32` (always = 1). These fields are inert in Stage 1
-but enable Stage 2 decoders to read Stage 1 files. (PDX is handled via the
-codes child type, not a metadata flag — see Stage 3.)
+### Stage 1b: Array representation cleanup (next)
 
-This is a complete, useful encoding for all dimensions ≥ 3 (automatic scheme
-selection applies only for d ≥ 128; smaller d remains available via explicit
-array construction). Power-of-2 dimensions
-have zero padding waste; non-power-of-2 dimensions have the padding overhead
-described above.
+Stage 1b restructures the array representation to support variable SRHT rounds
+and cleaner code/centroid modeling, and addresses outstanding review items from
+Stage 1a. The goal is to arrive at a wire format that we believe is ready for
+backward-compatibility guarantees — one we would be comfortable freezing — without
+formally committing to stability yet (in case we discover issues during Stage 2
+or benchmarking).
+
+**Changes vs. Stage 1a:**
+
+| Aspect              | Stage 1a (current)                              | Stage 1b                                                                                  |
+| ------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Dimension           | Any d ≥ 3 (non-power-of-2 zero-padded)          | **Power-of-2 only** (padding removed from TQ array)                                      |
+| Rotation signs      | `PrimitiveArray<u8>`, len = 3 × padded_dim bits | **`FixedSizeListArray`** with dtype `FixedSizeList(u8, dim, NonNullable)`, len = R        |
+| SRHT rounds         | Hard-coded to 3                                 | **Variable** (R = len of rotation signs array; default 3)                                 |
+| Metadata            | Raw single byte                                 | **Structured** (format TBD; vtable refactor may subsume)                                  |
+| Norms dtype         | Always f32                                      | **Same-or-wider**: f64 for f64 input, f32 for f32/f16                                     |
+| `new_unchecked`     | `pub`                                           | **`pub(crate)`**                                                                          |
+
+**Power-of-2 dimension requirement.** The TQ array requires its dimension to be
+a power of 2 (enforced at construction time). This eliminates the zero-padding
+logic, the `padded_dim` vs `dimension` distinction, and the "trailing structural
+zeros" edge case in the wire format. Non-power-of-2 dimensions are handled
+*outside* the TQ array: Stage 2's block decomposition splits them into
+power-of-2 blocks (e.g., 768 → 3×256), and the rare "no qualifying B" case
+(e.g., d=96) is padded at the scheme/compressor level before constructing the
+TQ array. Since `codes.list_size` always equals `dimension`, the decoder
+invariant simplifies.
+
+**Rotation signs as `FixedSizeListArray`.** Rather than storing all rotation
+sign diagonals in a single flat `PrimitiveArray<u8>` that is implicitly 3-way
+partitioned, the rotation signs become a `FixedSizeListArray` where each element
+is a `FixedSizeList(u8, dim, NonNullable)` — one bitpacked diagonal per element.
+The array length R equals the number of SRHT rounds (default 3). Signs are
+stored in inverse-friendly (read-optimized) order, as in Stage 1a.
+
+This structure makes the number of SRHT rounds a property of the array shape
+rather than a hard-coded constant. More rounds may improve mixing quality at
+lower dimensions or lower bit widths where the coordinate distribution deviates
+more from the analytical Beta — this should be benchmarked (see Experimental
+plan: "Test 3, 4, 5 SORF rounds at each B").
+
+**Codes and centroids remain separate children.** The codes
+(`FixedSizeListArray<u8>`) and centroids (`PrimitiveArray<f32>`) remain as
+independent child slots. However, operations that need a unified view (e.g.,
+`canonicalize`) can construct a `DictArray` from codes and centroids — e.g.,
+`DictArray::new_unchecked(codes, centroids)` — and then apply the inverse
+rotation to produce a canonical decoded form.
+
+**Forward-compatible metadata:** The metadata should expose `block_size: u32`
+(always = dimension in Stage 1b), `num_blocks: u32` (always = 1),
+`num_rounds: u32` (= R, default 3). These fields are inert in Stage 1b but
+enable Stage 2 decoders to read Stage 1b files. The serialization format is TBD
+— the upcoming vtable refactor may make the current raw-byte metadata
+unnecessary by encoding these fields directly in the vtable. If the refactor
+does not land first, a structured format (e.g., protobuf) is needed. (PDX is
+handled via the codes child type, not a metadata flag — see Stage 3.)
 
 ### Stage 2: Block decomposition
 
+Block decomposition splits a `FixedSizeListArray` vertically by dimension into
+fixed-size blocks, each encoded independently. This is structurally analogous
+to `ChunkedArray` (which splits horizontally by rows) — both are general-purpose
+structural transforms over arrays, not specific to any particular encoding. Like
+PDX (Stage 3), block decomposition is a layout concern that can wrap arbitrary
+child encodings.
+
+In the initial implementation, all blocks use TurboQuant MSE-only encoding with
+independent SORF rotations. However, the block decomposition itself is
+encoding-agnostic: each block is a child array that could in principle use a
+different encoding. This matters for future straggler-block support (see below).
+
 For dimensions where the block-size rule produces a valid B (see table above),
-split into blocks of size B. Each full block gets an independent B-dim SORF
-rotation. Dimensions with no qualifying B (e.g., d=96) remain on the padded
-single-block path from Stage 1.
+the scheme splits the input into k = d/B blocks of size B. Each block is a
+power-of-2 TQ array with an independent B-dim SORF rotation.
 
-**Changes vs. Stage 1:**
+**Changes vs. Stage 1b (with TQ blocks):**
 
-| Aspect                | Stage 1                              | Stage 2                                                                      |
-| --------------------- | ------------------------------------ | ---------------------------------------------------------------------------- |
-| Block count           | k = 1 (single block at padded_dim)   | **k = d/B** (multiple blocks, no padding)                                    |
-| SORF dimension        | padded_dim (e.g., 1024 for d=768)    | **B** (e.g., 256 for d=768)                                                  |
-| Rotation signs        | Single set, len = 3 × padded_dim     | **k sets**, len = k × 3 × B                                                  |
-| Centroids             | Computed for padded_dim distribution | **Computed for B-dim distribution** (different codebook!)                    |
-| Norms child           | `PrimitiveArray<F>`, 1 per vector    | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
-| Codes list_size       | padded_dim                           | **k × B** (= d for no-straggler dims)                                        |
-| Scheme compress()     | Pad → single SORF → quantize         | **Choose B → split → per-block normalize/rotate/quantize**                   |
-| Quantized dot product | Single sum over padded_dim centroids | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
-| L2 norm readthrough   | O(1) — return stored norm            | **O(k)** — compute √(Σ_k norm_k²)                                            |
-| Zero-padding waste    | Up to 33% (768→1024)                 | **Zero** for common dims                                                     |
+| Aspect                | Stage 1b                                    | Stage 2                                                                      |
+| --------------------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
+| Block count           | k = 1 (single power-of-2 block)            | **k = d/B** (multiple blocks)                                               |
+| SORF dimension        | dim (power-of-2)                            | **B** (e.g., 256 for d=768)                                                  |
+| Rotation signs        | `FSL`, len = R, element dim = dim           | **`FSL`, len = k × R**, element dim = B                                      |
+| Centroids             | Computed for dim distribution               | **Computed for B-dim distribution** (different codebook!)                    |
+| Norms child           | `PrimitiveArray<F>`, 1 per vector           | **`PrimitiveArray<F>` (k=1) or `FixedSizeListArray<F>` (k>1)**, same dtype F |
+| Codes list_size       | dim                                         | **k × B** (= d)                                                              |
+| Scheme compress()     | Single SORF → quantize                      | **Choose B → split → per-block normalize/rotate/quantize**                   |
+| Quantized dot product | Single sum over dim centroids               | **Per-block weighted sum** (Σ_k norm_a_k · norm_b_k · unit_dot_k)            |
+| L2 norm readthrough   | O(1) — return stored norm                   | **O(k)** — compute √(Σ_k norm_k²)                                            |
 
-**Unchanged from Stage 1:** SORF construction (3-round HD), Max-Lloyd algorithm,
-f32 internal quantization, slice/take semantics (per-row data sliced, shared
-data cloned), bitpacked rotation sign storage, compression scheme trait.
+**Unchanged from Stage 1b:** SORF construction (R-round HD, default R=3),
+Max-Lloyd algorithm, f32 internal quantization, slice/take semantics (per-row
+data sliced, shared data cloned), `FixedSizeListArray` rotation sign storage,
+compression scheme trait.
 
 **For power-of-2 dimensions**: B = d, k = 1. The encoding produces an identical
-wire format to Stage 1 (single norm, single SORF, single codes block). A Stage 2
-encoder writing k=1 data is fully backward-compatible with Stage 1 decoders.
+wire format to Stage 1b (single norm, single SORF, single codes block). A
+Stage 2 encoder writing k=1 data is fully backward-compatible with Stage 1b
+decoders.
 
 **Key design properties:**
 
-- **Self-contained.** The TurboQuant array handles block splitting, per-block
-  normalization, rotation, and quantization internally. No parent cooperation
-  is needed.
-- **One shared centroid set** for all blocks at the same B-dim distribution.
+- **Structural, not encoding-specific.** The block decomposition itself is a
+  vertical split of a `FixedSizeListArray` by dimension. Each block is an
+  independently-encoded child. In the initial implementation all blocks are TQ
+  MSE-only, but the structure allows heterogeneous child encodings in future.
+- **One shared centroid set** for all TQ blocks at the same B-dim distribution.
 - **Per-block SORF rotation signs.** Each block's SORF is independent (different
-  seed). Signs are 3 × B bits per block.
+  seed). Signs are R × B bits per block (R = number of SRHT rounds, default 3),
+  stored as a `FixedSizeListArray` with len = k × R.
+
+#### Straggler blocks (future work)
+
+The current block-size rule requires B to evenly divide d, so dimensions with no
+qualifying power-of-2 B ≥ 64 (e.g., d=96) fall back to scheme-level padding.
+A natural extension is **straggler blocks**: allow k blocks where k-1 are
+full-size B and the final block covers the remaining d - (k-1)×B dimensions.
+
+Because the block decomposition is encoding-agnostic (each block is an
+independently-encoded child array), the straggler block need not use the same
+encoding as the main blocks. Options include:
+
+- **Padded TQ**: pad the straggler to the next power-of-2, encode with standard
+  TQ. Simple but wastes storage on the padded dimensions.
+- **Exact-rotation TQ**: use a dense random orthogonal matrix (QR of Gaussian)
+  instead of SORF for the straggler block. Eliminates the power-of-2 constraint
+  at the cost of O(B_s²) rotation, where B_s is the straggler size. Acceptable
+  for small stragglers.
+- **Different encoding entirely**: the straggler could use scalar quantization,
+  PQ, or raw float storage. The block decomposition structure supports
+  heterogeneous child encodings.
+
+This is deferred: the block-size rule already handles all common embedding
+dimensions (768, 1024, 1536, etc.) without stragglers, and the rare
+no-qualifying-B case (d=96) is adequately served by scheme-level padding for
+now.
 
 #### Norm architecture
 
 Per-block norms are stored as an **internal child** of the TurboQuant array:
 
 - For k = 1 (power-of-2 dims): `PrimitiveArray<F>` with len = num_rows
-  (identical to Stage 1's single-norm layout).
+  (identical to Stage 1b's single-norm layout).
 - For k > 1: `FixedSizeListArray<F>` with list_size = k, len = num_rows.
 
 The norm dtype `F` matches or widens the input element type:
@@ -434,11 +553,13 @@ The actual MSE may depend on block dimension B: at larger B the coordinate
 distribution is more concentrated (variance ~1/B), giving the Max-Lloyd
 quantizer more to exploit. See Experimental plan.
 
-**SORF approximation.** The 3-round SORF `HD₃·HD₂·HD₁` [5] provides log₂(B)
-butterfly stages per round × 3 rounds = 3·log₂(B) total (18 at B=64, 24 at
-B=256, 27 at B=512).
-This is a rough heuristic for mixing quality — [5] does not analyze convergence
-rate as a function of rounds × dimension. Empirical validation is needed.
+**SORF approximation.** The R-round SORF `HD_R·...·HD₂·HD₁` [5] provides
+log₂(B) butterfly stages per round × R rounds = R·log₂(B) total. At R=3
+(default): 18 at B=64, 24 at B=256, 27 at B=512. At R=5: 30 at B=64, 40 at
+B=256. This is a rough heuristic for mixing quality — [5] does not analyze
+convergence rate as a function of rounds × dimension. The variable-round
+rotation signs (Stage 1b) enable testing more rounds at smaller B or lower
+bit widths where mixing quality matters more. Empirical validation is needed.
 
 **Fallback: dense rotation.** If SORF proves insufficient at the chosen B, use a
 B × B random orthogonal matrix (QR of Gaussian). Storage at B=256: 256 KB per
@@ -510,7 +631,7 @@ cᵢ[j] = 0
 
 Store (all as internal children):
 codes (k × B per vector), norms (k per vector),
-centroids (2^b_mse, shared), SORF signs (k × 3 × B, shared)
+centroids (2^b_mse, shared), SORF signs (k × R × B, shared; R = SRHT rounds)
 
 ```
 
@@ -529,10 +650,11 @@ x̃ = concat(x̂₀, ..., x̂ₖ₋₁)
 ### Stage 3: PDX dimension-major layout
 
 Introduce a new `PDXArray` encoding type that wraps any `FixedSizeListArray`
-with a dimension-major layout within groups of 64 vectors [4]. PDXArray is
-**not TurboQuant-specific** — it is a general-purpose layout optimization for
-any FixedSizeList of scalar elements (raw float vectors, scalar-quantized
-vectors, TurboQuant codes, etc.).
+with a dimension-major layout within groups of 64 vectors [4]. Like block
+decomposition (Stage 2), PDXArray is a **structural transform** over
+`FixedSizeListArray`, not specific to any particular encoding — it is a
+general-purpose layout optimization for any FixedSizeList of scalar elements
+(raw float vectors, scalar-quantized vectors, TurboQuant codes, etc.).
 
 **Changes vs. Stage 2:**
 
@@ -673,50 +795,75 @@ If pursued, four strategies should be compared:
 | -------------------- | --------------------- | ---------------- | --------------- |
 | Per-block Gaussian   | Correct (Lemma 4 [1]) | O(B²)/block      | k×B²×4 bytes    |
 | Per-block SORF       | Approximate           | O(B log B)/block | k×3×B bits      |
-| Full-dim padded SORF | Approximate           | O(d log d) total | 3×padded_d bits |
+| Full-dim SORF        | Approximate           | O(d log d) total | R×d bits        |
 | MSE-only (no QJL)    | N/A                   | 0                | None            |
 
 The paper's QJL uses Gaussian S (not SORF); Lemma 4 [1] is proved specifically
 for Gaussian. SORF for QJL is an additional approximation (the
-[current implementation][current-impl] uses SORF for QJL). Per-block QJL can
+[original QJL implementation][original-impl] used SORF for QJL). Per-block QJL can
 incur up to d/B times larger variance bound than full-dimension QJL (Lemma 4
 [1]), depending on how query and residual energy are distributed across blocks.
 
 Community reports indicate MSE-only often wins for KV-cache attention at all
 tested bit widths [8]. Whether this extends to ANN ranking is an empirical
 question (see Experimental plan); QJL may not be worth the complexity. Note:
-the [current PR][current-impl] flags a known SORF-related QJL bias for
-non-power-of-2 padded dimensions (#7245); MSE-only Stage 1 avoids this path.
+the [original QJL PR][original-impl] flagged a known SORF-related QJL bias for
+non-power-of-2 padded dimensions (#7245); the merged MSE-only encoding avoids
+this path.
 
 ## Array layout
 
-### Stage 1 (MSE-only single block)
+### Stage 1a (MSE-only single block — current, merged)
 
 ```
 TurboQuantArray
-├── metadata: { dimension, b_mse, block_size (= padded_dim),
-│               num_blocks (= 1) }
+├── metadata: { bit_width } (raw single byte)
 │
 │  # Per-row children
 ├── codes: FixedSizeListArray<u8>           # list_size = padded_dim
+├── norms: PrimitiveArray<f32>              # len = num_rows
+│
+│  # Shared children
+├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
+├── mse_rotation_signs: PrimitiveArray<u8>  # len = ceil(3 × padded_dim / 8) (bitpacked)
+```
+
+This is the structure as merged in [PR #7269][current-impl]: 4 slots (codes,
+norms, centroids, rotation_signs), MSE-only, 8-bit default.
+
+### Stage 1b (array representation cleanup)
+
+```
+TurboQuantArray (dimension must be power-of-2)
+├── metadata: { dimension, b_mse, block_size (= dimension),
+│               num_blocks (= 1), num_rounds (= R, default 3) }
+│               (format TBD; vtable refactor may subsume)
+│
+│  # Per-row children
+├── codes: FixedSizeListArray<u8>           # list_size = dimension
 │          (or PDXArray<u8> after Stage 3)
 ├── norms: PrimitiveArray<F>               # len = num_rows (F = f64 for f64, f32 otherwise)
 │
 │  # Shared children
 ├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
-├── mse_rotation_signs: PrimitiveArray<u8>  # len = 3 × padded_dim (bitpacked)
+├── mse_rotation_signs: FixedSizeListArray  # len = R (default 3)
+│     element dtype: FixedSizeList(u8, dimension, NonNullable)
+│     # each element = one bitpacked sign diagonal, inverse-friendly order
 ```
 
-Same structure as the [current PR][current-impl] minus the 3 QJL slots, plus
-the forward-compatible metadata fields and dtype-matching norms. The codes child
-is `FixedSizeListArray` in Stages 1-2 and may be swapped to `PDXArray` in Stage
-3 — TurboQuant checks the child type at runtime, not via a metadata flag.
+Stage 1b changes vs. 1a: power-of-2 dimension required (no padding), rotation
+signs become a `FixedSizeListArray` (one element per SRHT round, variable R),
+norms dtype matches input, metadata moves to a structured format. The codes
+child is `FixedSizeListArray` in Stages 1b-2 and may be swapped to `PDXArray`
+in Stage 3 — TurboQuant checks the child type at runtime, not via a metadata
+flag.
 
 ### Stage 2 (block decomposition)
 
 ```
 TurboQuantArray (self-contained, handles blocks internally)
-├── metadata: { dimension, b_mse, block_size, num_blocks }
+├── metadata: { dimension, b_mse, block_size, num_blocks,
+│               num_rounds }
 │
 │  # Per-row children (sliced/taken on row operations)
 ├── codes: FixedSizeListArray<u8>           # list_size = k × B
@@ -726,7 +873,9 @@ TurboQuantArray (self-contained, handles blocks internally)
 │
 │  # Shared children (cloned on row operations, not sliced)
 ├── centroids: PrimitiveArray<f32>          # len = 2^b_mse
-├── mse_rotation_signs: PrimitiveArray<u8>  # len = k × 3 × B
+├── mse_rotation_signs: FixedSizeListArray  # len = k × R
+│     element dtype: FixedSizeList(u8, B, NonNullable)
+│     # k blocks × R rounds, each element = one bitpacked sign diagonal
 ```
 
 ## Compression ratio
@@ -742,19 +891,29 @@ replace 32 with 64 in the norms row — ratios decrease accordingly):
 | Component  | Shared bits  |
 | ---------- | ------------ |
 | Centroids  | 2^b_mse × 32 |
-| SORF signs | k × 3 × B    |
+| SORF signs | k × R × B    |
 
-### Worked examples (f32, b_mse=5, N=1000)
+### Worked examples (f32, N=1000)
 
-| d             | B    | k   | Per-vec bits          | Ratio | Notes                    |
-| ------------- | ---- | --- | --------------------- | ----- | ------------------------ |
-| 768           | 256  | 3   | 3×256×5 + 3×32 = 3936 | 6.2×  | Block decomp; no padding |
-| 1024          | 1024 | 1   | 1024×5 + 32 = 5152    | 6.4×  | Single block (= current) |
-| 768 (current) | 1024 | 1   | 1024×5 + 32 = 5152    | 4.8×  | Padded; 33% overhead     |
+**At b_mse=8 (default, near-lossless):**
 
-Block decomposition improves the compression ratio for d=768 from ~4.8× to
-~6.2× (about 29% higher ratio; equivalently, about 24% fewer compressed bits
-per vector: 5152 → 3936). For d=1024 the encoding is identical to current.
+| d             | B    | k   | Per-vec bits            | Ratio | Notes                    |
+| ------------- | ---- | --- | ----------------------- | ----- | ------------------------ |
+| 768           | 256  | 3   | 3×256×8 + 3×32 = 6240   | 3.9×  | Block decomp; no padding |
+| 1024          | 1024 | 1   | 1024×8 + 32 = 8224      | 4.0×  | Single block (= current) |
+| 768 (Stage 1a)| 1024 | 1   | 1024×8 + 32 = 8224      | 3.0×  | Padded; 33% overhead     |
+
+**At b_mse=5 (32 centroids):**
+
+| d             | B    | k   | Per-vec bits            | Ratio | Notes                    |
+| ------------- | ---- | --- | ----------------------- | ----- | ------------------------ |
+| 768           | 256  | 3   | 3×256×5 + 3×32 = 3936   | 6.2×  | Block decomp; no padding |
+| 1024          | 1024 | 1   | 1024×5 + 32 = 5152      | 6.4×  | Single block (= current) |
+| 768 (Stage 1a)| 1024 | 1   | 1024×5 + 32 = 5152      | 4.8×  | Padded; 33% overhead     |
+
+Block decomposition improves the compression ratio at both bit widths. At b=8
+for d=768: from ~3.0× (padded) to ~3.9× (block decomp). At b=5 for d=768: from
+~4.8× to ~6.2×. For d=1024, the encoding is identical to current (single block).
 
 **Shared overhead note:** centroids and SORF signs are amortized over N vectors;
 for small N, per-column shared metadata is significant — report totals with and
@@ -765,8 +924,9 @@ without amortization when publishing ratios.
 ### Encode/decode throughput
 
 SORF at B dimensions (heuristic — real cost is dominated by memory bandwidth
-and constant factors): 3 × B × log₂(B) butterflies + 3 × B sign applications
-per block (plus B normalization multiplies, omitted). For k blocks:
+and constant factors): R × B × log₂(B) butterflies + R × B sign applications
+per block (R = SRHT rounds, default 3; plus B normalization multiplies,
+omitted). For k blocks, R=3:
 
 | B              | SORF FLOPs/block          | k (d=768) | Total MSE FLOPs |
 | -------------- | ------------------------- | --------- | --------------- |
@@ -774,7 +934,7 @@ per block (plus B normalization multiplies, omitted). For k blocks:
 | 512            | 3×512×9 + 1536 = 15,360   | —         | —               |
 | 1024 (current) | 3×1024×10 + 3072 = 33,792 | 1         | 33,792          |
 
-Block decomposition at d=768 is ~40% fewer FLOPs than the current padded
+Block decomposition at d=768 is ~40% fewer FLOPs than the Stage 1a padded
 approach, despite more blocks, because each block is smaller.
 
 ### Benchmarking plan
@@ -811,8 +971,8 @@ to 64 or raising to 256.
 
 ### MSE quality and scan performance vs. block size
 
-- Compare actual normalized MSE at B ∈ {64, 128, 256, 512} vs. single-SORF at
-  padded dimension, at bit widths b ∈ {2, 3, 4, 5, 8}
+- Compare actual normalized MSE at B ∈ {64, 128, 256, 512} vs. single-block at
+  full power-of-2 dimension, at bit widths b ∈ {2, 3, 4, 5, 8}
 - Compare ANN recall@k and scan throughput at fixed d (e.g., d=3072) across
   B ∈ {256, 512, 1024} — smaller B gives more pruning checkpoints for
   ADSampling-style early termination but increases norm overhead
@@ -827,7 +987,7 @@ performance despite higher per-block overhead.
 
 ### QJL strategy comparison (if pursued)
 
-- Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim padded SORF QJL
+- Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim SORF QJL
   vs. MSE-only
 - Key metric: ANN recall@k on the datasets above (Contriever, OpenAI, SIFT)
 - Per community findings for attention, MSE-only is expected to win [8]; ANN
@@ -868,15 +1028,21 @@ adversarial properties for the specific rotation).
 
 ### Dimensions with no qualifying B
 
-Rare for common embedding dimensions (e.g., d=96). These fall back to the
-Stage 1 padded single-block path (pad to next power-of-2, single SORF). No
-block decomposition is attempted.
+Rare for common embedding dimensions (e.g., d=96). Currently these fall back to
+scheme-level padding to the next power-of-2, then a single-block TQ array. See
+"Straggler blocks (future work)" in Stage 2 for a potential alternative using
+heterogeneous per-block encodings.
 
 ## Phasing
 
-**Phase 1** — MSE-only single-block TurboQuant: Split the [current PR][current-impl]
-to merge MSE-only (no QJL). Scheme auto-selects for d ≥ 128; smaller d available
-via explicit construction. Padding for non-power-of-2 dimensions.
+**Phase 1a** (done) — MSE-only single-block TurboQuant: Merged as
+[PR #7269][current-impl]. 8-bit default, d ≥ 128 scheme auto-selection, 3-round
+SORF, 4 child slots. The [original QJL PR][original-impl] was closed.
+
+**Phase 1b** (next) — Array representation cleanup: Restructure rotation signs
+as `FixedSizeListArray` (variable SRHT rounds), dtype-matching norms, restrict
+`new_unchecked` visibility, structured metadata (format pending vtable refactor).
+Address remaining review items from Phase 1a (see Stage 1a deferred items).
 
 **Phase 2** — Block decomposition: Add block splitting for dimensions where a
 valid B exists (greatest power-of-2 ≥ 64 dividing d). Per-block norms stored as
@@ -901,7 +1067,7 @@ For common model dimensions, the most promising configurations are:
 | ---------------------- | --------------------------- | -------------------------------------------------------------------------- |
 | 512, 1024, 2048, 4096  | Single-block MSE-only + PDX | B=d, no decomposition needed. Same as current TQ but with PDX scan layout. |
 | 768, 1536, 3072        | 3-block MSE-only + PDX      | B=256 or 512. No padding waste. 3 blocks, shared centroids.                |
-| No qualifying B (rare) | Padded single-block         | Fall back to Stage 1: pad to next power-of-2, single SORF.                 |
+| No qualifying B (rare) | Padded single-block         | Fall back to Stage 1b: pad to next power-of-2, single SORF.               |
 
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
@@ -992,39 +1158,40 @@ codes without decompressing them.
 
 ## Migration and compatibility
 
-TurboQuant has not shipped yet, so there are no existing files to migrate. We
-can design the metadata for forward compatibility from day one.
+Stage 1a is now shipped (merged in [PR #7269][current-impl]) with raw single-byte
+metadata. Stage 1b introduces structured metadata and a new rotation signs layout,
+which is a breaking change from Stage 1a's wire format. Since TurboQuant has not
+been included in a release yet, this is acceptable — no user-facing files need
+migration. The Stage 1b wire format is intended to be one we believe is ready
+for backward-compatibility guarantees, without formally committing to stability
+until we have confidence from Stage 2 implementation and benchmarking.
 
 **Strategy: single array ID, versioned metadata.** All stages use the same array
-ID (`vortex.turboquant`). The metadata includes `block_size` and `num_blocks`
-fields from Stage 1 onward. Stage 1 always writes `num_blocks=1`, but the field
-exists so that Stage 2 decoders can read Stage 1 files without migration.
+ID (`vortex.turboquant`). From Stage 1b onward, the metadata includes
+`block_size`, `num_blocks`, and `num_rounds` fields. Stage 1b always writes
+`num_blocks=1`, but the field exists so that Stage 2 decoders can read Stage 1b
+files without migration.
 
-**Decoder invariant:** `block_size` is always the per-block SORF dimension B.
-`codes.list_size` = `num_blocks × block_size`. The decoder **validates**
-`num_blocks == codes.list_size / block_size` (exact integer division; reject
-files where this does not hold). Note that `metadata.dimension` may differ
-from `codes.list_size`:
-
-- Stage 1, non-power-of-2 d: `dimension=768`, `block_size=1024` (padded),
-  `list_size=1024`. `dimension < list_size` is expected; trailing code slots
-  are structural zeros from padding.
-- Stage 2, no stragglers: `dimension = list_size = num_blocks × block_size`.
+**Decoder invariant:** From Stage 1b onward, dimension is always power-of-2 and
+`codes.list_size` = `dimension` = `num_blocks × block_size`. The decoder
+**validates** this equality (reject files where it does not hold).
+`num_rounds` must equal `rotation_signs.len / num_blocks`.
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
 
-- Stage 1: norms child is `PrimitiveArray<F>`, one norm per vector (F = f64 for
-  f64 input, f32 otherwise).
-- Stage 2 with k=1 (power-of-2 dims): same as Stage 1, identical wire format.
+- Stage 1a: norms child is `PrimitiveArray<f32>`, one norm per vector.
+- Stage 1b: norms child is `PrimitiveArray<F>`, one norm per vector (F = f64
+  for f64 input, f32 otherwise).
+- Stage 2 with k=1 (power-of-2 dims): same as Stage 1b, identical wire format.
 - Stage 2 with k>1: norms child is `FixedSizeListArray<F>`, k norms per vector.
 
 The decoder distinguishes k=1 from k>1 by reading `num_blocks` from metadata.
-A k=1 decoder is backward-compatible with Stage 1 files. A k>1 decoder is a new
-code path that only applies to files written by Stage 2+.
+A k=1 decoder is backward-compatible with Stage 1b files. A k>1 decoder is a
+new code path that only applies to files written by Stage 2+.
 
 **Stage 3 (PDXArray) is additive.** PDX is not a TurboQuant metadata flag — it's
-a separate array type (`PDXArray`) that wraps the codes child. Stage 1/2 files
+a separate array type (`PDXArray`) that wraps the codes child. Stage 1b/2 files
 have `FixedSizeListArray` codes; Stage 3 files have `PDXArray` codes. The
 TurboQuant decoder checks the child type and un-transposes PDXArray on decode if
 needed. `PDXArray` itself is registered as a new encoding, independent of
@@ -1032,10 +1199,11 @@ TurboQuant.
 
 **Incremental shipping:**
 
-| Stage        | Ships to users?  | Reads Stage 1 files?       | Notes                               |
-| ------------ | ---------------- | -------------------------- | ----------------------------------- |
-| 1 (MSE-only) | Yes, immediately | N/A (first version)        | New encoding, no backcompat concern |
-| 2 (blocks)   | Yes              | Yes (k=1 is identical)     | k>1 files need Stage 2+ decoder     |
+| Stage         | Ships to users?  | Reads prior stage files?    | Notes                                |
+| ------------- | ---------------- | --------------------------- | ------------------------------------ |
+| 1a (MSE-only) | Yes (merged)     | N/A (first version)         | Raw byte metadata, 3-round SORF     |
+| 1b (cleanup)  | Yes              | No (breaking: new metadata) | Variable rounds, structured metadata, new norms |
+| 2 (blocks)    | Yes              | Yes (k=1 is identical)      | k>1 files need Stage 2+ decoder      |
 | 3 (PDX)      | Yes              | Yes (FSL codes still work) | PDX codes need PDXArray registered  |
 
 Each stage is independently shippable. Users can upgrade incrementally. Files
