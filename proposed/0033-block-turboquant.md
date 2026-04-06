@@ -145,8 +145,8 @@ for details).
 
 The SORF requires power-of-2 input dimension. The current implementation
 zero-pads non-power-of-2 dimensions (e.g., 768 → 1024) internally; Stage 1
-moves this padding to the scheme level by requiring power-of-2 at the TQ array
-level (see Stage 1). For non-power-of-2 dimensions, this means:
+moves this padding to the scheme level by requiring power-of-2 block size at
+the TQ array level (see Stage 1). For non-power-of-2 dimensions, this means:
 
 - **33% storage overhead** for 768-d vectors: 1024 codes stored vs. 768 useful
   (equivalently, 25% of stored codes are wasted on zero-padded dimensions).
@@ -251,7 +251,7 @@ efficiency:
 
 - **SORF mixing quality:** 3-round SORF at d=64 provides only 18 butterfly
   stages (vs. 21 at d=128, 30 at d=1024). The coordinate distribution deviates
-  more from the analytical Beta, making Max-Lloyd centroids less optimal. Stage
+  more from the analytical Beta, making Max-Lloyd centroids less optimal.
   Stage 1's variable-round rotation signs (see Stage 1) may allow compensating with
   additional SORF rounds at lower dimensions — this should be benchmarked.
 - **Practical MSE:** At smaller d, the SORF mixing quality and coordinate-
@@ -271,7 +271,8 @@ The threshold of 128 is conservative:
   implementation.
 - The block-size rule produces B=128 for d=128 (single block, no decomposition).
 
-The TQ array requires power-of-2 dimensions (see Stage 1), making the array
+The TQ array requires power-of-2 block size (see Stage 1). In Stage 1
+(single block), this means dimension must be power-of-2, making the array
 minimum d=4 (the smallest power-of-2 where the Beta exponent (d-3)/2 > 0).
 The scheme minimum (128) controls automatic selection; smaller power-of-2
 dimensions remain available via explicit construction.
@@ -297,13 +298,15 @@ benchmarking.
   is pursued.
 - **8-bit default** (256 centroids). Near-lossless: normalized MSE ~4e-5,
   ~4× compression on f32. Lower bit widths available via `TurboQuantConfig`.
-- **Power-of-2 dimensions only.** The TQ array requires its dimension to be a
-  power of 2 (enforced at construction time). This eliminates internal
-  zero-padding logic and simplifies the decoder invariant
-  (`codes.list_size` always equals `dimension`). Non-power-of-2 dimensions are
-  handled *outside* the TQ array: Stage 2's block decomposition splits them
-  into power-of-2 blocks (e.g., 768 → 3×256), and the rare "no qualifying B"
-  case (e.g., d=96) is padded at the scheme/compressor level.
+- **Power-of-2 block size.** The TQ array requires `block_size` to be a power
+  of 2 (enforced at construction time). In Stage 1, `block_size = dimension`
+  (single block), so this also means power-of-2 dimension. In Stage 2,
+  `dimension = num_blocks × block_size` can be non-power-of-2 (e.g., 768 =
+  3 × 256). This eliminates internal zero-padding logic and simplifies the
+  decoder invariant. Non-power-of-2 dimensions are handled *outside* the TQ
+  array in Stage 1 (the scheme pads to the next power-of-2), and *inside* via
+  block decomposition in Stage 2 (e.g., 768 → 3×256 blocks). The rare
+  "no qualifying B" case (e.g., d=96) is padded at the scheme/compressor level.
 - **Variable-round SORF rotation.** Rotation signs are stored as a
   `FixedSizeListArray` where each element is a
   `FixedSizeList(u8, dim, NonNullable)` — one bitpacked diagonal per SORF
@@ -1075,10 +1078,12 @@ ID (`vortex.turboquant`). The metadata includes `block_size`, `num_blocks`, and
 `num_rounds` fields. Stage 1 always writes `num_blocks=1`, but the field exists
 so that Stage 2 decoders can read Stage 1 files without migration.
 
-**Decoder invariant:** Dimension is always power-of-2 and `codes.list_size` =
-`dimension` = `num_blocks × block_size`. The decoder **validates** this equality
-(reject files where it does not hold). `num_rounds` must equal
-`rotation_signs.len / num_blocks`.
+**Decoder invariant:** `block_size` is always power-of-2. `codes.list_size` =
+`dimension` = `num_blocks × block_size`. The decoder **validates** these
+equalities (reject files where they do not hold). `num_rounds` must equal
+`rotation_signs.len / num_blocks`. In Stage 1, `num_blocks=1` so
+`dimension = block_size` (both power-of-2). In Stage 2, `dimension` may be
+non-power-of-2 (e.g., 768 = 3 × 256).
 
 **Norms are always internal children.** The TurboQuant array is self-contained —
 it stores norms as a child slot, not in a parent encoding. This means:
