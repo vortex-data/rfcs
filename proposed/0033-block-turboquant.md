@@ -76,6 +76,58 @@ simple deployment, and theoretical guarantees matter most, while PQ or OPQ may
 still win empirically when a learned vector codebook can exploit dataset-specific
 structure.
 
+### Comparison to HIGGS
+
+HIGGS [12] (Malinovskii et al., 2024) is a data-free quantization method for LLM
+weight matrices that shares TurboQuant's core idea — Hadamard rotation followed by
+MSE-optimal grid quantization — but targets a different application domain and makes
+different design trade-offs:
+
+|                      | TurboQuant                                                               | HIGGS                                                                      |
+| -------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| Application domain   | ANN embedding search (per-vector, online)                                | LLM weight quantization (per-layer, offline)                               |
+| Rotation             | 3-round SORF (HD₃·HD₂·HD₁): high-quality random orthogonal approximation | Single RHT (H·D): one Hadamard × random diagonal signs                     |
+| Target distribution  | Beta marginal (1-x²)^((d-3)/2) on unit sphere                            | Approximate Gaussian N(0,1)                                                |
+| Quantization grid    | Max-Lloyd centroids (scalar, p=1), analytically derived for Beta         | CLVQ grids (Pagès & Printems 2003), supports vector quantization p∈{1,2,4} |
+| Error metric         | Pure MSE (reconstruction error)                                          | MSE + Hessian-weighted per-layer coefficients αₗ (Linearity Theorem)       |
+| Calibration data     | None                                                                     | None for quantization; small calibration set for αₗ estimation             |
+| Non-uniform bitwidth | No (uniform across all vectors)                                          | Yes (DP solver for per-layer bit allocation)                               |
+| Distance computation | Quantized-domain scan kernel (PDX layout, SIMD over 64 vectors)          | GPU matrix multiply (FLUTE kernel)                                         |
+| Norm storage         | Explicit per-block norms for distance computation                        | Per-group scales folded into weight reconstruction                         |
+
+**Key design differences explained:**
+
+- **Rotation depth.** TurboQuant normalizes to the unit sphere first, so
+  coordinates must follow the specific Beta marginal for Max-Lloyd centroids to
+  be optimal — this requires a high-quality random orthogonal approximation
+  (3-round SORF). HIGGS operates on raw (group-normalized) weights and only
+  needs approximate Gaussianity, so a single RHT suffices.
+- **VQ dimension.** HIGGS's CLVQ grids support multi-dimensional vector
+  quantization (p>1), where groups of p coordinates are quantized jointly to an
+  optimal multi-dimensional grid. At 3-4 bits, p=2 or p=4 achieves better
+  rate-distortion than scalar (p=1) quantization by exploiting residual
+  correlations between coordinates. TurboQuant is currently scalar-only (p=1);
+  p>1 would require changes to the PDX scan kernel (per-subvector codebook
+  lookup instead of per-coordinate). See Future work for discussion.
+- **Error metric.** HIGGS's Linearity Theorem (perplexity increase ≈ Σ αₗ·tₗ²)
+  enables Hessian-aware optimization specific to LLM inference. For ANN search,
+  MSE is the natural metric — it directly bounds distance distortion — and
+  non-uniform bit allocation has no analogue (all vectors share the same
+  encoding).
+- **Beta vs. Gaussian at high d.** As d grows, the Beta distribution
+  (1-x²)^((d-3)/2) concentrates and becomes approximately Gaussian with
+  variance ~1/d. At d=256+, the practical difference between Beta-optimal and
+  Gaussian-optimal grids shrinks. Whether Gaussian grids (simpler: one grid per
+  bitwidth, no dimension dependence) match Beta Max-Lloyd for ANN recall is an
+  empirical question — see Experimental plan.
+
+**Domain mismatch.** Comparisons of TurboQuant vs. HIGGS on LLM perplexity
+benchmarks are misleading: HIGGS's Hessian-aware optimization naturally dominates
+for that task, but TurboQuant was never designed for LLM weight quantization. The
+relevant comparison is ANN recall@k on embedding datasets, where TurboQuant's
+block decomposition, PDX scan layout, and per-vector encode/decode are the
+critical features.
+
 ### Current Vortex implementation
 
 The [current implementation][current-impl] (Rust, in the `vortex-tensor` crate,
@@ -908,6 +960,31 @@ maximizes per-block quality and minimizes norm count. Experiments may show that
 smaller B with more pruning checkpoints yields better end-to-end scan
 performance despite higher per-block overhead.
 
+### Gaussian-optimal vs. Beta-optimal grids
+
+HIGGS [12] demonstrates that Gaussian-optimal grids (computed via CLVQ for N(0,1))
+work well after a single Hadamard rotation. Since the Beta marginal converges to
+Gaussian at high d, test whether Gaussian grids can replace Beta Max-Lloyd centroids
+for ANN search:
+
+- **Grid comparison**: At B ∈ {64, 128, 256, 512} and b ∈ {2, 3, 4, 5, 8},
+  compare ANN recall@k and normalized MSE for (a) Beta Max-Lloyd centroids at
+  B-dim, (b) Gaussian-optimal scalar grids (Normal Float style), and
+  (c) CLVQ-computed Gaussian grids. Report the crossover point where the grids
+  become practically equivalent.
+- **Rotation depth**: If Gaussian grids match Beta Max-Lloyd at a given B, test
+  whether 1-round RHT (H·D with random signs) achieves comparable quality to
+  3-round SORF. A single round would reduce rotation cost by ~3× and simplify
+  the transform. Test at B ∈ {64, 128, 256, 512} on the benchmarking datasets.
+- **Simplification potential**: If Gaussian grids + 1-round RHT match quality at
+  B ≥ 256, this eliminates the dimension-dependent centroid computation (one grid
+  per bitwidth, shared across all block sizes) and reduces rotation overhead.
+  This would be a significant implementation simplification for Stage 2+.
+
+The expectation is that at B=256+ the difference is negligible, but at B=64-128
+the Beta-optimal grids may still win due to stronger non-Gaussian effects. Results
+should inform whether the centroid computation strategy changes in Phase 2.
+
 ### QJL strategy comparison (if pursued)
 
 - Per-block Gaussian QJL vs. per-block SORF QJL vs. full-dim SORF QJL
@@ -991,6 +1068,43 @@ For common model dimensions, the most promising configurations are:
 In all cases, MSE-only is the recommended starting point. QJL should only be
 added if experiments demonstrate clear recall@k improvements for the target
 workload.
+
+## Future work: Multi-dimensional vector quantization (p>1)
+
+HIGGS [12] demonstrates that vector quantization with dimension p>1 (quantizing
+groups of p coordinates jointly to an optimal multi-dimensional grid) achieves
+better rate-distortion than scalar quantization (p=1) at the same bit budget. For
+TurboQuant, this would mean replacing the per-coordinate Max-Lloyd centroid lookup
+with a per-subvector codebook lookup, where each group of p rotated coordinates
+maps to one of n codewords in a p-dimensional CLVQ grid.
+
+**Benefits:**
+
+- Improved rate-distortion: at 3-4 bits, p=2 or p=4 captures residual
+  correlations between coordinates that scalar quantization misses.
+- Simpler centroid computation: CLVQ grids for Gaussian inputs are computed once
+  per (n, p) pair and reused across all block sizes (no dimension dependence).
+
+**Costs and constraints:**
+
+- **Distance kernel redesign.** The PDX scan kernel (Stage 3) is built around
+  per-coordinate centroid lookups with a (2^b)²-entry distance table. At p=2
+  with b=4 bits per coordinate, the codebook has 2^(4×2)=256 entries, and the
+  distance table becomes 256×256=64K entries (256 KB) — still fits in L1/L2 but
+  much larger than the current 1 KB at b=4 scalar. At p=4 the table is
+  infeasible; alternative distance strategies (asymmetric distance computation,
+  partial codebook scans) would be needed.
+- **GPU shared memory.** HIGGS notes total grid points 2^(b×p) must fit GPU
+  shared memory (~2^10 points practical limit), constraining (b, p) pairs.
+- **PDX layout interaction.** The current "1 dim × 64 vecs" PDX layout assumes
+  per-coordinate independence. At p>1, the layout would need to group p
+  consecutive dimensions together per lookup, changing the transpose structure.
+
+**Recommendation:** Evaluate p=2 VQ experimentally after Stage 3 (PDX) is
+validated. Compare ANN recall@k at matched bit budgets: p=1 at b bits vs. p=2 at
+b bits. If p=2 shows meaningful recall improvement (>2% recall@10), design the
+kernel changes as a Stage 4 extension. CLVQ grids for p=2 can be precomputed
+offline using the Pagès & Printems (2003) algorithm [12].
 
 ## Future work: GPU decode and fused distance computation
 
@@ -1180,6 +1294,10 @@ IEEE Trans. PAMI 36(4):744-755, 2014.
 
 [11] Jääsaari, E., Hyvönen, V., Ceccarello, M., Roos, T. and Aumüller, M.
 "VIBE: Vector Index Benchmark for Embeddings." arXiv:2505.17810, May 2025.
+
+[12] Malinovskii, V., Panferov, A., Ilin, I., Guo, H., Richtárik, P. and
+Alistarh, D. "Pushing the Limits of Large Language Model Quantization via the
+Linearity Theorem." arXiv:2411.17525, November 2024.
 
 ## Appendix A: Reference implementation bugs and Theorem 1 constant
 
