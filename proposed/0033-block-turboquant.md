@@ -128,6 +128,41 @@ relevant comparison is ANN recall@k on embedding datasets, where TurboQuant's
 block decomposition, PDX scan layout, and per-vector encode/decode are the
 critical features.
 
+### Comparison to RotorQuant / IsoQuant
+
+RotorQuant [13] replaces TurboQuant's full-dimension SORF with Clifford algebra
+rotors in Cl(3,0), chunking vectors into 3-dimensional groups and applying SO(3)
+sandwich products. IsoQuant extends this to SO(4) via quaternions, and PlanarQuant
+uses SO(2) Givens rotations. All three are block-diagonal rotation strategies with
+very small blocks (2-4 dimensions).
+
+On real KV-cache tensors (Qwen2.5-3B), these small-block rotations showed severe
+quality regressions: RotorQuant at 3-bit measured 3.843 MSE vs. TurboQuant's
+0.354 (10.8× worse), and IsoQuant at 4-bit incurred +36% perplexity impact vs.
+TurboQuant's +11.7% [13]. Independent analysis attributed this to the fundamental
+decorrelation limitation: block-diagonal rotations in SO(2)/SO(3)/SO(4) provide
+no cross-group coordinate mixing, while WHT/SORF mixes all coordinates
+simultaneously. Real embedding vectors exhibit full-dimension correlations that
+small-block rotations cannot break.
+
+|                        | TurboQuant (SORF)                             | RotorQuant (SO(3))         | IsoQuant (SO(4))            |
+| ---------------------- | --------------------------------------------- | -------------------------- | --------------------------- |
+| Decorrelation          | Full dimension (3-round SORF, all coords mix) | Block-diagonal (3D groups) | Block-diagonal (4D groups)  |
+| Params (d=128)         | 384 sign bits (3 × 128)                       | 186 rotor params           | ~500 quaternion params      |
+| MSE at 3-bit (Qwen KV) | 0.354                                         | 3.843 (10.8× worse)        | Not reported at 3-bit       |
+| Speed vs. WHT          | Baseline (896 FMAs at d=128)                  | 2,408 FMAs (2.7× slower)   | ~3.6× slower (CUDA prefill) |
+
+**Relevance to our design.** RFC 0033's Stage 2 block decomposition is also
+block-diagonal — each B-dim block has an independent SORF with no cross-block
+mixing. The critical difference is block size: B=256 with 3-round SORF provides
+24 butterfly stages of within-block mixing (comparable to the current B=1024's
+30 stages), vs. RotorQuant's 3-4 coordinate groups with no structured mixing at
+all. The RotorQuant/IsoQuant data provides empirical evidence that the quality
+cliff for block-diagonal rotations is steep at very small B and validates the
+RFC's minimum B ≥ 64 constraint. Whether B=256 is large enough to avoid
+meaningful decorrelation loss is an empirical question addressed in the
+Experimental plan.
+
 ### Current Vortex implementation
 
 The [current implementation][current-impl] (Rust, in the `vortex-tensor` crate,
@@ -555,6 +590,18 @@ smaller block dimension B, within-block coordinate dependence after rotation may
 be stronger even when marginals are correct — this is an additional motivation
 for the experimental plan's comparison of block sizes.
 
+**Empirical evidence from small-block rotations.** The RotorQuant/IsoQuant
+experiments [13] provide direct evidence of this decorrelation failure mode:
+block-diagonal rotations in SO(3) (3-dim groups) and SO(4) (4-dim groups)
+caused 10× MSE regressions on real KV-cache vectors, attributed to complete
+absence of cross-group coordinate mixing. Our Stage 2 design operates at a
+fundamentally different scale — B=256 blocks with 3-round SORF provide 24
+butterfly mixing stages within each block, vs. RotorQuant's 3-4 raw coordinates
+with no structured mixing — so the decorrelation loss should be far less severe.
+Nevertheless, the experimental plan includes explicit cross-block correlation
+measurement on real embeddings to quantify any residual decorrelation gap
+between block-decomposed (B=256) and single-block (B=d) SORF.
+
 The actual MSE may depend on block dimension B: at larger B the coordinate
 distribution is more concentrated (variance ~1/B), giving the Max-Lloyd
 quantizer more to exploit. See Experimental plan.
@@ -954,6 +1001,15 @@ to 64 or raising to 256.
 - Test SORF coordinate distribution at each B: histogram vs. analytical Beta
 - Test 3, 4, 5 SORF rounds at each B
 - Determine if the practical MSE constant is worse at smaller B
+- Measure cross-block coordinate correlation on real embeddings (Contriever,
+  OpenAI) before and after per-block SORF rotation: compute the average
+  absolute Pearson correlation between coordinates in different blocks. Compare
+  block-decomposed (B=256, k=3) vs. single-block (B=d) SORF at d=768 to
+  quantify how much cross-block dependence survives block decomposition. The
+  RotorQuant/IsoQuant experiments [13] showed that very small block-diagonal
+  rotations (3-4 dims) leave full-dimension correlations intact; this test
+  determines where on the block-size spectrum the decorrelation gap becomes
+  negligible
 
 The block-size rule ("greatest qualifying B") is a starting heuristic that
 maximizes per-block quality and minimizes norm count. Experiments may show that
@@ -1298,6 +1354,13 @@ IEEE Trans. PAMI 36(4):744-755, 2014.
 [12] Malinovskii, V., Panferov, A., Ilin, I., Guo, H., Richtárik, P. and
 Alistarh, D. "Pushing the Limits of Large Language Model Quantization via the
 Linearity Theorem." arXiv:2411.17525, November 2024.
+
+[13] johndpope et al. "RotorQuant: Clifford algebra vector quantization." PR #34,
+TheTom/turboquant_plus, March-April 2026.
+https://github.com/TheTom/turboquant_plus/pull/34
+Explores SO(2)/SO(3)/SO(4) block-diagonal rotations as alternatives to
+full-dimension SORF. Rejected due to 10×+ MSE regressions on real KV-cache
+tensors, attributed to insufficient cross-group decorrelation.
 
 ## Appendix A: Reference implementation bugs and Theorem 1 constant
 
