@@ -102,8 +102,7 @@ This layer belongs in `vortex-scan`.
 
 ### 3. Operator Layer
 
-The operator layer is the host engine proper: DataFusion, DuckDB, Velox, Polars, Spiral, or a
-future Vortex-native query engine.
+The operator layer is the host engine proper: DataFusion, DuckDB, Velox, Polars, etc.
 
 Responsibilities:
 
