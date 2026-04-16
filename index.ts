@@ -229,7 +229,10 @@ function rfcPage(
   liveReload: boolean = false,
 ): string {
   let gitHeader = `
-      <div class="rfc-meta-header">`;
+      <div class="rfc-meta-header">
+        <div class="rfc-meta-item">
+          <span class="rfc-status-pill status-accepted">Accepted</span>
+        </div>`;
 
   if (rfc.git.accepted || rfc.git.author) {
     // Author section

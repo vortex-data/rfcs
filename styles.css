@@ -494,6 +494,26 @@ footer {
   font-size: 0.875rem;
 }
 
+/* Status pills */
+.rfc-status-pill {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.status-accepted {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+:root[data-theme="dark"] .status-accepted {
+  background: #1e3a8a;
+  color: #dbeafe;
+}
+
 /* Proposed RFCs (from open PRs) */
 .rfc-list-proposed {
   opacity: 0.75;
