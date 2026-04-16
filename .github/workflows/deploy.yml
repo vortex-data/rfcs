@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - develop
+  pull_request:
+    types: [opened, closed, reopened]
+    branches:
+      - develop
 
 permissions:
   contents: read
@@ -23,6 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: develop
           fetch-depth: 0
 
       - name: Setup Bun
