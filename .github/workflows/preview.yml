@@ -1,0 +1,41 @@
+name: RFC Preview
+
+on:
+  pull_request:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  preview:
+    env:
+      GH_TOKEN: ${{ github.token }}
+    runs-on: ubuntu-latest
+    environment:
+      name: rfc-preview
+      url: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build preview
+        run: bun run index.ts --preview
+
+      - name: Upload RFC preview
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: rfc-preview-pr-${{ github.event.pull_request.number }}
+          path: ./dist/preview.html
+          archive: false
