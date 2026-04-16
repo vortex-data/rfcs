@@ -1,5 +1,5 @@
 - Start Date: 2026-03-13
-- Authors: Mikhail Kot
+- Authors: @myrrc
 
 # High level C Scan API
 ## Summary
