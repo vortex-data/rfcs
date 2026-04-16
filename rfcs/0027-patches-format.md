@@ -1,4 +1,5 @@
 - Start Date: 2026-03-02
+- Authors: Andrew Duffy
 - Tracking Issue: TBD
 - Draft PR: https://github.com/vortex-data/vortex/pull/6815
 
