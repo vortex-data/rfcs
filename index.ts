@@ -29,6 +29,7 @@ interface RFC {
   filename: string;
   html: string;
   git: RFCGitInfo;
+  authors: string[] | null; // parsed from markdown frontmatter, overrides git author
 }
 
 interface ProposedRFC {
@@ -151,7 +152,9 @@ function indexPage(
       const dateStr = rfc.git.accepted ? formatDate(rfc.git.accepted.date) : "";
 
       let authorHTML = "";
-      if (rfc.git.author && rfc.git.accepted) {
+      if (rfc.authors) {
+        authorHTML = `<span class="rfc-author-name">${rfc.authors.map(escapeHTML).join(", ")}</span>`;
+      } else if (rfc.git.author && rfc.git.accepted) {
         const commitUrl = repoUrl
           ? `${repoUrl}/commit/${rfc.git.accepted.hash}`
           : `https://github.com/${rfc.git.author.login}`;
@@ -235,9 +238,14 @@ function rfcPage(
           <span class="rfc-status-pill status-accepted">Accepted</span>
         </div>`;
 
-  if (rfc.git.accepted || rfc.git.author) {
+  if (rfc.git.accepted || rfc.git.author || rfc.authors) {
     // Author section
-    if (rfc.git.author) {
+    if (rfc.authors) {
+      gitHeader += `
+        <div class="rfc-meta-item rfc-author">
+          <span class="author-name">${rfc.authors.map(escapeHTML).join(", ")}</span>
+        </div>`;
+    } else if (rfc.git.author) {
       gitHeader += `
         <div class="rfc-meta-item rfc-author">
           <a href="${rfc.git.author.profileUrl}" class="author-link">
@@ -414,6 +422,19 @@ async function validateProposals(): Promise<ValidationError[]> {
   return errors;
 }
 
+function parseAuthors(markdown: string): string[] | null {
+  // Match "- Authors: Name1, Name2" or "**Authors:** Name1, Name2"
+  const match = markdown.match(
+    /^(?:-\s*Authors:\s*|\*\*Authors:\*\*\s*)(.+)$/im,
+  );
+  if (!match?.[1]) return null;
+  const authors = match[1]
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean);
+  return authors.length > 0 ? authors : null;
+}
+
 function parseTitle(markdown: string, filename: string): string {
   // Try to extract title from first # heading
   const match = markdown.match(/^#\s+(.+)$/m);
@@ -558,9 +579,10 @@ async function build(liveReload: boolean = false): Promise<number> {
     const html = await highlightCodeBlocks(rawHtml);
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
+    const authors = parseAuthors(content);
     const git = await getGitHistory(path, repoPath);
 
-    rfcs.push({ number, title, filename, html, git });
+    rfcs.push({ number, title, filename, html, git, authors });
   }
 
   if (rfcs.length === 0) {
@@ -716,9 +738,10 @@ async function buildPreview(): Promise<void> {
     const html = await highlightCodeBlocks(rawHtml);
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
+    const authors = parseAuthors(content);
     const git = await getGitHistory(path, repoPath);
 
-    rfcs.push({ number, title, filename, html, git });
+    rfcs.push({ number, title, filename, html, git, authors });
   }
 
   // Build a single self-contained index page with all RFCs and inlined CSS
