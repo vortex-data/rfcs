@@ -36,32 +36,43 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      - name: Check proposal matches PR number
+      - name: Check RFC number matches PR number
         run: |
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          CHANGED_PROPOSALS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'proposals/' \
-            | grep -v '^proposals/0000-template\.md$' || true)
+          # Grandfathered RFCs that predate the PR number convention
+          GRANDFATHERED="5 15 23 24 27 29 33"
 
-          COUNT=$(echo "$CHANGED_PROPOSALS" | grep -c . || true)
+          CHANGED_RFCS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'rfcs/' \
+            | grep -v '^rfcs/0000-template\.md$' || true)
+
+          COUNT=$(echo "$CHANGED_RFCS" | grep -c . || true)
 
           if [ "$COUNT" -gt 1 ]; then
-            echo "::error::PR touches $COUNT proposals. Only one proposal per PR is allowed."
-            echo "$CHANGED_PROPOSALS"
+            echo "::error::PR touches $COUNT RFCs. Only one RFC per PR is allowed."
+            echo "$CHANGED_RFCS"
             exit 1
           fi
 
           if [ "$COUNT" -eq 1 ]; then
-            FILE=$(echo "$CHANGED_PROPOSALS" | head -1)
+            FILE=$(echo "$CHANGED_RFCS" | head -1)
             FILENAME=$(basename "$FILE")
             FILE_NUMBER=$(echo "$FILENAME" | grep -oE '^[0-9]+' || true)
             # Strip leading zeros for comparison
             FILE_NUM=$((10#$FILE_NUMBER))
 
+            # Skip check for grandfathered RFCs
+            for GF in $GRANDFATHERED; do
+              if [ "$FILE_NUM" -eq "$GF" ]; then
+                echo "RFC $FILE_NUM is grandfathered, skipping PR number check."
+                exit 0
+              fi
+            done
+
             if [ "$FILE_NUM" -ne "$PR_NUMBER" ]; then
-              echo "::error::Proposal number ($FILE_NUM from $FILENAME) does not match PR number ($PR_NUMBER)."
+              echo "::error::RFC number ($FILE_NUM from $FILENAME) does not match PR number ($PR_NUMBER)."
               exit 1
             fi
           fi

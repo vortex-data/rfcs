@@ -22,17 +22,12 @@ interface RFCGitInfo {
   author: GitHubAuthor | null;
 }
 
-type RFCState = "proposed" | "accepted" | "completed";
-
-const RFC_STATES: RFCState[] = ["proposed", "accepted", "completed"];
-
 interface RFC {
   number: string;
   title: string;
   filename: string;
   html: string;
   git: RFCGitInfo;
-  state: RFCState;
 }
 
 const THEME_SCRIPT = `
@@ -69,33 +64,6 @@ function updateToggleIcon() {
 }
 
 document.addEventListener('DOMContentLoaded', updateToggleIcon);
-`;
-
-const FILTER_SCRIPT = `
-function filterRFCs(state) {
-  const items = document.querySelectorAll('.rfc-list li');
-  const buttons = document.querySelectorAll('.filter-btn');
-
-  buttons.forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.state === state);
-  });
-
-  items.forEach(item => {
-    if (state === 'all' || item.dataset.state === state) {
-      item.style.display = '';
-    } else {
-      item.style.display = 'none';
-    }
-  });
-
-  // Save filter preference
-  localStorage.setItem('rfc-filter', state);
-}
-
-document.addEventListener('DOMContentLoaded', function() {
-  const saved = localStorage.getItem('rfc-filter') || 'all';
-  filterRFCs(saved);
-});
 `;
 
 const LIVE_RELOAD_SCRIPT = `
@@ -160,10 +128,6 @@ function escapeHTML(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function stateLabel(state: RFCState): string {
-  return state.charAt(0).toUpperCase() + state.slice(1);
-}
-
 function indexPage(
   rfcs: RFC[],
   repoUrl: string | null,
@@ -189,10 +153,9 @@ function indexPage(
       }
 
       return `
-      <li data-state="${rfc.state}">
+      <li>
         <a href="rfc/${rfc.number}.html" class="rfc-item">
           <span class="rfc-number">RFC ${rfc.number}</span>
-          <span class="rfc-state-pill state-${rfc.state}">${stateLabel(rfc.state)}</span>
           <span class="rfc-title">${escapeHTML(rfc.title)}</span>
           <span class="rfc-date">${dateStr}</span>
         </a>${authorHTML}
@@ -200,22 +163,12 @@ function indexPage(
     })
     .join("\n");
 
-  const filterButtons = `
-      <div class="filter-bar">
-        <button class="filter-btn active" data-state="all" onclick="filterRFCs('all')">All</button>
-        <button class="filter-btn" data-state="proposed" onclick="filterRFCs('proposed')">Proposed</button>
-        <button class="filter-btn" data-state="accepted" onclick="filterRFCs('accepted')">Accepted</button>
-        <button class="filter-btn" data-state="completed" onclick="filterRFCs('completed')">Completed</button>
-      </div>`;
-
   const content = `
       <h1>Request for Comments</h1>
       <p>Technical proposals for the Vortex file format.</p>
-${filterButtons}
       <ul class="rfc-list">
 ${list}
-      </ul>
-      <script>${FILTER_SCRIPT}</script>`;
+      </ul>`;
 
   return baseHTML("Vortex RFCs", content, "styles.css", liveReload, repoUrl);
 }
@@ -234,10 +187,7 @@ function rfcPage(
   liveReload: boolean = false,
 ): string {
   let gitHeader = `
-      <div class="rfc-meta-header">
-        <div class="rfc-meta-item">
-          <span class="rfc-state-pill state-${rfc.state}">${stateLabel(rfc.state)}</span>
-        </div>`;
+      <div class="rfc-meta-header">`;
 
   if (rfc.git.accepted || rfc.git.author) {
     // Author section
@@ -390,34 +340,28 @@ interface ValidationError {
 async function validateProposals(): Promise<ValidationError[]> {
   const errors: ValidationError[] = [];
   const glob = new Bun.Glob("*");
-  const seenNumbers = new Map<string, string>(); // number -> "folder/filename"
+  const seenNumbers = new Map<string, string>();
 
-  for (const state of RFC_STATES) {
-    const folder = `./${state}`;
+  for await (const filename of glob.scan("./rfcs")) {
+    // Check filename format: NNNN-slug.md
+    if (!filename.match(/^\d{4}-[a-zA-Z0-9_-]+\.md$/)) {
+      errors.push({
+        filename: `rfcs/${filename}`,
+        message: `Invalid filename format. Expected: NNNN-name.md (e.g., 0007-my-proposal.md)`,
+      });
+      continue;
+    }
 
-    for await (const filename of glob.scan(folder)) {
-      const fullPath = `${state}/${filename}`;
-
-      // Check filename format: NNNN-slug.md
-      if (!filename.match(/^\d{4}-[a-zA-Z0-9_-]+\.md$/)) {
-        errors.push({
-          filename: fullPath,
-          message: `Invalid filename format. Expected: NNNN-name.md (e.g., 0007-my-proposal.md)`,
-        });
-        continue;
-      }
-
-      // Check for duplicate RFC numbers across all folders
-      const number = filename.slice(0, 4);
-      const existing = seenNumbers.get(number);
-      if (existing) {
-        errors.push({
-          filename: fullPath,
-          message: `Duplicate RFC number ${number} (also used by ${existing})`,
-        });
-      } else {
-        seenNumbers.set(number, fullPath);
-      }
+    // Check for duplicate RFC numbers
+    const number = filename.slice(0, 4);
+    const existing = seenNumbers.get(number);
+    if (existing) {
+      errors.push({
+        filename: `rfcs/${filename}`,
+        message: `Duplicate RFC number ${number} (also used by ${existing})`,
+      });
+    } else {
+      seenNumbers.set(number, `rfcs/${filename}`);
     }
   }
 
@@ -515,29 +459,22 @@ async function build(liveReload: boolean = false): Promise<number> {
   const glob = new Bun.Glob("*.md");
   const rfcs: RFC[] = [];
 
-  // Parse all RFC markdown files from each state folder
-  for (const state of RFC_STATES) {
-    const folder = `./${state}`;
+  for await (const filename of glob.scan("./rfcs")) {
+    console.log(`Processing rfcs/${filename}...`);
 
-    for await (const filename of glob.scan(folder)) {
-      console.log(`Processing ${state}/${filename}...`);
+    const path = `./rfcs/${filename}`;
+    const content = await Bun.file(path).text();
+    const rawHtml = Bun.markdown.html(content, { autolinks: true });
+    const html = await highlightCodeBlocks(rawHtml);
+    const number = parseRFCNumber(filename);
+    const title = parseTitle(content, filename);
+    const git = await getGitHistory(path, repoPath);
 
-      const path = `${folder}/${filename}`;
-      const content = await Bun.file(path).text();
-      const rawHtml = Bun.markdown.html(content, { autolinks: true });
-      const html = await highlightCodeBlocks(rawHtml);
-      const number = parseRFCNumber(filename);
-      const title = parseTitle(content, filename);
-      const git = await getGitHistory(path, repoPath);
-
-      rfcs.push({ number, title, filename, html, git, state });
-    }
+    rfcs.push({ number, title, filename, html, git });
   }
 
   if (rfcs.length === 0) {
-    console.log(
-      "No RFC files found in ./proposed/, ./accepted/, or ./completed/",
-    );
+    console.log("No RFC files found in ./rfcs/");
     return 0;
   }
 
@@ -598,9 +535,7 @@ async function startDevServer() {
   // Initial build with live reload enabled
   await build(true);
   console.log(`\nStarting dev server at http://localhost:${PORT}`);
-  console.log(
-    "Watching for changes in ./proposed/, ./accepted/, ./completed/, and ./styles.css\n",
-  );
+  console.log("Watching for changes in ./rfcs/ and ./styles.css\n");
 
   // Debounce rebuilds
   let rebuildTimeout: Timer | null = null;
@@ -613,14 +548,11 @@ async function startDevServer() {
     }, 100);
   };
 
-  // Watch all state directories
-  for (const state of RFC_STATES) {
-    watch(`./${state}`, { recursive: true }, (_event, filename) => {
-      if (filename?.endsWith(".md")) {
-        scheduleRebuild();
-      }
-    });
-  }
+  watch("./rfcs", { recursive: true }, (_event, filename) => {
+    if (filename?.endsWith(".md")) {
+      scheduleRebuild();
+    }
+  });
 
   // Watch styles.css
   watch("./styles.css", () => {
