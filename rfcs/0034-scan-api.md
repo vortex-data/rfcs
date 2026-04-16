@@ -1,5 +1,5 @@
 - Start Date: 2026-04-07
-- Authors: Nick Gates
+- Authors: @gatesn
 - RFC PR: [vortex-data/rfcs#0034](https://github.com/vortex-data/rfcs/pull/0034)
 
 # Scan API
