@@ -45,7 +45,8 @@ jobs:
           # Grandfathered RFCs that predate the PR number convention
           GRANDFATHERED="5 15 23 24 27 29 33"
 
-          CHANGED_RFCS=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'rfcs/' \
+          # Only check newly added RFC files, not moved/renamed ones
+          CHANGED_RFCS=$(git diff --name-only --diff-filter=A "$BASE_SHA" "$HEAD_SHA" -- 'rfcs/' \
             | grep -v '^rfcs/0000-template\.md$' || true)
 
           COUNT=$(echo "$CHANGED_RFCS" | grep -c . || true)

@@ -3,6 +3,7 @@ import { watch } from "fs";
 import { createHighlighter, type Highlighter } from "shiki";
 
 const isDev = process.argv.includes("--dev");
+const isPreview = process.argv.includes("--preview");
 const PORT = 3000;
 
 interface GitCommit {
@@ -697,8 +698,99 @@ async function startDevServer() {
   });
 }
 
+async function buildPreview(): Promise<void> {
+  console.log("Building RFC preview...\n");
+
+  const repoUrl = await getGitHubRepoUrl();
+  const repoPath = repoUrl ? repoUrl.replace("https://github.com/", "") : null;
+  const css = await Bun.file("styles.css").text();
+
+  // Find new/changed RFC files compared to the base branch
+  const glob = new Bun.Glob("*.md");
+  const rfcs: RFC[] = [];
+
+  for await (const filename of glob.scan("./rfcs")) {
+    const path = `./rfcs/${filename}`;
+    const content = await Bun.file(path).text();
+    const rawHtml = Bun.markdown.html(content, { autolinks: true });
+    const html = await highlightCodeBlocks(rawHtml);
+    const number = parseRFCNumber(filename);
+    const title = parseTitle(content, filename);
+    const git = await getGitHistory(path, repoPath);
+
+    rfcs.push({ number, title, filename, html, git });
+  }
+
+  // Build a single self-contained index page with all RFCs and inlined CSS
+  const proposed = await getProposedRFCs(repoPath);
+  const sorted = [...rfcs].sort((a, b) => b.number.localeCompare(a.number));
+
+  let rfcPages = "";
+  for (const rfc of sorted) {
+    rfcPages += `
+    <article class="rfc-content" id="rfc-${rfc.number}">
+      <hr>
+      ${rfc.html}
+    </article>`;
+  }
+
+  const list = sorted
+    .map(
+      (rfc) => `
+      <li>
+        <a href="#rfc-${rfc.number}" class="rfc-item">
+          <span class="rfc-number">RFC ${rfc.number}</span>
+          <span class="rfc-title">${escapeHTML(rfc.title)}</span>
+        </a>
+      </li>`,
+    )
+    .join("\n");
+
+  const content = `
+      <h1>Request for Comments</h1>
+      <p>Technical proposals for the Vortex file format.</p>
+      <h2>Accepted</h2>
+      <ul class="rfc-list">
+${list}
+      </ul>
+${rfcPages}`;
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vortex RFCs — Preview</title>
+  <style>${css}</style>
+  <script>${THEME_SCRIPT}</script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="header-brand">
+        <h1>Vortex RFCs — Preview</h1>
+      </div>
+      <div class="header-actions">
+        <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme"></button>
+      </div>
+    </header>
+    <main>
+${content}
+    </main>
+  </div>
+  <script>${TOGGLE_SCRIPT}</script>
+</body>
+</html>`;
+
+  await $`mkdir -p dist`.quiet();
+  await Bun.write("dist/preview.html", html);
+  console.log("Generated dist/preview.html");
+}
+
 if (isDev) {
   startDevServer().catch(console.error);
+} else if (isPreview) {
+  buildPreview().catch(console.error);
 } else {
   build()
     .then((count) => {
