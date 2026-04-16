@@ -1,5 +1,5 @@
 - Start Date: YYYY-MM-DD (today's date)
-- Authors: John Smith, Foo Bar
+- Authors: @username1, @username2
 - RFC PR: [vortex-data/rfcs#0000](https://github.com/vortex-data/rfcs/pull/0000)
 
 # RFC Template

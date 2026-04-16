@@ -29,7 +29,7 @@ interface RFC {
   filename: string;
   html: string;
   git: RFCGitInfo;
-  authors: string[] | null; // parsed from markdown frontmatter, overrides git author
+  authors: GitHubAuthor[]; // parsed from markdown frontmatter @usernames, or git author fallback
 }
 
 interface ProposedRFC {
@@ -37,7 +37,7 @@ interface ProposedRFC {
   title: string;
   prNumber: number;
   prUrl: string;
-  author: GitHubAuthor | null;
+  authors: GitHubAuthor[];
 }
 
 const THEME_SCRIPT = `
@@ -151,19 +151,14 @@ function indexPage(
     .map((rfc) => {
       const dateStr = rfc.git.accepted ? formatDate(rfc.git.accepted.date) : "";
 
-      let authorHTML = "";
-      if (rfc.authors) {
-        authorHTML = `<span class="rfc-author-name">${rfc.authors.map(escapeHTML).join(", ")}</span>`;
-      } else if (rfc.git.author && rfc.git.accepted) {
-        const commitUrl = repoUrl
-          ? `${repoUrl}/commit/${rfc.git.accepted.hash}`
-          : `https://github.com/${rfc.git.author.login}`;
-        authorHTML = `
-          <a href="${commitUrl}" class="rfc-author-link" title="${rfc.git.author.login}">
-            <img src="${rfc.git.author.avatarUrl}" alt="${rfc.git.author.login}" class="rfc-author-avatar">
-            <span class="rfc-author-name">${rfc.git.author.login}</span>
-          </a>`;
-      }
+      const authorHTML = rfc.authors
+        .map(
+          (author) => `
+          <a href="${author.profileUrl}" class="rfc-author-link" title="${author.login}">
+            <img src="${author.avatarUrl}" alt="${author.login}" class="rfc-author-avatar">
+          </a>`,
+        )
+        .join("");
 
       return `
       <li>
@@ -180,14 +175,14 @@ function indexPage(
   if (proposed.length > 0) {
     const proposedList = proposed
       .map((rfc) => {
-        let authorHTML = "";
-        if (rfc.author) {
-          authorHTML = `
-          <a href="${rfc.author.profileUrl}" class="rfc-author-link" title="${rfc.author.login}">
-            <img src="${rfc.author.avatarUrl}" alt="${rfc.author.login}" class="rfc-author-avatar">
-            <span class="rfc-author-name">${rfc.author.login}</span>
-          </a>`;
-        }
+        const authorHTML = rfc.authors
+          .map(
+            (author) => `
+          <a href="${author.profileUrl}" class="rfc-author-link" title="${author.login}">
+            <img src="${author.avatarUrl}" alt="${author.login}" class="rfc-author-avatar">
+          </a>`,
+          )
+          .join("");
 
         return `
       <li>
@@ -238,20 +233,20 @@ function rfcPage(
           <span class="rfc-status-pill status-accepted">Accepted</span>
         </div>`;
 
-  if (rfc.git.accepted || rfc.git.author || rfc.authors) {
-    // Author section
-    if (rfc.authors) {
+  if (rfc.git.accepted || rfc.authors.length > 0) {
+    if (rfc.authors.length > 0) {
+      const authorsHTML = rfc.authors
+        .map(
+          (author) => `
+            <a href="${author.profileUrl}" class="author-link">
+              <img src="${author.avatarUrl}" alt="${author.login}" class="author-avatar">
+              <span class="author-name">${author.login}</span>
+            </a>`,
+        )
+        .join(", ");
       gitHeader += `
         <div class="rfc-meta-item rfc-author">
-          <span class="author-name">${rfc.authors.map(escapeHTML).join(", ")}</span>
-        </div>`;
-    } else if (rfc.git.author) {
-      gitHeader += `
-        <div class="rfc-meta-item rfc-author">
-          <a href="${rfc.git.author.profileUrl}" class="author-link">
-            <img src="${rfc.git.author.avatarUrl}" alt="${rfc.git.author.login}" class="author-avatar">
-            <span class="author-name">${rfc.git.author.login}</span>
-          </a>
+          ${authorsHTML}
         </div>`;
     }
 
@@ -422,17 +417,24 @@ async function validateProposals(): Promise<ValidationError[]> {
   return errors;
 }
 
-function parseAuthors(markdown: string): string[] | null {
-  // Match "- Authors: Name1, Name2" or "**Authors:** Name1, Name2"
+function parseAuthorLogins(markdown: string): string[] {
+  // Match "- Authors: @user1, @user2" or "**Authors:** @user1, @user2"
   const match = markdown.match(
     /^(?:-\s*Authors:\s*|\*\*Authors:\*\*\s*)(.+)$/im,
   );
-  if (!match?.[1]) return null;
-  const authors = match[1]
+  if (!match?.[1]) return [];
+  return match[1]
     .split(",")
-    .map((a) => a.trim())
+    .map((a) => a.trim().replace(/^@/, ""))
     .filter(Boolean);
-  return authors.length > 0 ? authors : null;
+}
+
+function loginsToAuthors(logins: string[]): GitHubAuthor[] {
+  return logins.map((login) => ({
+    login,
+    avatarUrl: `https://github.com/${login}.png?size=48`,
+    profileUrl: `https://github.com/${login}`,
+  }));
 }
 
 function parseTitle(markdown: string, filename: string): string {
@@ -510,7 +512,7 @@ async function getProposedRFCs(
   if (!repoPath) return [];
   try {
     const result =
-      await $`gh pr list --repo ${repoPath} --state open --json number,title,url,files,author`.quiet();
+      await $`gh pr list --repo ${repoPath} --state open --json number,title,url,files,author,headRefName`.quiet();
     const prs = JSON.parse(result.stdout.toString());
     const proposed: ProposedRFC[] = [];
 
@@ -527,18 +529,30 @@ async function getProposedRFCs(
       const rfcNumber = rfcFile.path.match(/(\d{4})-/)?.[1];
       if (!rfcNumber) continue;
 
+      // Fetch file content from PR branch to parse authors
+      let authors: GitHubAuthor[] = [];
+      try {
+        const fileResult =
+          await $`gh api repos/${repoPath}/contents/${rfcFile.path}?ref=${pr.headRefName} --jq '.content'`.quiet();
+        const content = atob(fileResult.stdout.toString().trim());
+        const logins = parseAuthorLogins(content);
+        if (logins.length > 0) {
+          authors = loginsToAuthors(logins);
+        }
+      } catch {
+        // Fall back to PR author
+      }
+
+      if (authors.length === 0 && pr.author) {
+        authors = loginsToAuthors([pr.author.login]);
+      }
+
       proposed.push({
         number: rfcNumber,
         title: pr.title,
         prNumber: pr.number,
         prUrl: pr.url,
-        author: pr.author
-          ? {
-              login: pr.author.login,
-              avatarUrl: `https://github.com/${pr.author.login}.png?size=48`,
-              profileUrl: `https://github.com/${pr.author.login}`,
-            }
-          : null,
+        authors,
       });
     }
 
@@ -579,8 +593,14 @@ async function build(liveReload: boolean = false): Promise<number> {
     const html = await highlightCodeBlocks(rawHtml);
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
-    const authors = parseAuthors(content);
+    const authorLogins = parseAuthorLogins(content);
     const git = await getGitHistory(path, repoPath);
+    const authors =
+      authorLogins.length > 0
+        ? loginsToAuthors(authorLogins)
+        : git.author
+          ? [git.author]
+          : [];
 
     rfcs.push({ number, title, filename, html, git, authors });
   }
@@ -738,8 +758,14 @@ async function buildPreview(): Promise<void> {
     const html = await highlightCodeBlocks(rawHtml);
     const number = parseRFCNumber(filename);
     const title = parseTitle(content, filename);
-    const authors = parseAuthors(content);
+    const authorLogins = parseAuthorLogins(content);
     const git = await getGitHistory(path, repoPath);
+    const authors =
+      authorLogins.length > 0
+        ? loginsToAuthors(authorLogins)
+        : git.author
+          ? [git.author]
+          : [];
 
     rfcs.push({ number, title, filename, html, git, authors });
   }

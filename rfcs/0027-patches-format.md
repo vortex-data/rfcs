@@ -1,4 +1,5 @@
 - Start Date: 2026-03-02
+- Authors: @a10y
 - Tracking Issue: TBD
 - Draft PR: https://github.com/vortex-data/vortex/pull/6815
 
