@@ -494,6 +494,15 @@ footer {
   font-size: 0.875rem;
 }
 
+/* Proposed RFCs (from open PRs) */
+.rfc-list-proposed {
+  opacity: 0.75;
+}
+
+.rfc-list-proposed li {
+  border-left: 3px solid var(--border);
+}
+
 /* Shiki syntax highlighting - dual theme support */
 pre.shiki {
   font-family:

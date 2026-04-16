@@ -30,6 +30,14 @@ interface RFC {
   git: RFCGitInfo;
 }
 
+interface ProposedRFC {
+  number: string;
+  title: string;
+  prNumber: number;
+  prUrl: string;
+  author: GitHubAuthor | null;
+}
+
 const THEME_SCRIPT = `
 (function() {
   const saved = localStorage.getItem('theme') || 'light';
@@ -130,6 +138,7 @@ function escapeHTML(str: string): string {
 
 function indexPage(
   rfcs: RFC[],
+  proposed: ProposedRFC[],
   repoUrl: string | null,
   liveReload: boolean = false,
 ): string {
@@ -163,9 +172,42 @@ function indexPage(
     })
     .join("\n");
 
+  let proposedSection = "";
+  if (proposed.length > 0) {
+    const proposedList = proposed
+      .map((rfc) => {
+        let authorHTML = "";
+        if (rfc.author) {
+          authorHTML = `
+          <a href="${rfc.author.profileUrl}" class="rfc-author-link" title="${rfc.author.login}">
+            <img src="${rfc.author.avatarUrl}" alt="${rfc.author.login}" class="rfc-author-avatar">
+            <span class="rfc-author-name">${rfc.author.login}</span>
+          </a>`;
+        }
+
+        return `
+      <li>
+        <a href="${rfc.prUrl}" class="rfc-item" target="_blank" rel="noopener">
+          <span class="rfc-number">RFC ${rfc.number}</span>
+          <span class="rfc-title">${escapeHTML(rfc.title)}</span>
+          <span class="rfc-date">PR #${rfc.prNumber}</span>
+        </a>${authorHTML}
+      </li>`;
+      })
+      .join("\n");
+
+    proposedSection = `
+      <h2>Proposed</h2>
+      <ul class="rfc-list rfc-list-proposed">
+${proposedList}
+      </ul>`;
+  }
+
   const content = `
       <h1>Request for Comments</h1>
       <p>Technical proposals for the Vortex file format.</p>
+${proposedSection}
+      <h2>Accepted</h2>
       <ul class="rfc-list">
 ${list}
       </ul>`;
@@ -437,6 +479,50 @@ async function highlightCodeBlocks(html: string): Promise<string> {
   return result;
 }
 
+async function getProposedRFCs(
+  repoPath: string | null,
+): Promise<ProposedRFC[]> {
+  if (!repoPath) return [];
+  try {
+    const result =
+      await $`gh pr list --repo ${repoPath} --state open --json number,title,url,files,author`.quiet();
+    const prs = JSON.parse(result.stdout.toString());
+    const proposed: ProposedRFC[] = [];
+
+    for (const pr of prs) {
+      // Find RFC files in the PR's changed files (match rfcs/, proposed/, proposals/)
+      const rfcFile = pr.files?.find(
+        (f: { path: string }) =>
+          f.path.match(
+            /^(rfcs|proposed|proposals)\/\d{4}-[a-zA-Z0-9_-]+\.md$/,
+          ) && !f.path.endsWith("/0000-template.md"),
+      );
+      if (!rfcFile) continue;
+
+      const rfcNumber = rfcFile.path.match(/(\d{4})-/)?.[1];
+      if (!rfcNumber) continue;
+
+      proposed.push({
+        number: rfcNumber,
+        title: pr.title,
+        prNumber: pr.number,
+        prUrl: pr.url,
+        author: pr.author
+          ? {
+              login: pr.author.login,
+              avatarUrl: `https://github.com/${pr.author.login}.png?size=48`,
+              profileUrl: `https://github.com/${pr.author.login}`,
+            }
+          : null,
+      });
+    }
+
+    return proposed.sort((a, b) => b.number.localeCompare(a.number));
+  } catch {
+    return [];
+  }
+}
+
 async function build(liveReload: boolean = false): Promise<number> {
   console.log("Building Vortex RFC site...\n");
 
@@ -501,8 +587,14 @@ async function build(liveReload: boolean = false): Promise<number> {
     console.log(`Copied static/${filename} -> ${dest}`);
   }
 
+  // Fetch proposed RFCs from open PRs
+  const proposed = await getProposedRFCs(repoPath);
+  if (proposed.length > 0) {
+    console.log(`Found ${proposed.length} proposed RFC(s) from open PRs`);
+  }
+
   // Generate index page
-  const indexHTML = indexPage(rfcs, repoUrl, liveReload);
+  const indexHTML = indexPage(rfcs, proposed, repoUrl, liveReload);
   await Bun.write("dist/index.html", indexHTML);
   console.log("Generated dist/index.html");
 
