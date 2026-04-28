@@ -12,13 +12,13 @@ warrants a new `DType` variant or is merely `FixedSizeList<u8, n>` under a diffe
 fundamentally, we lack a shared vocabulary for reasoning about what makes two types "different" at
 the logical level.
 
-This RFC formalizes the Vortex type system by grounding `DType` as a quotient type over physical
-encodings: each `DType` variant names an equivalence class of encodings that decode to the same
-logical values. It then uses refinement types to establish a decision framework for when new `DType`
+This RFC formalizes the Vortex type system by treating physical arrays that decode to the same
+logical values as equivalent, and by requiring operations on logical types to respect that
+equivalence. It then uses refinement types to establish a decision framework for when new `DType`
 variants are justified. A new logical type requires either semantic distinctness (a genuinely
-different equivalence class) or a refinement predicate that gates operations unavailable on the
-parent type. If justified, a second step determines whether the type belongs in core `DType` or as
-an extension type.
+different domain of values or operation contract) or a refinement predicate that gates operations
+unavailable on the parent type. If justified, a second step determines whether the type belongs in
+core `DType` or as an extension type.
 
 ## Overview
 
@@ -27,12 +27,14 @@ a set of `Canonical` encodings that represent the different targets that arrays 
 
 ### Logical vs. Physical Types
 
-A **logical type** (`DType`) describes what the data means, independent of how it is stored (e.g.,
-`Primitive(I32)`, `Utf8`, `List(Primitive(I32))`). A **physical encoding** describes how data is
-laid out in memory or on disk (e.g., flat buffer, dictionary-encoded, run-end-encoded, bitpacked).
-Many physical encodings can represent the same logical type.
+A **logical type** (`DType`) describes what operations are available, what laws those operations
+obey, and what the data means independent of how it is stored (e.g., `Primitive(I32)`, `Utf8`,
+`List(Primitive(I32))`). A **physical encoding** describes how data is laid out in memory or on disk
+(e.g., flat buffer, dictionary-encoded, run-end-encoded, bitpacked). Many physical encodings can
+represent the same logical type.
 
-Vortex separates these two concepts so that encodings and compute can evolve independently. Without
+Vortex separates these two concepts so that consumers can write code against logical operations,
+while new physical encodings can be added without changing that code. Without
 this separation, implementing `M` operations across `N` encodings requires `N * M` implementations.
 With it, each encoding only needs to decompress itself and each operation only needs to target
 decompressed forms, reducing the cost to `N + M`. See this
@@ -50,7 +52,7 @@ for the common compute case, but not fundamental: nothing in theory privileges `
 
 Vortex's built-in set of logical types will not cover every use case. Extension types allow external
 consumers to define their own logical types on top of existing `DType`s without modifying the core
-type system. See [RFC 0005](./0005-extension.md) for the full design.
+type system. See [RFC #0005](https://github.com/vortex-data/rfcs/pull/5) for the full design.
 
 ## Motivation
 
@@ -79,7 +81,7 @@ intuitively, but there is value in mapping these implicit concepts to explicit t
 Note that this section made heavy use of LLMs to help research and identify terms and definitions,
 as the author of this RFC is notably _not_ a type theory expert.
 
-### Equivalence Classes and `DType` as a Quotient Type
+### Equivalence Classes over Physical Arrays
 
 #### In Theory
 
@@ -102,19 +104,18 @@ to a well-defined function on the quotient `f' : A/~ → B`.
 Consider the set of all physical array representations / encodings in Vortex: a dictionary-encoded
 `i32` array, a run-end-encoded `i32` array, a bitpacked `i32` array, a flat Arrow `i32` buffer, etc.
 
-Two physical encodings are logically equivalent if and only if they produce the same logical
-sequence of values when decoded / decompressed. This equivalence relation partitions the space of
-all physical encodings into equivalence classes, where each class corresponds to a single logical
-column of data.
+Two physical arrays are logically equivalent if and only if they produce the same logical sequence
+of values when decoded / decompressed. This equivalence relation partitions the space of physical
+arrays into equivalence classes, where each class corresponds to a single logical column value.
 
-A Vortex `DType` like `Primitive(I32, NonNullable)` **names** one of these equivalence classes. It
-tells us what logical data we are working with, but says nothing about which physical encoding is
-representing it. Thus, we can say that logical types in Vortex form equivalence classes, and `DType`
-is the set of equivalence classes. More formally, `DType` is the quotient type over the space of
-physical encodings, collapsed by the decoded / decompressed equivalence relation.
+A Vortex `DType` like `Primitive(I32, NonNullable)` identifies the logical type of many such
+equivalence classes. It tells us which domain of values and operations we are working with, but says
+nothing about which physical encoding is representing any particular array. Thus, the quotient is
+best understood as a quotient over physical array values, while `DType` indexes the logical family
+those values belong to.
 
-This quotient structure imposes a concrete requirement: any operation defined on `DType` must
-produce the same result regardless of which physical encoding backs the data.
+This quotient structure imposes a concrete requirement: any operation defined on arrays of a
+`DType` must produce the same logical result regardless of which physical encoding backs the data.
 
 For example, operations like `filter`, `take`, and `scalar_at` all satisfy this: they depend only on
 the logical values, not on how those values are stored. However, an operation like "return the
@@ -136,8 +137,8 @@ type, which physical encoding should I use to represent it?"
 exactly one canonical physical form:
 
 ```rust
-/// The different logical types in Vortex (the different equivalence classes).
-/// This is the quotient type!
+/// The different logical types in Vortex.
+/// Each logical type indexes a family of logical array values.
 pub enum DType {
     Null,
     Bool(Nullability),
@@ -254,8 +255,8 @@ variant of `DType`) or an extension type.
 **Step 1: Is a new logical type justified?** A new logical type is justified when it is
 distinguishable from existing types by one of the following criteria:
 
-1. **Is it semantically distinct?** (Quotient type criterion.) The values must form a genuinely
-   different equivalence class, not merely a different physical layout.
+1. **Is it semantically distinct?** (Logical-domain criterion.) The values must have a genuinely
+   different domain, semantics, or operation contract, not merely a different physical layout.
 2. **Does it have a refinement predicate that gates different operations?** (Refinement type
    criterion.) A predicate that restricts the domain of values _and_ enables or disables specific
    operations justifies a new logical type. For example, `valid_utf8` gates string operations that
@@ -265,7 +266,7 @@ If neither criterion applies, the difference is purely physical and belongs in t
 
 **Step 2: Core type or extension type?** Once a new logical type is justified, the question is
 whether it belongs in the core `DType` enum or as an extension type (see
-[RFC 0005](./0005-extension.md)).
+[RFC #0005](https://github.com/vortex-data/rfcs/pull/5)).
 
 This must be a pragmatic decision: if the operations gated by the type are owned by core Vortex
 (e.g., string kernels for `Utf8`), it should be a first-class `DType`. If the gated operations are
