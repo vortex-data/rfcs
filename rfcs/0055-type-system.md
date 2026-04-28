@@ -12,13 +12,13 @@ warrants a new `DType` variant or is merely `FixedSizeList<u8, n>` under a diffe
 fundamentally, we lack a shared vocabulary for reasoning about what makes two types "different" at
 the logical level.
 
-This RFC formalizes the Vortex type system by treating physical arrays that decode to the same
-logical values as equivalent, and by requiring operations on logical types to respect that
-equivalence. It then uses refinement types to establish a decision framework for when new `DType`
-variants are justified. A new logical type requires either semantic distinctness (a genuinely
-different domain of values or operation contract) or a refinement predicate that gates operations
-unavailable on the parent type. If justified, a second step determines whether the type belongs in
-core `DType` or as an extension type.
+This RFC formalizes the Vortex type system by treating physical arrays or executable array plans
+that produce the same logical values as equivalent, and by requiring operations on logical types to
+respect that equivalence. It then uses refinement types to establish a decision framework for when
+new `DType` variants are justified. A new logical type requires either semantic distinctness (a
+genuinely different domain of values or operation contract) or a refinement predicate that gates
+operations unavailable on the parent type. If justified, a second step determines whether the type
+belongs in core `DType` or as an extension type.
 
 ## Overview
 
@@ -34,10 +34,10 @@ obey, and what the data means independent of how it is stored (e.g., `Primitive(
 represent the same logical type.
 
 Vortex separates these two concepts so that consumers can write code against logical operations,
-while new physical encodings can be added without changing that code. Without
-this separation, implementing `M` operations across `N` encodings requires `N * M` implementations.
-With it, each encoding only needs to decompress itself and each operation only needs to target
-decompressed forms, reducing the cost to `N + M`. See this
+while new physical encodings can be added without changing that code. Without this separation,
+implementing `M` operations across `N` encodings requires `N * M` implementations. With it, each
+encoding only needs to decompress itself and each operation only needs to target decompressed forms,
+reducing the cost to `N + M`. See this
 [blog post](https://spiraldb.com/post/logical-vs-physical-data-types) for more information.
 
 ### What is a `Canonical` encoding?
@@ -101,12 +101,14 @@ to a well-defined function on the quotient `f' : A/~ → B`.
 
 #### In Vortex
 
-Consider the set of all physical array representations / encodings in Vortex: a dictionary-encoded
-`i32` array, a run-end-encoded `i32` array, a bitpacked `i32` array, a flat Arrow `i32` buffer, etc.
+Consider the set of all physical array representations / executable array plans in Vortex: a
+dictionary-encoded `i32` array, a run-end-encoded `i32` array, a bitpacked `i32` array, a flat Arrow
+`i32` buffer, etc.
 
-Two physical arrays are logically equivalent if and only if they produce the same logical sequence
-of values when decoded / decompressed. This equivalence relation partitions the space of physical
-arrays into equivalence classes, where each class corresponds to a single logical column value.
+Two physical arrays or array plans are logically equivalent if and only if they produce the same
+logical sequence of values when executed / decoded / decompressed. This equivalence relation
+partitions the space of physical array representations into equivalence classes, where each class
+corresponds to a single logical column value.
 
 A Vortex `DType` like `Primitive(I32, NonNullable)` identifies the logical type of many such
 equivalence classes. It tells us which domain of values and operations we are working with, but says
@@ -114,27 +116,50 @@ nothing about which physical encoding is representing any particular array. Thus
 best understood as a quotient over physical array values, while `DType` indexes the logical family
 those values belong to.
 
-This quotient structure imposes a concrete requirement: any operation defined on arrays of a
-`DType` must produce the same logical result regardless of which physical encoding backs the data.
+This quotient structure imposes a concrete requirement: any operation defined on arrays of a `DType`
+must produce the same logical result regardless of which physical encoding backs the data.
 
 For example, operations like `filter`, `take`, and `scalar_at` all satisfy this: they depend only on
 the logical values, not on how those values are stored. However, an operation like "return the
 `ends` buffer" is not well-defined on the quotient type as that only exists for run-end encoding.
 
-### Sections and Canonicalization
+### Canonical Execution
 
-Observe that every physical array (a specific encoding combined with actual data) maps back to a
-`DType`. A run-end-encoded `i32` array maps to `Primitive(I32)`, as does a dictionary-encoded `i32`
-array. A `VarBinView` array can map to either `Utf8` or `Binary`, depending on whether its contents
-are valid UTF-8. Call this projection `π : Array → DType`.
+Observe that every physical array or executable array plan maps back to a `DType`. A run-end-encoded
+`i32` array maps to `Primitive(I32)`, as does a dictionary-encoded `i32` array. A `VarBinView` array
+can map to either `Utf8` or `Binary`, depending on whether its contents are valid UTF-8. Call this
+projection `dtype : ArrayRef -> DType`.
 
-A **section** is a right-inverse of this projection: a function `s : DType → Array` that injects
-each logical type back into the space of physical encodings, such that projecting back recovers the
-original `DType` (`π(s(d)) = d`). In other words, a section answers the question: "given a logical
-type, which physical encoding should I use to represent it?"
+Canonical execution has both a dtype-level design choice and an array-level operation:
 
-**In Vortex**, the current `to_canonical` function is a section. For each `DType`, it selects
-exactly one canonical physical form:
+1. For each `DType`, Vortex chooses a single canonical physical encoding.
+2. For each concrete array plan, `execute::<Canonical>(&mut ctx)` evaluates that plan into the
+   chosen encoding while preserving its dtype and logical values.
+
+In other words, a `DType` can tell us which canonical encoding to use, but it cannot produce a
+canonical array by itself because it has no length or values. The value-level operation is exposed
+as:
+
+```rust
+array.execute::<Canonical>(&mut ctx)
+```
+
+For the laws below, we write `execute_canonical(a)` for execution into `Canonical`. For an array
+plan `a`, canonical execution must satisfy:
+
+```text
+dtype(execute_canonical(a)) = dtype(a)
+execute_canonical(a) ~ a
+```
+
+where `~` is the logical equivalence relation over physical arrays or array plans described above.
+If two arrays are logically equivalent, canonical execution must preserve that equivalence:
+
+```text
+if a ~ b then execute_canonical(a) ~ execute_canonical(b)
+```
+
+The current `DType` and `Canonical` enums are:
 
 ```rust
 /// The different logical types in Vortex.
@@ -149,11 +174,11 @@ pub enum DType {
     List(Arc<DType>, Nullability),
     FixedSizeList(Arc<DType>, u32, Nullability),
     Struct(StructFields, Nullability),
+    Variant(Nullability),
     Extension(ExtDTypeRef),
 }
 
-/// We "choose" the set of representations for each of the logical types.
-/// This is the image/result of the `to_canonical` function (where `to_canonical` is the section).
+/// The canonical physical array encodings returned by canonical execution.
 pub enum Canonical {
     Null(NullArray),
     Bool(BoolArray),
@@ -163,29 +188,30 @@ pub enum Canonical {
     List(ListViewArray),
     FixedSizeList(FixedSizeListArray),
     Struct(StructArray),
+    Variant(VariantArray),
     Extension(ExtensionArray),
 }
 ```
 
-More formally, `Canonical` enumerates the **image** of the section `to_canonical`. Note that the
-section is _not_ a bijection between `DType` and `Canonical`: multiple logical types can share the
-same canonical form. For example, both `Utf8` and `Binary` canonicalize to `VarBinView`.
+`Canonical` is _not_ a bijection with `DType`: multiple logical types can share the same canonical
+physical encoding. For example, both `Utf8` and `Binary` canonicalize to `VarBinView`.
 
 This non-bijection is deliberate. If `DType` and `Canonical` were in bijection, the physical type
 system would "leak" into the logical types.
 
 For example, if two logically distinct types coincidentally share the same physical layout, a
-bijective section would conflict with having both as separate logical `DType`s since "there is no
-physical reason for the second." But this reasoning is backwards: logical types are justified by
-their _semantics_ (the operations they gate and the refinement predicates they carry), not by
-whether they coincidentally share a physical representation.
+one-to-one mapping between `DType` and canonical physical encoding would conflict with having both
+as separate logical `DType`s since "there is no physical reason for the second." But this reasoning
+is backwards: logical types are justified by their _semantics_ (the operations they gate and the
+refinement predicates they carry), not by whether they coincidentally share a physical
+representation.
 
 `Canonical` also represents several arbitrary **choices**. Nothing in the theory privileges
-`ListView` over `List` as the canonical representation for variable-length list data. Both are valid
-sections (both pick a representation from the same equivalence class), and both satisfy
-`π(s(d)) = d`. Even dictionary encoding or run-end encoding are theoretically valid sections. The
-fact that we choose flat, uncompressed forms as canonical is a design choice optimized for compute,
-not a theoretical requirement.
+`ListView` over `List` as the canonical representation for variable-length list data. Both could be
+chosen as the canonical encoding for `List`, and either choice could satisfy the canonical execution
+laws above. Even dictionary encoding or run-end encoding could theoretically be chosen as canonical.
+The fact that we choose flat, uncompressed forms as canonical is a design choice optimized for
+compute, not a theoretical requirement.
 
 ### The Church-Rosser Property (Confluence)
 
@@ -195,9 +221,10 @@ result (called a **normal form**). For example, the expression `(2 + 3) * (1 + 1
 evaluating the left subexpression first (`5 * (1 + 1)`) or the right first (`(2 + 3) * 2`), but both
 paths arrive at `10`.
 
-**In current Vortex**, `to_canonical` is confluent by construction. Applying `take`, `filter`, or
-`scalar_at` before or after canonicalization produces the same logical values. There is one normal
-form per `DType`, and every reduction path reaches it.
+**In current Vortex**, execution into `Canonical` is confluent by construction. Applying `take`,
+`filter`, or `scalar_at` before or after canonical execution produces the same logical values. There
+is one chosen canonical encoding per `DType`, and one canonical representative per logical array
+value under that strategy.
 
 A **non-confluent** rewriting system is one where two reduction paths from the same starting point
 can arrive at different normal forms. Non-confluent systems are well-studied, and the standard
@@ -383,8 +410,8 @@ unresolved. See [Unresolved Questions](#unresolved-questions).
 - We can have extension types be a generalization of the refinement type pattern: for example we
   could enforce user-defined predicates that gate custom operations on existing `DType`s.
 - Using the decision framework to audit existing `DType` variants and determine if any should be
-  consolidated or split, as well as to make decisions about logical types we want to add (namely
-  `FixedSizeBinary` and `Variant`).
+  consolidated or split, including accepted logical types such as `Variant`, as well as to make
+  decisions about logical types we may want to add, such as `FixedSizeBinary`.
 
 ## Further Reading
 
@@ -393,8 +420,6 @@ unresolved. See [Unresolved Questions](#unresolved-questions).
 - **Quotient types in type theory.**
   [nLab: quotient type](https://ncatlab.org/nlab/show/quotient+type). Altenkirch, Anberree, Li,
   "Quotient Types for Programmers" ([arXiv:1901.01006](https://arxiv.org/abs/1901.01006)).
-- **Sections in category theory.**
-  [Wikipedia: Section (category theory)](<https://en.wikipedia.org/wiki/Section_(category_theory)>).
 - **Church-Rosser property and confluence.**
   [Wikipedia: Church-Rosser theorem](https://en.wikipedia.org/wiki/Church%E2%80%93Rosser_theorem).
   [Wikipedia: Confluence](<https://en.wikipedia.org/wiki/Confluence_(abstract_rewriting)>). Baader &
