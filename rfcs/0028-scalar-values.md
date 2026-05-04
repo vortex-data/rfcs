@@ -25,6 +25,11 @@ binary values. Row-backed constants become the representation for non-null list,
 struct, variant, and other complex values where nested scalar materialization is expensive or
 requires array-level storage.
 
+Scalar functions already operate over `ArrayRef` inputs. This RFC does not change that calling
+convention. It only requires literals and constants to enter scalar-function execution as
+`ConstantArray(len = row_count, value = ...)`, with complex values represented by row-backed
+constants.
+
 ## Motivation
 
 Vortex currently uses `ScalarValue::Tuple(Vec<Option<ScalarValue>>)` for list, fixed-size-list, and
@@ -56,6 +61,8 @@ expensive nested scalar object.
 - Avoid requiring an `ExecutionCtx` to construct or validate a `Scalar`.
 - Allow in-memory complex constants to hold device-resident array buffers without copying them into
   host scalar values.
+- Define a scalar-function broadcasting model where every input has logical length `row_count`, and
+  constants are represented as `ConstantArray`s.
 - Preserve compatibility with existing scalar literal and constant-array encodings.
 
 ## Non-Goals
@@ -64,6 +71,7 @@ expensive nested scalar object.
 - This RFC does not require every scalar-like API to move to arrays in one change.
 - This RFC does not define a device-resident `Scalar`.
 - This RFC does not require canonicalizing complex constants during expression deserialization.
+- This RFC does not redesign scalar function child execution or `Columnar`.
 
 ## Design
 
@@ -227,6 +235,28 @@ Row-backed constants should canonicalize by broadcasting the singleton row struc
 
 The key rule is that row-backed constants should not be converted into recursive `ScalarValue::Tuple`
 except when an API explicitly asks for a `Scalar`.
+
+### Scalar functions and broadcasting
+
+Scalar functions already take `ArrayRef` inputs. This RFC keeps that interface unchanged.
+
+The required calling convention is:
+
+- every input array has logical length `args.row_count()`
+- scalar broadcasting is represented by `ConstantArray(len = args.row_count(), value = ...)`
+- row-backed broadcasting is represented by
+  `ConstantArray(len = args.row_count(), value = Row(singleton_array))`
+- naked length-1 arrays are not normal scalar function inputs, except for private sub-executions
+  such as evaluating an all-constant expression once
+
+This means scalar functions do support broadcasting, but broadcasting is encoded in the array
+representation rather than in per-kernel length checks. A scalar function should not need to handle
+both `len == 1` and `len == row_count` inputs. Its inputs are always length `row_count`; some are
+physically constant.
+
+Scalar functions may still use constant fast paths by checking whether an input is a `ConstantArray`.
+This RFC only broadens what a constant can contain. It does not require changing the scalar-function
+execution API, adding argument materialization helpers, or changing `Columnar`.
 
 ### Serialization of ConstantArray
 
