@@ -1,5 +1,5 @@
 - Start Date: 2026-05-04
-- Authors: @ngates
+- Authors: @gatesn
 - RFC PR: TBD
 
 # Extension DTypes and Arrays
