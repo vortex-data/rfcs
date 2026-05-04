@@ -6,7 +6,7 @@
 
 ## Summary
 
-This RFC proposes a redesign of Vortex extension dtypes and extension arrays. Extension arrays should remain a fully type-erased semantic wrapper around a storage array, but their array encoding id should be the extension dtype id rather than the generic `vortex.ext` id. Scalar-function behavior for extensions should be implemented through session-registered scalar kernels, with helper APIs for common storage-delegation behavior, instead of ad hoc hooks on `ExtVTable` or special cases in every builtin scalar function.
+This RFC proposes a redesign of Vortex extension dtypes and extension arrays. Extension arrays should remain a fully type-erased semantic wrapper around a storage array, but their array encoding id should be the extension dtype id rather than the generic `vortex.ext` id. Scalar-function behavior for extensions should be implemented through session-registered `execute_parent` kernels, with helper APIs for common storage-delegation behavior, instead of ad hoc hooks on `ExtVTable` or special cases in every builtin scalar function.
 
 The proposal does not require a structural wire-format break. New readers should continue reading old `vortex.ext` arrays and should also read extension arrays encoded under their extension dtype id. A compatibility plugin should deserialize both forms into the same in-memory extension array representation.
 
@@ -22,9 +22,9 @@ Extensions are currently represented by a generic `vortex.ext` array encoding. T
 
 The design goal is to make extension types first-class semantic wrappers while preserving Vortex's plugin model:
 
-- Extension dtypes describe identity, metadata, storage dtype, validation, and high-level kind.
+- Extension dtypes describe identity, metadata, storage dtype, validation, and whether the extension is a nominal newtype or storage-preserving refinement.
 - Extension arrays wrap storage arrays and expose the extension id as their array encoding id.
-- Scalar-function behavior is provided by session-registered kernels.
+- Scalar-function behavior is provided by session-registered `execute_parent` kernels.
 - Storage delegation is implemented as a reusable kernel helper, not as a required check in every scalar function.
 
 ## Design
@@ -102,7 +102,6 @@ Extension dtype vtables should expose a coarse classification:
 ```rust
 pub enum ExtensionKind {
     Newtype,
-    Domain,
     Refinement,
 }
 
@@ -113,54 +112,70 @@ pub trait ExtVTable {
 }
 ```
 
-This is policy metadata, not an execution mechanism.
+This is policy metadata, not a custom execution mechanism. It gives Vortex a conservative default for generated storage-delegate kernels.
 
-`Newtype` means a nominal semantic type over storage. UUID over fixed bytes and UserId over `u64` are examples. The default policy should be conservative: do not assume storage operations have extension semantics.
+`Newtype` means a nominal semantic type over storage. UUID over fixed bytes and UserId over `u64` are examples. The default policy is conservative: do not assume storage operations have extension semantics. Newtypes must register session `execute_parent` kernels or explicit storage-delegate kernels for operations they support.
 
-`Domain` means a storage type plus constraints. PositiveInt over `i64` or Email over `Utf8` are examples. Operations may be storage-compatible, but results may need validation before being wrapped back into the extension type.
+`Refinement` means the extension represents a subset or refinement of the storage type where storage equality and value identity are still the extension's equality and value identity. Utf8-over-Binary, non-empty-Utf8, and fixed-size-list-as-list are examples.
 
-`Refinement` means a storage type plus a representational invariant. Utf8-over-Binary or fixed-size-list-as-list are examples. Operations that preserve existing values, such as filter, take, slice, and dictionary decode, usually preserve the refinement.
+Refinements may get default generated storage-delegate kernels for operations that only observe or preserve existing values. Equality, inequality, hash, filter, take, slice, dictionary decode, and min/max are candidates when the storage operation has the same semantics. Transforming operations, such as arithmetic, casts into the refinement, string transforms, parsing, or functions that construct new values, still need explicit kernels or validation-aware wrapping.
 
-The kind is useful for documentation, default validation policy, planner hints, and future diagnostics. It should not replace explicit scalar kernels.
+The kind should not replace explicit session kernels. It is a default-policy input for the storage-delegate helper. If an extension's semantics differ from storage for a particular operation, the extension should be a `Newtype` or should avoid registering that default delegate.
 
-### Scalar Function Kernels
+### Session Execute-Parent Kernels
 
-Vortex should add a session-level scalar kernel registry. This is the extension point for extension-authored scalar-function behavior and storage delegation.
+Vortex should move `execute_parent` kernels into the session. This is the extension point for extension-authored scalar-function behavior and storage delegation.
+
+This is not a new scalar-function execution path. Today many scalar functions already have operation-specific kernels, such as `CastKernel`, `CompareKernel`, `LikeKernel`, and `FillNullKernel`, that are adapted into `ExecuteParentKernel` so a child encoding can execute its `ScalarFnArray` parent. This RFC proposes moving those `execute_parent` kernels from static child-vtable registration into a session registry.
+
+The registry should be keyed by parent id and child id:
 
 ```rust
-pub trait ScalarFnKernel: Send + Sync {
-    fn scalar_fn_id(&self) -> ScalarFnId;
+pub type ParentKernelKey = (Id, ArrayId);
 
-    fn execute(
+pub trait SessionExecuteParentKernel: Send + Sync {
+    fn parent_id(&self) -> Id;
+    fn child_id(&self) -> ArrayId;
+
+    fn execute_parent(
         &self,
-        scalar_fn: &ScalarFnRef,
-        args: &dyn ExecutionArgs,
+        child: &ArrayRef,
+        parent: &ArrayRef,
+        child_idx: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
 }
 ```
 
-The registry is stored in the session:
+The exact Rust signature can be refined during implementation. The important point is that the session stores erased `execute_parent` kernels. Existing typed `ExecuteParentKernel<V>` implementations can remain as an implementation convenience and be adapted into the erased session form.
 
-```rust
-pub struct ScalarKernelSession {
-    kernels: ScalarKernelRegistry,
-}
-```
+Parent id lookup should follow these rules:
 
-`ScalarFnArray::execute` should check the session scalar-kernel registry before calling the scalar function's default implementation:
+- For ordinary array parents, `parent_id = parent.encoding_id()`.
+- For `ScalarFnArray` parents, `parent_id = parent.scalar_fn().id()`, not the generic scalar-function array id.
+- The child id is always `child.encoding_id()`.
+
+After this RFC, an extension array's child id is its extension dtype id. That means scalar-function extension behavior can be registered as ordinary parent kernels:
 
 ```text
-1. Try exact/custom scalar kernels.
-2. Try generated storage-delegate kernels.
-3. Fall back to ScalarFnVTable::execute.
+(parent_id = vortex.binary, child_id = vortex.uuid)
+(parent_id = vortex.cast, child_id = vortex.timestamp)
+(parent_id = vortex.get_item, child_id = vortex.json)
 ```
 
-This centralizes extension dispatch. Individual builtin scalar functions do not all need to remember to check extension-specific flags.
+Execution order should be:
+
+```text
+1. For each child slot, try matching session execute_parent kernels.
+2. During migration, fall back to the child's static execute_parent implementation.
+3. If no parent kernel applies, execute the parent normally.
+```
+
+This centralizes extension dispatch in the existing parent-kernel mechanism. Individual builtin scalar functions do not all need to remember to check extension-specific flags.
 
 ### Custom Extension Kernels
 
-Extensions that need custom semantics register scalar kernels during plugin initialization or default-session construction.
+Extensions that need custom semantics register session `execute_parent` kernels during plugin initialization or default-session construction.
 
 Examples:
 
@@ -176,13 +191,13 @@ This avoids putting compute behavior on `ExtVTable`.
 
 ### Storage-Delegate Kernel Helper
 
-Many extension functions only need to delegate to storage. This should be easy to register, but still implemented as ordinary scalar kernels.
+Many extension functions only need to delegate to storage. This should be easy to register, but still implemented as ordinary session `execute_parent` kernels.
 
-Vortex should provide a helper/builder that creates scalar kernels:
+Vortex should provide a helper/builder that creates session `execute_parent` kernels:
 
 ```rust
-session.scalar_kernels().register(
-    StorageDelegateKernel::new(Binary.id())
+session.execute_parent_kernels().register(
+    StorageDelegateExecuteParentKernel::new(Binary.id())
         .for_extension(Uuid.id())
         .when_options(|options| matches_binary_operator(options, [Eq, NotEq]))
         .unwrap_args([0, 1])
@@ -205,7 +220,7 @@ register_storage_delegate(
 
 The exact API can be refined during implementation. The important properties are:
 
-- it registers a scalar kernel in the session;
+- it registers an `execute_parent` kernel in the session;
 - it is not a method on `ExtVTable`;
 - it does not require every scalar function to check a flag;
 - it can express argument unwrapping, output wrapping, validation, and option matching.
@@ -373,19 +388,19 @@ Forward compatibility depends on reader behavior:
 Public Rust APIs will change around extension array construction and extension plugin registration. The migration path is:
 
 - replace generic `vortex.ext` construction with `ExtensionArray::try_new(ext_dtype, storage)`;
-- register extension scalar behavior as session scalar kernels;
+- register extension scalar behavior as session `execute_parent` kernels;
 - use storage-delegate helper kernels for common storage-transparent operations;
 - use `extension_unwrap` and `extension_wrap` for explicit representation access.
 
-Performance should improve for extension-specific dispatch because the array encoding id now carries the concrete extension id. There is some additional session-kernel lookup cost during scalar-function execution, but this is centralized and should be small compared to actual array execution.
+Performance should improve for extension-specific dispatch because the array encoding id now carries the concrete extension id. There is some additional session-kernel lookup cost during parent-kernel execution, but this is centralized and should be small compared to actual array execution.
 
 ## Drawbacks
 
-This adds a session scalar-kernel registry and a storage-delegate helper API. That is more machinery than direct methods on `ExtVTable`.
+This adds a session `execute_parent` kernel registry and a storage-delegate helper API. That is more machinery than direct methods on `ExtVTable`.
 
 The design also changes the meaning of extension array encoding ids. Although this is not a structural wire-format break, it requires compatibility behavior during serde and careful migration of tests and registry setup.
 
-The storage-delegate helper must be expressive enough for common cases without becoming a second scalar-function implementation framework. Complex extension semantics should use custom scalar kernels instead of stretching the helper API.
+The storage-delegate helper must be expressive enough for common cases without becoming a second scalar-function implementation framework. Complex extension semantics should use custom session `execute_parent` kernels instead of stretching the helper API.
 
 ## Alternatives
 
@@ -407,7 +422,7 @@ This looks simple but creates a bad contract. Every scalar function would need t
 
 ### Add `ExtVTable::execute_scalar_fn`
 
-This makes the dtype vtable a compute engine and creates arbitration problems for multi-argument functions. For `binary(lhs_ext, rhs_ext)`, it is unclear whether the left extension, right extension, or scalar function owns execution. Session scalar kernels are a cleaner extension point.
+This makes the dtype vtable a compute engine and creates arbitration problems for multi-argument functions. For `binary(lhs_ext, rhs_ext)`, it is unclear whether the left extension, right extension, or scalar function owns execution. Session `execute_parent` kernels are a cleaner extension point.
 
 ### Add `ExtVTable::register_storage_delegates`
 
@@ -417,16 +432,16 @@ This RFC explicitly rejects registration methods on `ExtVTable`. Registration sh
 
 Apache Arrow extension types store a regular Arrow storage type plus extension metadata on the field. The storage array remains a normal Arrow array. Vortex should preserve this separation between logical extension type and physical storage representation while giving extensions better runtime dispatch. See the Arrow extension type documentation: <https://arrow.apache.org/docs/format/Columnar.html#extension-types>.
 
-Postgres domains are base types with constraints. They are useful prior art for Vortex `ExtensionKind::Domain`. Postgres also has the concept of binary-coercible casts through `CREATE CAST ... WITHOUT FUNCTION`, where no conversion is required because the source and target have the same internal representation. That is related to storage delegation, but Vortex should express it through scalar kernels rather than a closed set of global flags. See <https://www.postgresql.org/docs/current/sql-createcast.html> and <https://www.postgresql.org/docs/current/sql-createdomain.html>.
+Postgres domains are base types with constraints. They are useful prior art for refinement-like types, although this RFC does not model domains as a separate extension kind. Postgres also has the concept of binary-coercible casts through `CREATE CAST ... WITHOUT FUNCTION`, where no conversion is required because the source and target have the same internal representation. That is related to storage delegation, but Vortex should express it through registered kernels rather than a closed set of global flags. See <https://www.postgresql.org/docs/current/sql-createcast.html> and <https://www.postgresql.org/docs/current/sql-createdomain.html>.
 
-DuckDB and Postgres both distinguish type identity from function/operator implementations. Operators and casts are registered behavior, not hard-coded methods on the type descriptor. Vortex should follow that separation by putting extension scalar behavior in session kernels.
+DuckDB and Postgres both distinguish type identity from function/operator implementations. Operators and casts are registered behavior, not hard-coded methods on the type descriptor. Vortex should follow that separation by putting extension scalar behavior in session `execute_parent` kernels.
 
 ## Unresolved Questions
 
-- What should the exact `ScalarFnKernel` trait look like?
-- Should scalar kernels be ordered by registration order, specificity, or explicit priority?
-- Should generated storage-delegate kernels be stored in the same registry as custom scalar kernels, or in a separate registry checked by the same dispatcher?
-- How should scalar-kernel dispatch handle multi-extension arguments when multiple kernels match?
+- What should the exact erased session `execute_parent` kernel trait look like?
+- Should session `execute_parent` kernels be ordered by registration order, specificity, or explicit priority?
+- Should generated storage-delegate kernels be stored in the same registry as custom session kernels, or in a separate registry checked by the same dispatcher?
+- How should session `execute_parent` dispatch handle multi-extension arguments when multiple kernels match?
 - What should the exact `extension_wrap` validation-policy API be?
 - Should new writers default to extension-id encoding immediately, or should there be a transition period where `vortex.ext` remains the default?
 - Which built-in extension dtypes should register storage-delegate kernels initially?
@@ -437,8 +452,8 @@ Adding `FixedSizeBinary` is also out of scope. It may be a good storage dtype fo
 
 ## Future Possibilities
 
-The same session scalar-kernel mechanism can eventually replace more static `execute_parent` and `reduce_parent` implementations. The migration does not need to happen as part of this RFC.
+The same session-kernel mechanism can eventually replace more static `execute_parent` implementations beyond scalar functions. Session `reduce_parent` already exists in a limited form; aligning both registries is a natural follow-on.
 
 The extension descriptor could eventually include richer documentation metadata for external systems, such as Arrow extension mappings, SQL type names, and display/formatting preferences.
 
-The storage-delegate helper may grow convenience constructors for common patterns such as equality-only newtypes, ordered domains, and value-preserving refinements.
+The storage-delegate helper may grow convenience constructors for common patterns such as equality-only newtypes and value-preserving refinements.
