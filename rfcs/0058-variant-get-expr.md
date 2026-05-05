@@ -1,6 +1,6 @@
 - Start Date: 2026-05-05
 - Authors: @AdamGS
-- RFC PR: [vortex-data/rfcs#57](https://github.com/vortex-data/rfcs/pull/57)
+- RFC PR: [vortex-data/rfcs#58](https://github.com/vortex-data/rfcs/pull/58)
 
 # VariantGet Expression
 
@@ -41,23 +41,29 @@ still read from `core_storage`.
 
 ### Execution
 
-When executing the expression on a variant array, it will pull out recursively shredded data until the path is exhausted OR the path reached a child path that isn't shredded. As we traverse the chain of shredded children along the path, we'll need to make sure to keep track of their validity, as the leaf child's validity is an OR of all of them.
+`VariantGet` is one execution over the requested path. Execution tracks the remaining path, the
+current variant data, and the accumulated validity from variant arrays visited so far. It consumes
+path segments from the shredded child when possible; when the shredded tree ends, the remaining path
+is extracted row-by-row from `core_storage`.
 
-At this point, we have 3 possible cases:
+The result is produced row-wise:
 
-1. Perfectly shredded - there's a fully shredded child at this path. If it matches the expected type or can be casted into it, we can just return it. Note that this child might actually be a Variant array with its own shredded children, this just means that we've reached a position where all data is contained within this child, with no relevant data in the "core storage" child.
-2. Partially shredded - data for this path exists in both the shredded child AND in some unshredded values, which we can merge according to the expected type.
-3. Unshredded - No shredded child at this path, we try and extract the relevant value from the unshredded values which are unchanged from the original array.
+1. Fully shredded, exact dtype match - return the shredded child with the accumulated validity.
+2. Partially shredded - for each row, use the shredded value when it is valid; otherwise extract the
+   value from unchanged `core_storage`.
+3. Unshredded - extract the requested path for each row entirely from unchanged `core_storage`.
 
 The important invariant is that `VariantGet` changes the typed child selected for the requested
 path, but it does not rewrite the raw unshredded data. The raw storage continues to represent the
 same original variant values and can still be used by later `VariantGet` expressions for paths that
 were not shredded.
 
-For example, `VariantGet("$.a.b", i64)` changes only the typed view of the requested path:
+The diagram below shows a single execution step. It is not the full execution process; it only
+illustrates the invariant that each step changes the typed view for the current path while
+preserving the raw unshredded data.
 
 ```text
-Variant array before VariantGet("$.a.b", i64)
+One VariantGet execution step for "$.a.b" as i64
 
 +------------------------------------------------------------------------+
 | validity                                                               |
@@ -67,7 +73,7 @@ Variant array before VariantGet("$.a.b", i64)
 |   $.x.y: bool                                                          |
 +------------------------------------------------------------------------+
                                       |
-                                      | VariantGet("$.a.b", i64)
+                                      | one execution step
                                       v
 +------------------------------------------------------------------------+
 | validity for rows where $.a.b can be read as i64                       |
