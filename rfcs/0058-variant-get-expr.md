@@ -54,25 +54,27 @@ path, but it does not rewrite the raw unshredded data. The raw storage continues
 same original variant values and can still be used by later `VariantGet` expressions for paths that
 were not shredded.
 
+For example, `VariantGet("$.a.b", i64)` changes only the typed view of the requested path:
+
 ```text
 Variant array before VariantGet("$.a.b", i64)
 
-+--------------------------------------------------------------+
-| validity                                                     |
-| raw unshredded data --------------------------------------+  |
-| shredded children                                        |  |
-|   $.a.b: utf8 / missing / partially materialized         |  |
-|   $.x.y: bool                                            |  |
-+----------------------------------------------------------|---+
-                                                           |
-VariantGet("$.a.b", i64)                                  | unchanged
-                                                           |
-+----------------------------------------------------------|---+
-| validity for rows where $.a.b can be read as i64         |  |
-| raw unshredded data <------------------------------------+  |
-| typed child: i64 values for $.a.b                           |
-|   built from shredded data, raw data, or a merge of both     |
-+--------------------------------------------------------------+
++------------------------------------------------------------------------+
+| validity                                                               |
+| raw unshredded data  ------------------------------ unchanged -------- |
+| shredded children                                                      |
+|   $.a.b: utf8 / missing / partially materialized                       |
+|   $.x.y: bool                                                          |
++------------------------------------------------------------------------+
+                                      |
+                                      | VariantGet("$.a.b", i64)
+                                      v
++------------------------------------------------------------------------+
+| validity for rows where $.a.b can be read as i64                       |
+| raw unshredded data  ------------------------------ unchanged -------- |
+| typed child: i64 values for $.a.b                                      |
+|   built from shredded data, raw data, or a merge of both               |
++------------------------------------------------------------------------+
 ```
 
 ### Pushdown, Filter and Slice
