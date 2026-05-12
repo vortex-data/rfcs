@@ -7,7 +7,7 @@
 
 ## Summary
 
-This RFC proposes adopting **OnPair** (Gargiulo, Venturini, 2025) as a Vortex string encoding, with two extensions on top of the published design: (1) the code width is encoder-parametric (10/11/12/14/16 bits), with **12-bit as the default** so the flattened symbol table fits in NVIDIA Hopper-class shared memory; (2) a first-class CUDA decoder that combines a SMEM-resident dictionary, writer-side output-offset checkpoints (the design idea from GSST that decouples segment decoding from serial prior-state dependencies — commonly summarized as "block parallelism" but really *split parallelism via checkpoints*), and warp-level prefix-sum on per-code output lengths.
+This RFC proposes adopting **OnPair** (Gargiulo, Venturini, 2025) as a Vortex string encoding, with two extensions on top of the published design: (1) the code width is encoder-parametric (10/11/12/14/16 bits), with **12-bit as the default** so the flattened symbol table fits in NVIDIA Hopper-class shared memory; (2) a first-class CUDA decoder that adopts the **split parallelism format** introduced by GSST (GPU Static Symbol Table; Vonk, 2024) — per-split uncompressed-size metadata stored in the block header that lets multiple GPU threads decode different splits of a single block in parallel, sharing one SMEM-resident symbol table — combined with warp-level prefix-sum on per-code output lengths and (optionally) GSST's **coalesced memory access format** for the on-disk code stream.
 
 The encoding integrates with Vortex in two tiers — `OnPairArray` for self-contained per-array dictionaries, and `OnPairLayout` for cross-chunk dictionary sharing via Vortex's existing `LayoutRef`-Arc mechanism — exactly mirroring how the current FSST encoding and `DictLayout` cooperate today.
 
@@ -19,7 +19,7 @@ Vortex currently uses FSST for variable-length string compression. Three converg
 
 1. **FSST8's escape mechanism is a real cost on diverse data.** FSST8 has 255 symbols + 1 escape code; bytes that don't fit any symbol cost two input bytes (escape + raw). For text-heavy columns this is fine, but for more diverse distributions (JSON, XML, identifiers in code, mixed-language text) the escape rate climbs and the branchy fast-vs-slow-path decode loop costs measurable throughput. The `cwida/fsst` reference implementation ships an FSST12 variant ([`fsst12.h`, `libfsst12.cpp`](https://github.com/cwida/fsst)) whose source comment states it "will outperform [FSST8] on datasets that are more chaotic, such as JSON and widely diverse URLs." With 4096 codes available, every byte 0–255 can be a symbol via training, which substantially reduces the escape rate — though FSST12 retains escape logic in the decoder for unseen bytes.
 
-2. **GPU string decompression is now a real target.** The GSST work (Vonk, Hoozemans, Al-Ars, 2025; published in ACM SIGOPS Operating Systems Review, Vol. 59 No. 1) demonstrates that FSST-class encodings can be decoded on GPU at near-bandwidth rates — the paper reports **191 GB/s on A100** — given a shared-memory-resident symbol table and a kernel that handles variable-length output via prefix-sum + coalesced writes. Tim Anema's complementary ADMS 2025 work (["High Throughput GPU-Accelerated FSST String Compression"](https://github.com/timanema/fsst-gpu)) reports **74 GB/s on RTX 4090** for the encode side, using a thread-voting matching mechanism and a stream-compaction output pipeline. GPU decompression is no longer hypothetical for production formats; Vortex should target it directly.
+2. **GPU string decompression is now a real target.** GSST — *GPU Static Symbol Table* — (Vonk et al, 2025; published in ACM SIGOPS Operating Systems Review, Vol. 59 No. 1; full thesis with implementation details available from TU Delft) demonstrates that FSST-class encodings can be decoded on GPU at near-bandwidth rates — **191 GB/s on A100** at 2.74× compression ratio. The headline design choices, all introduced in the thesis's Chapter 4, are three *format* optimizations (block parallelism, split parallelism, coalesced memory access) and three *memory-management* optimizations (shared-memory-resident symbol table, aligned memory accesses, asynchronous data transfer). The split parallelism format specifically is what enables in-block intra-SM parallelism without per-thread serial dependencies: the writer stores per-split uncompressed sizes in the block header, so each GPU thread knows where its output begins. Tim Anema's complementary ADMS 2025 work (["High Throughput GPU-Accelerated FSST String Compression"](https://github.com/timanema/fsst-gpu)) reports **74 GB/s on RTX 4090** for the encode side, using a thread-voting matching mechanism and a stream-compaction output pipeline. GPU decompression is no longer hypothetical for production formats; Vortex should target it directly.
 
 3. **Fixed-width codes + larger dictionaries dominate variable-width-with-escapes.** OnPair ([Gargiulo, Venturini, 2025; arXiv:2508.02280](https://arxiv.org/abs/2508.02280)) introduces a single-pass pair-merge training algorithm — much cheaper than classical BPE — that produces up-to-65k-entry dictionaries with **no escape codes** (the first 256 codes are reserved as raw bytes; every byte has a representation). On the Book Titles dataset at 16-bit codes, Table 1 of the paper reports up to **~5.4 GB/s** CPU decode (on an Intel Core Ultra 7 265K performance core; the reference C++ implementation relies on compiler auto-vectorization of `memcpy`-with-overcopy rather than explicit SIMD intrinsics). The fixed-width codes are also intrinsically GPU-friendly: no warp divergence from variable-stride code consumption.
 
@@ -41,9 +41,9 @@ The encoding proposed here is a deliberate combination of three published encodi
 
 - **OnPair** ([Gargiulo, Venturini, 2025](https://arxiv.org/abs/2508.02280)) provides the backbone: the single-pass pair-merge training algorithm, the principle that symbols can be unbounded byte sequences built by chaining merges, and the escape-free fixed-width-code bitstream shape (codes 0–255 reserved as raw bytes; codes 256+ are learned merge-pair symbols). The reference implementation at [`gargiulofrancesco/onpair_cpp`](https://github.com/gargiulofrancesco/onpair_cpp) supports configurable code widths from 9 to 16 bits. This RFC's encoding *is* OnPair: same algorithm, same bitstream shape, with a 12-bit default and a GPU decoder layered on top.
 - **FSST12** ([Boncz et al, PVLDB Vol 13, 2020](https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf); 12-bit variant from the reference implementation at [`cwida/fsst`](https://github.com/cwida/fsst)) provides the well-tested 12-bit-codes-packed-two-per-three-bytes bitstream layout that we reuse at the 12-bit width. (FSST12 itself differs from this RFC by retaining FSST's training algorithm and escape mechanism; we keep only its bit-packing layout.)
-- **GSST** (Vonk, Hoozemans, Al-Ars, 2025; ACM SIGOPS Operating Systems Review Vol. 59 No. 1) provides the GPU decoder design: cooperative shared-memory dictionary load, writer-side per-segment output-offset metadata so segments can be decoded independently in parallel (the actual key insight behind "parallel string decompression at 191 GB/s on A100"), warp-level prefix-sum on per-code output lengths, and coalesced bandwidth-optimal stores. We refer to the underlying technique throughout this RFC as "split parallelism via output-offset checkpoints"; the exact terminology in the paper may differ.
+- **GSST** — *GPU Static Symbol Table* — (Vonk, 2024 thesis; Vonk, Hoozemans, Al-Ars, 2025 paper) provides the GPU decoder design via three composable format optimizations introduced in Section 4.2 of the thesis: **block parallelism format** (independent compressed blocks with their own symbol tables, decompressed in parallel across SMs), **split parallelism format** (within a block, the writer stores per-split uncompressed-size metadata in the block header so each GPU thread within an SM can begin decoding at the correct output offset, sharing the block's single SMEM-resident symbol table), and **coalesced memory access format** (within a block, codes are reordered so adjacent threads access adjacent memory locations on each read). Plus three memory-management optimizations: shared-memory-resident symbol table, aligned memory access, and asynchronous host↔device transfers.
 
-What's new in this RFC relative to those three is the *combination*: filling FSST12's bitstream with OnPair's training, defaulting to 12-bit code width so the flattened symbol table fits in NVIDIA Hopper-class shared memory, providing two CUDA decoder modes (dict-in-shared-memory and dict-in-global-memory) for different code widths, and integrating with Vortex's existing `DictLayout` sharing model.
+What's new in this RFC relative to those three is the *combination*: filling FSST12's bitstream with OnPair's training, defaulting to 12-bit code width so the flattened symbol table fits in NVIDIA Hopper-class shared memory, applying GSST's split parallelism format and (optionally) coalesced memory access format to the OnPair code stream, providing two CUDA decoder modes (dict-in-shared-memory and dict-in-global-memory) for different code widths, and integrating with Vortex's existing `DictLayout` sharing model.
 
 ### Two-tier Vortex integration
 
@@ -58,18 +58,21 @@ buffers:
   [0] merge_pairs        : (parent0, parent1)[n_pairs]   // dict; u16 × 2 per entry
   [1] code_offsets       : bitpacked u32[n_strings + 1]  // per-string boundaries
   [2] codes              : packed[n_codes]               // the compressed stream
-  [3] gpu_checkpoints    : (input_offset, output_offset)[n_chk]  // OPTIONAL; for GPU split parallelism
+  [3] splits             : u32[n_splits]                       // OPTIONAL; GSST-style split parallelism metadata
 metadata (Prost):
   code_width_bits:       u8       // 10/11/12/14/16
   n_pairs:               u32      // ≤ 2^code_width_bits - 256
   n_strings:             u32
-  n_chk:                 u32      // 0 if gpu_checkpoints buffer is absent
+  n_splits:              u32      // 0 if `splits` buffer is absent
+  codes_per_split:       u32      // GSST's "constant number of codes" per split; valid iff n_splits > 0
   uncompressed_bytes:    u64
   code_offsets_ptype:    PType    // u16/u32 depending on n_codes
   max_symbol_length:     u8       // 8 or 16
 ```
 
-The first 256 codes are reserved as raw bytes; codes `256..(256 + n_pairs)` are merge-pair symbols defined recursively by `(parent0, parent1)` indices into the same code space. The flattened symbol table is reconstructed at decode start, not stored on disk (a merge-pair list at ~4 bytes/entry is roughly 2× more compact than the OnPair reference implementation's flat-bytes-plus-cumulative-offsets representation at typical symbol lengths; the two formats are functionally equivalent and decode to the same byte sequences). The optional `gpu_checkpoints` buffer is described in the GPU decoder section and may be absent on arrays not destined for GPU decode.
+The first 256 codes are reserved as raw bytes; codes `256..(256 + n_pairs)` are merge-pair symbols defined recursively by `(parent0, parent1)` indices into the same code space. The flattened symbol table is reconstructed at decode start, not stored on disk (a merge-pair list at ~4 bytes/entry is roughly 2× more compact than the OnPair reference implementation's flat-bytes-plus-cumulative-offsets representation at typical symbol lengths; the two formats are functionally equivalent and decode to the same byte sequences).
+
+The optional `splits` buffer adopts GSST's split parallelism format directly (thesis §4.2.2, Figure 4.2b): each entry is the *uncompressed* size produced by one split of `codes_per_split` consecutive codes. With this metadata each GPU thread can compute its output offset by summing the preceding uncompressed sizes (or by a parallel prefix-sum across threads). The "constant number of codes per split" choice matches GSST's chosen format and is the load-balancing option preferred by the GSST thesis. The buffer may be absent on arrays not destined for GPU decode.
 
 **Tier 2 — `OnPairLayout` (analog of `DictLayout`).** A layout with two children:
 
@@ -175,97 +178,99 @@ The flattened decode table is two arrays — a 16-byte-stride symbol slot per co
 
 This is the structural reason GSST hits 191 GB/s with FSST8's ~2 KiB symbol table: a 2 KiB table is essentially free in SMEM, so the GPU isn't trading occupancy for table size. And it's the reason 12-bit is the GPU sweet spot for Hopper-class hardware: 4K × 17 bytes lands at 3 blocks/SM on H100, which is decent occupancy and leaves substantial latency-hiding headroom. The corresponding 16-bit (64K-entry, ~1 MiB) flattened table does not fit in any current GPU's SMEM and forces the slower dict-in-global-memory mode.
 
-**Parallelism granularity: split-parallelism via writer-side checkpoints.** The thing that makes GSST work at near-bandwidth rates is not "one block per string" per se — it is that the writer pre-computes the output byte offset at every segment boundary, so any block or warp can decode any segment without a serial dependency on prior segments. Calling that "block parallelism" is a useful shorthand for the *resulting* compute pattern, but the design choice is really about three knobs: (a) how the code stream is segmented; (b) what compute unit owns one segment; (c) how segments are scheduled onto SMs. All three have first-class consequences for throughput on real Vortex workloads, where string lengths range from URLs and UUIDs at ~30 bytes to free-text columns at multiple KBs.
+**Adopting GSST's split parallelism format.** The structural insight from GSST is not "one block per string" but rather that the writer stores per-split metadata (uncompressed size of each split, where a split is a contiguous run of compressed codes) in the block header, so multiple GPU threads inside a single SM can begin decoding at known output offsets without serial dependency on prior splits. GSST evaluated two split designs (thesis §4.2.2):
 
-#### Segment-size analysis
+- *Constant uncompressed size* (Figure 4.2a) — each split outputs the same number of bytes; the block header stores the *number of codes* per split (variable). Pros: uniform write footprint per thread. Cons: variable codes per split means thread-time divergence.
+- *Constant number of codes* (Figure 4.2b) — each split consumes the same number of input codes; the block header stores the *uncompressed size* per split (variable). Pros: uniform input footprint per thread, simpler bit-unpacking. Cons: variable output sizes.
 
-The competing pressures are amortizing per-segment overhead vs. extracting enough parallelism to fill the GPU. The per-segment overhead is one global-memory read of the checkpoint table (~16 bytes; L2-cached after warmup) plus a few cycles of bookkeeping — call it ~30 ns minimum. The per-warp-iteration work, at 12-bit codes with 128 codes/iter (4 codes per thread, 256 bytes coalesced input), is roughly ~25–40 ns when input/output bandwidth and SMEM dict lookups are pipelined behind enough warp parallelism per SM.
+GSST chose **constant number of codes** for its implementation, reasoning that decode is write-bound and balancing input is easier than balancing output. The OnPair encoding adopts the same choice. (The thesis additionally develops a *Coalesced Memory Access Format* layered on top, which reorders codes within a block so that adjacent threads access adjacent memory locations on every read; see "Coalesced format" below.)
 
-That gives a warp-per-segment setup-amortization table:
+#### Split-size analysis
 
-| Segment size at 12-bit | Warp iters | Work | Setup | Setup % |
+The competing pressures are amortizing per-split overhead vs. extracting enough parallelism to fill the GPU. The per-split overhead is one global-memory read of the split's uncompressed size and the implied input/output offsets (~16 bytes total; L2-cached after warmup) plus a few cycles of bookkeeping — call it ~30 ns minimum. The per-warp-iteration work, at 12-bit codes with 128 codes/iter (4 codes per thread, 256 bytes coalesced input), is roughly ~25–40 ns when input/output bandwidth and SMEM dict lookups are pipelined behind enough warp parallelism per SM.
+
+That gives a warp-per-split setup-amortization table:
+
+| Split size (codes) at 12-bit | Warp iters | Work | Setup | Setup % |
 |---|---|---|---|---|
-| 256 codes | 2 | ~60 ns | ~30 ns | **33% — bad** |
-| 512 codes | 4 | ~120 ns | ~30 ns | **20% — marginal** |
-| 1024 codes | 8 | ~240 ns | ~30 ns | **11% — OK** |
-| 2048 codes | 16 | ~480 ns | ~30 ns | **6% — good** |
-| 4096 codes | 32 | ~960 ns | ~30 ns | **3% — great** |
+| 256 | 2 | ~60 ns | ~30 ns | **33% — bad** |
+| 512 | 4 | ~120 ns | ~30 ns | **20% — marginal** |
+| 1024 | 8 | ~240 ns | ~30 ns | **11% — OK** |
+| 2048 | 16 | ~480 ns | ~30 ns | **6% — good** |
+| 4096 | 32 | ~960 ns | ~30 ns | **3% — great** |
 
-So warp-per-segment at 12-bit codes wants segments of **at least ~1K codes, ideally 2–4K**. At 16-bit codes the analysis is similar but slightly more generous on the small end (no bit-unpacking overhead, cleaner coalescing) — ~512 codes / segment is roughly the OK threshold.
+So warp-per-split at 12-bit codes wants `codes_per_split ≥ ~1024`, ideally 2K–4K. At 16-bit codes the analysis is similar but slightly more generous on the small end (no bit-unpacking overhead, cleaner coalescing) — ~512 codes/split is roughly the OK threshold.
 
-The opposing pressure is parallelism. A typical Vortex chunk of ~500K codes at 4K codes/segment is only ~125 segments — well below H100's ~528 concurrent warps. We'd run out of work before saturating the GPU.
+The opposing pressure is parallelism. A typical Vortex chunk of ~500K codes at 4K codes/split is only ~125 splits — well below H100's ~528 concurrent warps. The thesis addresses this by recommending one *block* per SM, with ~64–128 splits inside each block (matching the SM's core count), and many *blocks* across SMs. For OnPair the analog is: many chunks (each a "block" in GSST terms) distributed across SMs, plus many splits within each chunk.
 
-**This is exactly the regime where persistent threads win.** Launch ~512 warps once; each warp atomically claims segments from a global counter and decodes them in a loop. The per-segment overhead drops from ~30 ns (with kernel-grid setup costs) to ~10 ns (just the metadata read; no per-launch barrier), so segments can shrink to ~512–1K codes without setup dominating. Load balancing across heterogeneous segment costs is automatic. This is more complex than block-per-segment but is the right default for production performance.
+For Vortex's case where a single chunk is large and we want to use the whole GPU, **persistent threads** with a global atomic split counter is a clean alternative to the GSST one-block-per-SM mapping. Launch ~512 warps once; each warp claims its next split via `atomicAdd`. Per-split overhead drops to ~10 ns (no per-launch grid setup), and splits can shrink to ~512–1024 codes without setup dominating. Load balancing across heterogeneous split costs (different output sizes) is automatic. This is more complex than the direct GSST mapping but is the right default for production performance on single-chunk decodes. For multi-chunk decodes, the GSST one-block-per-SM mapping with chunks-as-blocks naturally provides the same load balancing.
 
-#### Segmentation strategy
+The recommended default is `codes_per_split = 1024` at 12-bit codes (~1.5 KiB input per split, ~4 KiB typical output), tunable per array. Metadata overhead at this stride is ~4 bytes per split per 1.5 KiB input ≈ 0.3%.
 
-The writer needs to produce a checkpoint table. The four reasonable strategies are:
+#### Coalesced Memory Access Format (optional)
 
-| Segmentation | Pros | Cons |
-|---|---|---|
-| Per-string boundaries only | Free (already in our format); natural for random access | Long strings (multi-KB) starve some warps; very-short strings cause warp underutilization |
-| Per-K-strings groups (e.g., 32 strings per segment) | Uniform warp work for short-string columns | Coarser random access; two-level offset table |
-| Fixed-input-stride checkpoints (every N codes) | Uniform GPU work regardless of string-length distribution | Extra metadata; two-level offset table |
-| **Hybrid** (per-string boundaries always; inner checkpoints every ~1–2K codes within long strings) | Workload-adaptive; preserves per-string random access | Most complex writer |
+GSST's third format optimization (thesis §4.2.3, Figure 4.4) reorders codes within a block so that the *i*-th code of every split is stored contiguously, then the (*i*+1)-th, and so on. With this ordering, when 128 threads each read their *i*-th code in parallel, the reads coalesce into one or two consecutive cache lines instead of 128 scattered ones. The thesis reports this reordering is meaningfully helpful on top of the basic split format.
 
-The recommended default is **hybrid**, with the inner checkpoint stride defaulting to ~1K codes at 12-bit (~1.5 KiB input per inner segment, ~4 KiB typical output) and tunable per array. Per-string boundaries provide free random access for short-string columns; inner checkpoints provide uniform GPU work for long-string columns. Metadata overhead at this stride is ~16 bytes per ~1.5 KiB input ≈ 1%.
-
-Short strings (≤1K codes typical) reach exactly one checkpoint — the per-string boundary — and act like the simple per-string-boundaries case. Long strings (>1K codes) get inner checkpoints automatically. The kernel treats both uniformly: it iterates segments from the checkpoint table without caring whether segment boundaries are string boundaries or inner-string checkpoints.
+For OnPair, the coalesced format applies equally well; it's an on-disk reordering of the `codes` buffer (no change to the merge-pair dictionary or split metadata). Whether to make it the default vs. an optional flag is something to settle in the validation campaign — there's a small CPU-decode cost (the CPU then reads codes in scattered order, though prefetching helps) so it may be better as an opt-in flag for GPU-targeted arrays. Reserved as a header bit.
 
 #### Mode A — dict-in-shared-memory (`code_width_bits` ≤ 12), persistent-thread kernel
 
-The fast path. Sketched as persistent threads with warp-per-segment claiming; block-per-segment with larger segments is a simpler-but-slightly-slower variant we should also implement for the reference decoder.
+The fast path. Sketched as persistent threads with warp-per-split claiming; one-block-per-SM with constant `codes_per_split` (GSST's direct kernel shape) is a simpler reference variant we should also implement.
 
 ```cuda
 __global__ void decode_kernel_smem_persistent(
-    const Checkpoint* checkpoints, uint32_t n_segments,
+    const uint32_t* split_uncompressed_sizes, uint32_t n_splits, uint32_t codes_per_split,
     const uint8_t* codes, uint8_t* out,
-    const MergePair* pairs, uint32_t n_pairs)
+    const MergePair* pairs, uint32_t n_pairs,
+    uint32_t* g_split_counter)   // global atomic counter
 {
-    __shared__ uint4   sym[4096];   // 64 KB at 16 bytes × 4096, bank-interleaved
-    __shared__ uint8_t len[4096];   //  4 KB
-    __shared__ uint32_t seg_counter; // atomic claim counter, per block
+    __shared__ uint4   sym[4096];   // 64 KiB at 16 bytes × 4096, bank-interleaved
+    __shared__ uint8_t len[4096];   //  4 KiB
 
     // Phase 1: cooperative symbol-table materialization.
     //   - First 256 entries: thread t initializes sym[t] = {t, 0, 0, 0, ...}, len[t] = 1.
     //   - Merge-pair walk: parent indices are strictly smaller than the entry being built,
     //     so a single warp walks the list linearly; one __syncthreads at the end.
-    //   - Cost: ~60 µs amortized over the kernel lifetime; negligible.
+    //   - The per-split output offsets are precomputed once into shared memory via a
+    //     block-wide CUB::ExclusiveScan over split_uncompressed_sizes[].
 
-    // Phase 2: warp-per-segment, persistent-thread work loop.
-    //   - One warp lane per block claims the next segment via atomicAdd on a global counter;
+    // Phase 2: warp-per-split, persistent-thread work loop.
+    //   - One lane per warp atomicAdds the global counter to claim the next split;
     //     warp-broadcast to the other lanes.
-    //   - Loop: while (segment_id < n_segments) { decode segment; claim next; }
-    //   - Per-segment work:
-    //     - Read checkpoint[segment_id] -> (input_start, input_len, output_start).
-    //     - In a warp-iter loop over the segment:
+    //   - Loop: while (split_id < n_splits) { decode split; claim next; }
+    //   - Per-split work:
+    //     - Input range:  codes[split_id * codes_per_split * code_width_bits / 8 ..]
+    //     - Output start: prefix_output_offsets[split_id]   (precomputed in Phase 1)
+    //     - In a warp-iter loop over the split's codes_per_split codes:
     //         - 32 threads load 32×4 = 128 codes via 2 coalesced 128-byte reads,
     //           with bit-unpacking to extract the 12-bit codes per thread.
+    //           (If coalesced memory access format is in use, the gather pattern
+    //           is striped per the GSST §4.2.3 layout.)
     //         - Each lane: lookup sym[code], len[code] from SMEM (~1–2 cycles each).
     //         - CUB warp-inclusive scan on lengths -> per-lane output offset within iter.
     //         - Warp-cooperative store: pack each lane's (1..16) live bytes into 128-byte
     //           coalesced global writes via __shfl_sync + masked stores. (Same shape as
-    //           the variable-length-output handling described in the GSST paper; here it
-    //           is simpler because there are no escape codes to detect or handle.)
+    //           the variable-length-output handling in the GSST thesis; here it is simpler
+    //           because there are no escape codes to detect or handle.)
 }
 ```
 
 Alternative kernels worth implementing (and measuring against the persistent variant):
 
-- *Block-per-segment*, with each block processing one segment of ~8–32K codes via its 8 warps cooperating on output-offset prefix-sum. Simpler than persistent threads. Likely 10–20% slower at the typical segment sizes but easier to reason about and debug. Reference implementation should ship this.
-- *Two-stage pipeline* (offset-computation kernel → scatter kernel). Almost certainly loses to single-kernel warp-cooperative on this workload due to extra global-memory traffic, but it's the obvious thing to compare against and helps quantify the value of split parallelism.
+- *Direct GSST mapping*: one CUDA block per Vortex chunk, ~128 threads per block (matching SM core count), each thread owning one split. Simpler; closer to the thesis. Likely 10–20% slower on single-chunk decode but easier to reason about, debug, and port. The reference implementation should ship this.
+- *Two-stage pipeline* (offset-computation kernel → scatter kernel). Almost certainly loses to the single-kernel warp-cooperative design due to extra global-memory traffic, but useful as a baseline to quantify the value of split parallelism.
 
-Expected throughput on H100: should match or exceed GSST's 191 GB/s. GSST spends cycles handling escape codes and the resulting warp divergence; we do not. With Hopper's higher per-SM SMEM and bandwidth, the prediction is ~250–300 GB/s on H100 for the 12-bit configuration with the persistent-thread kernel and hybrid checkpoints. This is a prediction tied to specific design choices, not a measurement; the validation campaign in the Unresolved Questions section gates it.
+Expected throughput on H100: should match or exceed GSST's 191 GB/s. GSST spends cycles handling escape codes and the resulting warp divergence; we do not. With Hopper's higher per-SM SMEM and bandwidth, the prediction is ~250–300 GB/s on H100 for the 12-bit configuration with the persistent-thread kernel and `codes_per_split = 1024`. This is a prediction tied to specific design choices, not a measurement; the validation campaign in the Unresolved Questions section gates it.
 
 **Mode B — dict-in-global-memory (code_width_bits ∈ {14, 16}).** A separate kernel for when the encoder chose a larger dict for ratio reasons but GPU decode is still wanted. A pre-pass kernel walks the merge-pair list and emits the flattened symbol table to global memory once; subsequent decode kernels read it through L2 (50 MB on H100 per NVIDIA's Hopper tuning guide; the 1 MiB symbol table fits trivially with high hit rate). The lane-level lookup uses `__ldcg` or equivalent for a cache-global load. Expected throughput: ~150–200 GB/s on H100. Slower than Mode A but still 30–50× the CPU.
 
 The encoder's choice of `code_width_bits` implicitly selects Mode A or Mode B at decode time. We can additionally support an encoder strategy that trains a 64K-entry dict, measures its on-disk size, and falls back to a 12-bit dict if the larger one doesn't pay off — but that's an optimization, not a format requirement.
 
 **CUDA-specific risks worth flagging in implementation:**
-- *Segmentation/checkpoint metadata.* The writer must emit a checkpoint table (input-stride → output-offset) for the GPU decoder to achieve split parallelism. This is small (one entry per segment, ~8 bytes; at the recommended ~1–2K-code inner stride, metadata overhead is well under 1%) but it is *required* for GPU mode to hit peak. Tier-1 arrays without checkpoints will fall back to slower paths on GPU.
-- *Bank conflicts on dictionary access.* With 16-byte-wide entries (4 banks per entry), an unlucky access pattern can serialize. Standard fix is a one-word stride or interleaving the low bits of the code with the bank index; the CUB scan helpers handle this correctly.
-- *Occupancy vs. SMEM tradeoff.* Mode A at 12-bit codes uses ~68 KB SMEM/block; on H100 this gives ~3 blocks/SM (decent, not maximal). Dropping to 10-bit codes (16 KB SMEM/block) doubles occupancy, but ratio loss is real and must be measured.
-- *Per-string boundaries are NOT in the GPU hot path.* They live in a separate buffer that bulk-decode kernels skip entirely; only the random-access path and the writer's segmentation logic read them.
+- *Split metadata is required for peak GPU throughput.* The writer must emit the `splits` buffer (per-split uncompressed sizes; ~4 bytes per split) for the GPU decoder to use the split parallelism format. At the recommended `codes_per_split = 1024`, metadata overhead is well under 1% of the compressed bytes. Tier-1 arrays without `splits` will fall back to slower decode paths on GPU.
+- *Bank conflicts on dictionary access.* With 16-byte-wide entries (4 banks per entry), an unlucky access pattern can serialize. Standard fix is a one-word stride or interleaving the low bits of the code with the bank index; CUB scan helpers handle this correctly.
+- *Occupancy vs. SMEM tradeoff.* Mode A at 12-bit codes uses ~68 KiB SMEM/block; on H100 this gives ~3 blocks/SM (decent, not maximal). Dropping to 10-bit codes (~17 KiB SMEM/block) raises occupancy substantially, but the ratio loss is real and must be measured.
+- *Per-string boundaries are NOT in the GPU hot path.* They live in a separate buffer that bulk-decode kernels skip entirely; only the random-access path reads them. The GPU bulk-decode path uses `splits`, which is independent of string boundaries.
 
 ### Per-string random access and LIKE pushdown
 
@@ -323,7 +328,7 @@ The format-stability commitments for the OnPair encoding:
 ## Prior Art
 
 - **FSST** — *FSST: Fast Random Access String Compression*, Boncz, Neumann, Leis. PVLDB Vol 13. https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf. Reference implementation: https://github.com/cwida/fsst (MIT), which ships both the FSST8 variant from the paper and a 12-bit FSST12 variant introduced in the source tree (see `fsst12.h` / `libfsst12.cpp`).
-- **GSST** — *GSST: Parallel string decompression at 191 GB/s on GPU*, Vonk, Hoozemans, Al-Ars. ACM SIGOPS Operating Systems Review, Vol. 59 No. 1, pp. 55–61, 2025. https://dl.acm.org/doi/10.1145/3759441.3759450
+- **GSST** — *GSST: Parallel string decompression at 191 GB/s on GPU*, Vonk, Hoozemans, Al-Ars. ACM SIGOPS Operating Systems Review, Vol. 59 No. 1, pp. 55–61, 2025. https://dl.acm.org/doi/10.1145/3759441.3759450. The full design — the three format optimizations (block parallelism format, split parallelism format, coalesced memory access format) and three memory-management optimizations (shared memory, alignment, asynchronous transfers) adopted by this RFC — is documented in Robin Vonk's MSc thesis *"GSST: High Throughput Parallel String Decompression on GPU"* (TU Delft, 2024), Chapter 4. The thesis abstract states GSST source will be released on GitHub.
 - **GPU-side FSST encoding** — *High Throughput GPU-Accelerated FSST String Compression*, Anema, Hoozemans, Al-Ars, Hofstee. VLDB 2025 ADMS Workshop. Source: https://github.com/timanema/fsst-gpu (Apache-2.0).
 - **OnPair** — *OnPair: Short Strings Compression for Fast Random Access*, Gargiulo, Venturini. arXiv:2508.02280, August 2025. https://arxiv.org/abs/2508.02280. C++ reference implementation: https://github.com/gargiulofrancesco/onpair_cpp (MIT). Rust reference implementation: https://github.com/gargiulofrancesco/onpair_rs (MIT).
 - **Vortex's current FSST integration** — https://github.com/vortex-data/vortex/tree/develop/encodings/fsst (Apache-2.0) — particularly the LIKE-pushdown DFA, which generalizes to the OnPair encoding directly.
@@ -337,7 +342,7 @@ These will be settled through the validation campaign and during implementation 
 - **`MaxSymbolLength`.** 16 bytes makes the SIMD decoder clean (one u128 store per code). If long-prefix workloads (URLs, deeply-nested JSON keys) measurably benefit from 24- or 32-byte symbols, we may want a variant. The cost is wider per-decode SIMD; the benefit is a tighter dict for very-redundant data. Worth a focused micro-benchmark.
 - **Tier-2 `dict` layout type.** Should the shared `dict` `LayoutRef` be a `BinaryView` (one variable-length entry per code, suitable for direct predicate pushdown on the dict), a plain `Buffer` of u16 pairs (compact, opaque), or something else? `DictLayout` stores values as a typed array because predicate pushdown operates on typed values — we may want the same so the dict can be queried directly without re-materialization.
 - **Bitpacked code-stream alignment at non-byte-aligned widths.** Only the 16-bit width has a clean per-code byte boundary; 12-bit packs two codes per three bytes (FSST12's pattern) and 10/11/14-bit codes are bitpacked at arbitrary positions. Does the decoder require segment-aligned access (every checkpoint starts at a byte boundary, or even a 16-byte boundary), or can it tolerate arbitrary start offsets within a packed stream? GPU coalescing strongly prefers byte-aligned starts; CPU is indifferent. The Vortex writer should pad each segment to a clean byte boundary; the exact alignment requirement and padding rules need to be specified.
-- **GPU parallelism granularity and segmentation strategy.** The proposal recommends a persistent-thread kernel with warp-per-segment claiming, fed by a hybrid checkpoint table (per-string boundaries always; inner fixed-input-stride checkpoints every ~1–2K codes within long strings). The argued-out segment-size math is in the GPU section; the open question is whether the kernel-design and segment-size priors match the workload shapes Vortex's largest users actually have, especially when short and long strings are mixed in the same column. The validation sub-benchmark above is the gate. The format reserves a header bit for checkpoint-table presence; the *exact* checkpoint stride is encoder-time-configurable.
+- **GPU split sizing and kernel design.** The proposal recommends adopting GSST's split parallelism format with `codes_per_split = 1024` at 12-bit codes, a persistent-thread kernel with warp-per-split claiming, and the coalesced memory access format reordering enabled by default. The argued-out split-size math is in the GPU section; the open question is whether these priors match the workload shapes Vortex's largest users actually have, especially when short and long strings are mixed in the same column. The validation sub-benchmark above is the gate. The `codes_per_split` value is encoder-time-configurable per array; the format reserves a header bit for the coalesced reordering.
 - **Validation benchmark plan.** The substantive open question. Detailed below.
 
 ### Validation campaign
@@ -348,7 +353,7 @@ Every design choice above is a prior, not a conclusion. Before any production co
 2. **Training algorithm at 12-bit codes.** Hold the bitstream constant (12-bit, 4096 dict, FSST12 layout) and vary only the training: (a) FSST12's 5-round greedy iteration, (b) OnPair's single-pass pair-merge with early termination at 4096 codes, (c) OnPair-16 trained to full capacity then truncated to top-4096-by-coverage. The plan recommends (b); this benchmark tests that prior. **This is the load-bearing measurement for the whole RFC.**
 3. **GPU decode throughput sweep.** Port GSST to the same test harness as a baseline; then benchmark the OnPair encoding at `code_width_bits ∈ {10, 11, 12, 14, 16}` on H100, Ada (RTX 4090), and A100 (for comparison). Confirms the Mode A vs Mode B crossover and the per-GPU code-width recommendation.
 
-   **Sub-benchmark: parallelism granularity.** At the recommended `code_width_bits = 12`, measure four kernel designs — warp-per-segment, block-per-segment, persistent-thread + warp-per-segment claim, persistent-thread + block-per-segment claim — at three segment sizes (~512, ~2K, ~8K codes) and three workload shapes (short strings ~30 bytes mean, mixed bimodal distributions, long free-text bodies averaging >1 KB). Also vary the writer's segmentation strategy (per-string boundaries only / per-K-strings / fixed-input-stride / hybrid). The proposal recommends the **persistent-thread + warp-per-segment** kernel with **hybrid checkpoints** at ~1–2K-code inner stride; this benchmark tests that prior on real workload shapes. This is the load-bearing measurement for the GPU side of the RFC.
+   **Sub-benchmark: split sizing and kernel design.** At the recommended `code_width_bits = 12`, measure three kernel designs — direct GSST mapping (one CUDA block per chunk, one thread per split), persistent threads with warp-per-split claiming, and persistent threads with block-per-split claiming — at four `codes_per_split` values (~512, ~1024, ~2048, ~4096) on three workload shapes (short strings ~30 bytes mean, mixed bimodal distributions, long free-text bodies averaging >1 KB). Cross with two on-disk layouts (with and without GSST's coalesced memory access format reordering). The proposal recommends the **persistent-thread + warp-per-split** kernel at `codes_per_split = 1024` with the coalesced format enabled by default; this benchmark tests those priors. This is the load-bearing measurement for the GPU side of the RFC.
 4. **Ratio vs throughput Pareto frontier on GPU.** For each `code_width_bits`, plot decompression throughput against compression ratio. Visualize where the design lives in tradeoff space; identify the right defaults per GPU class.
 5. **Dictionary materialization cost.** Cold and warm decode-start time at all code widths. Drives the random-access strategy and the Tier-2 caching policy.
 6. **Per-string decode latency.** OnPair vs FSST for short strings (names, URLs, UUIDs). Verify SIMD ramp-up doesn't make short-string decode worse than FSST's tight scalar loop.
