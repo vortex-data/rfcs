@@ -695,6 +695,18 @@ budget. `S = 1` is wire-format-stable today (it's already in the code)
 and matches what the note [14] calls "TurboQuant_mse" — a known but
 suboptimal point on the curve.
 
+**Stage 1 is a preview format with no backward-compat commitment.**
+TurboQuant has not been included in a Vortex release, so the Stage 1
+wire format (`S = 1`) is provisional. When Stage 1.5 lands and pins
+EDEN's `S(d, b)`, the new constant becomes the stable encode/decode
+behavior for **all** TurboQuant files; pre-Stage-1.5 files (if any
+escaped the preview phase) must be re-encoded. Stage 1.5 is therefore
+**the first stable wire format**, not a follow-up to a frozen Stage 1.
+This avoids the alternative of adding a per-file `s_variant` metadata
+field to distinguish files encoded under `S = 1` vs EDEN-`S` — the
+alternative would work but carries permanent metadata cost for a
+short-lived experimental phase.
+
 If a future stage adds EDEN's native unbiased mode (§15), an
 `unbiased: bool` metadata flag is added at prost tag 7 and the cache
 key extends to `(padded_dim, bit_width, biased)`; biased and unbiased
@@ -1680,15 +1692,17 @@ Removal is a Stage 1 cleanup task once the example migrates.
 
 ### Incremental shipping
 
-| Stage          | Ships to users? | Reads prior stage files?    | Notes                                                 |
-| -------------- | --------------- | --------------------------- | ----------------------------------------------------- |
-| 1 (MSE)        | Yes             | N/A (first preview)         | Single block, biased only, `S = 1`                    |
-| 1.5 (EDEN-`S`) | Yes             | Yes (wire-format-identical) | Layers EDEN-`S` on top; no metadata or storage change |
-| 2 (blocks)     | Yes             | Yes (k=1 is identical)      | `block_size` metadata added; k>1 needs S2+ readers    |
-| 3 (PDX)        | Yes             | Yes (FSL codes still work)  | PDX codes need `PDXArray` registered                  |
+| Stage          | Ships to users?          | Reads prior stage files?                                   | Notes                                                                              |
+| -------------- | ------------------------ | ---------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| 1 (MSE)        | Preview only (no compat) | N/A (first preview)                                        | Single block, biased only, `S = 1`. Wire format is provisional.                    |
+| 1.5 (EDEN-`S`) | **First stable release** | No — Stage 1 was preview; Stage 1 files must be re-encoded | Layers EDEN-`S` on top; no metadata or storage shape change. Pins the wire format. |
+| 2 (blocks)     | Yes                      | Yes (k=1 is identical to Stage 1.5)                        | `block_size` metadata added; k>1 needs Stage 2+ readers.                           |
+| 3 (PDX)        | Yes                      | Yes (FSL codes still work)                                 | PDX codes need `PDXArray` registered.                                              |
 
-Each stage is independently shippable. Users can upgrade incrementally.
-Files written by earlier stages are always readable by later decoders.
+Stages 1.5 → 2 → 3 are independently shippable and each later stage reads
+all earlier-stage files correctly. Stage 1 is explicitly outside this
+guarantee — it is a preview phase intended to validate the design before
+Stage 1.5 commits to a stable wire format.
 
 ## Drawbacks
 
