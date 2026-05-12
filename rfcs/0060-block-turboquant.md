@@ -1,8 +1,8 @@
 # Block-Decomposed TurboQuant: a Lossy Extension Type with PDX Layout
 
-**Authors:** @lwwmanning, @connortsui20
-**Status:** Proposal
-**Date:** 2026-04-02 (rewritten 2026-05-12; citations corrected 2026-05-12)
+- Start Date: 2026-05-12
+- Authors: @lwwmanning, @connortsui20
+- RFC PR: [vortex-data/rfcs#60](https://github.com/vortex-data/rfcs/pull/60)
 
 ## Summary
 
@@ -35,17 +35,16 @@ decision below:
   recompression by the default cascade compressor, and no "approximate" flag —
   the encoding is lossy by definition.
 
-This rewrite supersedes the original RFC 33 draft, which was written against an
-earlier monolithic `TurboQuantArray` design that has since been replaced by the
-extension-type model on `vortex-data/vortex` `develop` (PR #7829, merged
-2026-05-07). It also incorporates a piece of prior art the original RFC missed:
-the **EDEN paper** [15] ([arXiv:2108.08842], ICML 2022) and its predecessor
-**DRIVE** [16] ([arXiv:2105.08339], NeurIPS 2021) predate TurboQuant [1]
-([arXiv:2504.19874]). A recent note by the EDEN authors [14]
-([arXiv:2604.18555], April 2026) demonstrates that TurboQuant is a suboptimal
-special case of the same RHT + Lloyd-Max scalar quantizer family. We adopt
-EDEN's contributions while keeping the codebase's TurboQuant branding;
-see §4 "Naming."
+This RFC is anchored to the current state of the `vortex-data/vortex`
+`develop` branch — specifically the extension-type implementation in the
+standalone `vortex-turboquant` crate (PR #7829, merged 2026-05-07). The
+algorithm sits in a family that includes **EDEN** [15] ([arXiv:2108.08842],
+ICML 2022) and its predecessor **DRIVE** [16] ([arXiv:2105.08339],
+NeurIPS 2021); both predate TurboQuant [1] ([arXiv:2504.19874]). A recent
+note by the EDEN authors [14] ([arXiv:2604.18555], April 2026) shows that
+TurboQuant is a special case of EDEN with a suboptimal fixed scale `S = 1`.
+We adopt EDEN's contributions while keeping the codebase's TurboQuant
+branding; see §4 "Naming."
 
 [arXiv:2108.08842]: https://arxiv.org/abs/2108.08842
 [arXiv:2105.08339]: https://arxiv.org/abs/2105.08339
@@ -210,7 +209,7 @@ correlation tests.
 
 ### Relationship to EDEN and DRIVE
 
-The original RFC 33 missed an important piece of prior art. **EDEN** [15]
+An important piece of prior art for this design family is **EDEN** [15]
 (Vargaftik et al., ICML 2022; [arXiv:2108.08842]) and its predecessor
 **DRIVE** [16] (NeurIPS 2021; [arXiv:2105.08339]) use the same building blocks
 as TurboQuant — Randomized Hadamard Transform plus Lloyd–Max scalar
@@ -1304,8 +1303,8 @@ with the column's metadata.
 SORF at B dimensions (heuristic; real cost is dominated by memory
 bandwidth and constant factors): `R · B · log₂(B)` butterflies + `R · B`
 sign applications per block. The per-vector normalization multiplies
-(`B` per block) are omitted from these counts as in the original RFC 33;
-they amortize against memory bandwidth in practice. For Stage 1 with
+(`B` per block) are omitted from these counts; they amortize against
+memory bandwidth in practice. For Stage 1 with
 padded_dim and 3 rounds:
 
 | padded_dim | SORF FLOPs                  | k   | Total per-vector FLOPs |
@@ -2258,11 +2257,11 @@ work, not blockers on the design:
    d < 128 by a new writer would be rejected by an old reader. Surface
    this in the migration plan when the experiment lands.
 
-### Resolved during this rewrite
+### Resolved during initial drafting
 
-The following questions were live during the first draft of the rewrite
-and have been resolved here. Recording the resolutions so future readers
-don't re-litigate.
+The following questions were considered during the design and have been
+resolved here. Recording the resolutions so future readers don't
+re-litigate.
 
 - **Norm storage shape uniformity (Stage 2)** — resolved in favor of
   `Primitive<element_ptype>` when `num_blocks == 1` (matches Stage 1
