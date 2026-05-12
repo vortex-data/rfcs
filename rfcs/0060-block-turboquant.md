@@ -2084,14 +2084,19 @@ fn tq_decode(tq: TurboQuantArray) -> Vector<F, d>:
 ```text
 fn tq_encode_stage2(v: Vector<F, d>, cfg: &TurboQuantConfig, B: u32) -> TurboQuantArray:
     k = d / B   # exact division required; if not, fall back to Stage 1 padded
+    norm_factor = B^(-cfg.num_rounds / 2)  # Stage 2 normalizes per block dimension
 
     for i in 0..k:
         v_i  = v[i*B .. (i+1)*B]
         n_i  = ‖v_i‖₂
         if n_i > 0:
             u_i = v_i / n_i
-            r_i = SORF(u_i, block_seed(seed, i), cfg.num_rounds)
+            # Same SORF as D.4 but applied per-block; block_seed mixes the array's seed with
+            # the block index so each block has an independent rotation (see Open Questions §3).
+            r_i = SORF(u_i, block_seed(cfg.seed, i), cfg.num_rounds, norm_factor)
             for j in 0..B:
+                # S = S(B, cfg.bit_width); Stage 2 inherits the Stage 1 / Stage 1.5 scale
+                # decision (S = 1 today; EDEN-S keyed on block dim B once Stage 1.5 lands).
                 codes[i*B + j] = nearest_centroid(r_i[j] * S, centroids)
         else:
             codes[i*B .. (i+1)*B] = 0
@@ -2346,11 +2351,14 @@ rounds, the total sign budget is `num_rounds * padded_dim` signs;
 extract them in **round-major, block-major** order:
 
 ```text
-for round in 0..num_rounds:
-    for block in 0..(padded_dim / 64):    // padded_dim divisible by 64 (guaranteed by >= 128 and power-of-2)
-        u = next_u64(state)
-        for bit in 0..64:
-            sign[round][block * 64 + bit] = if (u >> bit) & 1 == 1 { +1.0 } else { -1.0 }
+fn extract_signs(state: &mut u64, num_rounds: u8, padded_dim: usize) -> [[f32; padded_dim]; num_rounds]:
+    let mut signs = zero-init array [num_rounds][padded_dim]
+    for round in 0..num_rounds:
+        for block in 0..(padded_dim / 64):    // padded_dim divisible by 64 (guaranteed by >= 128 and power-of-2)
+            u = next_u64(state)
+            for bit in 0..64:
+                signs[round][block * 64 + bit] = if (u >> bit) & 1 == 1 { +1.0 } else { -1.0 }
+    return signs
 ```
 
 If `padded_dim < 64` the contract degrades (`padded_dim < MIN_DIMENSION
