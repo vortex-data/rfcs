@@ -12,7 +12,7 @@ This RFC adds a new array to Vortex's existing FSST encoding family ([`encodings
 The contributing prior work, in order of how much of the new encoding is theirs:
 
 - **OnPair** (Gargiulo & Venturini, August 2025): the single-pass longest-prefix-matching pair-merge codebook construction — much cheaper than classical BPE and, we hypothesize, better at small dictionary sizes than FSST's 5-round evolutionary algorithm. The published compressed-domain predicate machinery (KMP / Aho–Corasick / prefix / equality / boolean composition over the token stream, all in [`onpair_cpp@ae590713/include/onpair/search/automata/`](https://github.com/gargiulofrancesco/onpair_cpp/tree/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/search/automata), MIT-licensed). The OnPair16 variant's bounded-symbol-length decode pattern (paper §3.4.2, Algorithm 3) that makes SIMD CPU decode straightforward. The on-disk dictionary representation (lexicographically-ordered flat bytes + Arrow-style offsets) that supports the prefix-range automata. OnPair is a recent, under-recognized substantive contribution to columnar string compression; this RFC adopts it wholesale and credits accordingly.
-- **FSST** (Boncz, Neumann, Leis, [PVLDB Vol 13, 2020](https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf)): the family archetype — field-level (per-string) random-access compression with a small static symbol table, the "no-block-decode-required" property, the late-decompression discipline that Vortex's compute layer already exploits. This RFC's encoding sits as a sibling to FSST in that family, *not* as a replacement; the two are complementary code-construction strategies over the same architectural idea.
+- **FSST** (Boncz, Neumann, Leis, [PVLDB Vol 13, 2020](https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf)): the family archetype — field-level (per-string) random-access compression with a small static symbol table, the "no-block-decode-required" property, the late-decompression discipline that Vortex's compute layer already exploits. This RFC's encoding sits as a sibling to FSST in that family, _not_ as a replacement; the two are complementary code-construction strategies over the same architectural idea.
 - **FSST12** (post-paper variant in [`cwida/fsst@e638d4c/fsst12.h`](https://github.com/cwida/fsst/blob/e638d4cf8c26129d73c242a4127b42b975de5b63/fsst12.h)): the 12-bit-codes-packed-two-per-three-bytes bitstream layout we reuse at the 12-bit width. The training algorithm is FSST's, not used here; only the bit-packing is reused.
 - **GSST** (Vonk, [TU Delft MSc thesis 2024](https://repository.tudelft.nl/) + Vonk, Hoozemans, Al-Ars, [ACM SIGOPS OS Review 2025](https://dl.acm.org/doi/10.1145/3759441.3759450)): the GPU decoder design via the split parallelism format (per-split uncompressed-size metadata in the block header → intra-SM parallelism without serial dependencies) and accompanying shared-memory + alignment + async-transfer memory-management optimizations.
 
@@ -30,29 +30,29 @@ The new pieces on top of those four contributions:
 
 Vortex currently ships FSST for variable-length string compression — the encoding established by Boncz, Neumann, and Leis at VLDB 2020 ("[FSST: Fast Random Access String Compression](https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf)"). FSST is the design archetype for "field-level, random-access, small-dictionary" string compression in columnar databases: per-string decode without block-level dependencies, ~2 GB/s decode (with AVX-512), late-decompression discipline so the compute layer can push predicates into the compressed representation. Five-plus years on, FSST is the strongest baseline in this corner of the design space, and the right starting point for a Vortex encoding.
 
-Three subsequent contributions sharpen the design and motivate this RFC. They are best understood as improvements *within the FSST family*, not as replacements:
+Three subsequent contributions sharpen the design and motivate this RFC. They are best understood as improvements _within the FSST family_, not as replacements:
 
 1. **OnPair's codebook construction is a strict improvement over FSST's at small dictionary sizes.** OnPair (the broader algorithm) and **OnPair16** (the bounded-symbol-length variant we adopt here) are introduced together in [Gargiulo & Venturini, arXiv:2508.02280v1](https://arxiv.org/abs/2508.02280v1), August 2025. The paper contributes a single-pass longest-prefix-matching pair-merge training algorithm that's an order of magnitude cheaper than classical BPE and avoids FSST's "dependency issue" (FSST paper §4.1) through a different mechanism — incremental merging rather than gain-estimation-after-the-fact. The resulting dictionary has up to 65k tokens, none of which are reserved as escape codes (codes 0–255 are the raw bytes, so every byte has a learned-or-literal representation). OnPair16 caps symbol length at 16 bytes, enabling a tight `memcpy(buf, src, 16); buf += len[t]` decode loop — a SIMD-friendly decode pattern that achieves **6.5–7.8 GB/s** CPU decode (paper Table 3, Intel Core Ultra 7 265K, AVX2 only — no AVX-512 on the test hardware). The OnPair paper also ships a published **compressed-domain predicate machinery** (Aho–Corasick, KMP, prefix, equality, boolean composition over the token stream — all in [`onpair_cpp@ae590713/include/onpair/search/automata/`](https://github.com/gargiulofrancesco/onpair_cpp/tree/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/search/automata)) that solves the same problem Vortex's FSST DFA solves, with a different and arguably more general technique. OnPair is recent and has received less attention than its contributions warrant; this RFC adopts OnPair16 in full and credits accordingly throughout. (Where the algorithm is the same between OnPair and OnPair16, this RFC uses "OnPair" generically; where the 16-byte symbol cap matters, "OnPair16" is used explicitly.)
 
 2. **The FSST family already has a wider-dict member with the escape branch absent.** The `cwida/fsst` reference implementation ([`fsst12.h@e638d4c`](https://github.com/cwida/fsst/blob/e638d4cf8c26129d73c242a4127b42b975de5b63/fsst12.h#L46)) ships an FSST12 variant whose source comment states it "will outperform [FSST8] on datasets that are more chaotic, such as JSON and widely diverse URLs" (note the original's "dan/than" typo). FSST12 has 4096 codes instead of 255 — 16× more space for learned symbols — but retains FSST's escape mechanism and its 5-round evolutionary symbol-selection algorithm. It's not benchmarked publicly in head-to-head form. This RFC reuses FSST12's bit-packing layout at the 12-bit code width (two codes per three bytes) — well-tested, GPU-friendly — but swaps in OnPair's training algorithm because at the same 4K-code budget OnPair's incremental pair-merging plausibly outperforms FSST's gain-estimation-and-reorder heuristic. The training-algorithm question is the load-bearing empirical claim of this RFC; the validation campaign measures it directly (sub-benchmark 2).
 
-3. **GPU string decompression is now a real target for FSST-family encodings.** GSST — *GPU Static Symbol Table* — (Vonk, [TU Delft MSc thesis, 2024](https://repository.tudelft.nl/); Vonk, Hoozemans, Al-Ars, [ACM SIGOPS Operating Systems Review Vol. 59 No. 1, 2025](https://dl.acm.org/doi/10.1145/3759441.3759450)) demonstrates that FSST-class encodings can be decoded on GPU at near-bandwidth rates — **191 GB/s on A100 at 2.74× compression ratio**. The headline design is three format optimizations (block parallelism, split parallelism, coalesced memory access; thesis §4.2) and three memory-management optimizations (shared-memory-resident symbol table, aligned memory accesses, asynchronous data transfer; §4.3). The *split parallelism format* specifically is what enables intra-SM parallelism without per-thread serial dependencies: the writer stores per-split uncompressed sizes in the block header so each GPU thread within an SM begins decoding at a known output offset. Tim Anema's complementary ADMS 2025 work *"High Throughput GPU-Accelerated FSST String Compression"* ([paper](https://www.vldb.org/2025/Workshops/VLDB-Workshops-2025/ADMS/ADMS25-01.pdf); [`timanema/fsst-gpu@a0b639c3`](https://github.com/timanema/fsst-gpu/tree/a0b639c33bb0d6d6272c04a2e1c83877d1941f2f), Apache-2.0) reports **74 GB/s** encode-side throughput on RTX 4090 using a thread-voting matching mechanism and a stream-compaction output pipeline. Both are FSST-family work; the GSST decoder approach ports cleanly onto OnPair's escape-free bitstream because the FSST family's "table-lookup-per-code, variable-length output" shape is the same.
+3. **GPU string decompression is now a real target for FSST-family encodings.** GSST — _GPU Static Symbol Table_ — (Vonk, [TU Delft MSc thesis, 2024](https://repository.tudelft.nl/); Vonk, Hoozemans, Al-Ars, [ACM SIGOPS Operating Systems Review Vol. 59 No. 1, 2025](https://dl.acm.org/doi/10.1145/3759441.3759450)) demonstrates that FSST-class encodings can be decoded on GPU at near-bandwidth rates — **191 GB/s on A100 at 2.74× compression ratio**. The headline design is three format optimizations (block parallelism, split parallelism, coalesced memory access; thesis §4.2) and three memory-management optimizations (shared-memory-resident symbol table, aligned memory accesses, asynchronous data transfer; §4.3). The _split parallelism format_ specifically is what enables intra-SM parallelism without per-thread serial dependencies: the writer stores per-split uncompressed sizes in the block header so each GPU thread within an SM begins decoding at a known output offset. Tim Anema's complementary ADMS 2025 work _"High Throughput GPU-Accelerated FSST String Compression"_ ([paper](https://www.vldb.org/2025/Workshops/VLDB-Workshops-2025/ADMS/ADMS25-01.pdf); [`timanema/fsst-gpu@a0b639c3`](https://github.com/timanema/fsst-gpu/tree/a0b639c33bb0d6d6272c04a2e1c83877d1941f2f), Apache-2.0) reports **74 GB/s** encode-side throughput on RTX 4090 using a thread-voting matching mechanism and a stream-compaction output pipeline. Both are FSST-family work; the GSST decoder approach ports cleanly onto OnPair's escape-free bitstream because the FSST family's "table-lookup-per-code, variable-length output" shape is the same.
 
 ### Quick comparison
 
-| Axis | FSST8 (Boncz 2020) | FSST12 (`cwida/fsst@e638d4c`) | OnPair16 (paper) | This RFC |
-|---|---|---|---|---|
-| Code width | 8 bits + escape | 12 bits + escape | 9–16 bits (16-bit default) | 10/11/12/14/16 bits (12-bit default) |
-| Dict capacity | 255 symbols | 4096 symbols | 512–65,536 tokens | 1024–65,536 tokens |
-| Escape codes | Yes | Yes | No | No |
-| Symbol length cap | 8 bytes | 8 bytes | 16 bytes | 16 bytes |
-| Training | 5-round evolutionary + sampling (Section 4.1) | Same as FSST8 | Single-pass LPM pair-merge | OnPair16's algorithm unchanged |
-| On-disk dict | u64 symbols + u8 lengths (~2 KiB) | Same shape (~32 KiB) | Flat bytes + u32 offsets, lex-ordered (~0.25–1 MiB) | Same as OnPair16 |
-| CPU decode (paper) | "approaching 2 GB/s" (AVX-512) | unreported | 6.5–7.8 GB/s (AVX2) | inherits OnPair16's path |
-| CPU compress (paper) | 1–3 GB/s (AVX-512), ~325–504 MiB/s (AVX2) | unreported | 137–229 MiB/s (AVX2, no AVX-512 yet) | inherits OnPair16's path |
-| GPU decode | hostile (escapes + var-stride) | better but still has escapes | not implemented; structurally GPU-friendly | 191 GB/s expected at 12-bit (GSST-class) |
-| Predicate pushdown | byte-DFA after decode | same | Compressed-domain automata (KMP, Aho–Corasick, prefix, equality, boolean composition) — onpair_cpp ships these | Inherits OnPair's automata |
-| Random access | per-string | per-string | per-string | per-string |
+| Axis                 | FSST8 (Boncz 2020)                            | FSST12 (`cwida/fsst@e638d4c`) | OnPair16 (paper)                                                                                               | This RFC                                 |
+| -------------------- | --------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| Code width           | 8 bits + escape                               | 12 bits + escape              | 9–16 bits (16-bit default)                                                                                     | 10/11/12/14/16 bits (12-bit default)     |
+| Dict capacity        | 255 symbols                                   | 4096 symbols                  | 512–65,536 tokens                                                                                              | 1024–65,536 tokens                       |
+| Escape codes         | Yes                                           | Yes                           | No                                                                                                             | No                                       |
+| Symbol length cap    | 8 bytes                                       | 8 bytes                       | 16 bytes                                                                                                       | 16 bytes                                 |
+| Training             | 5-round evolutionary + sampling (Section 4.1) | Same as FSST8                 | Single-pass LPM pair-merge                                                                                     | OnPair16's algorithm unchanged           |
+| On-disk dict         | u64 symbols + u8 lengths (~2 KiB)             | Same shape (~32 KiB)          | Flat bytes + u32 offsets, lex-ordered (~0.25–1 MiB)                                                            | Same as OnPair16                         |
+| CPU decode (paper)   | "approaching 2 GB/s" (AVX-512)                | unreported                    | 6.5–7.8 GB/s (AVX2)                                                                                            | inherits OnPair16's path                 |
+| CPU compress (paper) | 1–3 GB/s (AVX-512), ~325–504 MiB/s (AVX2)     | unreported                    | 137–229 MiB/s (AVX2, no AVX-512 yet)                                                                           | inherits OnPair16's path                 |
+| GPU decode           | hostile (escapes + var-stride)                | better but still has escapes  | not implemented; structurally GPU-friendly                                                                     | 191 GB/s expected at 12-bit (GSST-class) |
+| Predicate pushdown   | byte-DFA after decode                         | same                          | Compressed-domain automata (KMP, Aho–Corasick, prefix, equality, boolean composition) — onpair_cpp ships these | Inherits OnPair's automata               |
+| Random access        | per-string                                    | per-string                    | per-string                                                                                                     | per-string                               |
 
 The FSST family is converging on **fixed-width codes, no escapes, larger dictionaries trained adaptively from the data**, with GPU decode as a now-tractable target. FSST12 covers the bitstream-shape side. OnPair contributes the training algorithm + the OnPair16 SIMD-friendly decode pattern + the compressed-domain predicate machinery. GSST contributes the GPU decoder shape. None of these alone occupies the design point Vortex actually wants — a single FSST-family member competitive on both CPU and GPU with first-class shared-dictionary support and pre-existing query-pushdown machinery — but assembled together, they do.
 
@@ -76,13 +76,13 @@ The family ancestry, and the specific contributions inherited:
 
 - **OnPair** ([Gargiulo & Venturini, arXiv:2508.02280v1](https://arxiv.org/abs/2508.02280v1)) — the codebook-construction improvement. The single-pass longest-prefix-matching pair-merge algorithm (paper §3.2) replaces FSST's 5-round evolutionary symbol selection (FSST paper §4) — a deliberate restructuring of how symbols come into the dictionary, motivated by but conceptually distinct from BPE. The paper also contributes (a) **OnPair16**, a bounded-symbol-length variant (paper §3.4.2, Algorithm 3) whose 16-byte cap enables a tight `memcpy(buf, src, 16); buf += len[t]` decode hot loop — the source of the 6.5–7.8 GB/s CPU decode result in paper Table 3; (b) the **lexicographically-ordered flat-bytes-with-Arrow-offsets on-disk dictionary format** (paper §3.5, [`include/onpair/core/dictionary.h`](https://github.com/gargiulofrancesco/onpair_cpp/blob/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/core/dictionary.h)) — the lex-order is load-bearing for the prefix automaton's O(log n) range computation; (c) the published **compressed-domain predicate machinery** ([`include/onpair/search/automata/`](https://github.com/gargiulofrancesco/onpair_cpp/tree/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/search/automata) — KMP, Aho–Corasick, prefix, equality, boolean composition over the token stream); and (d) a parameter sweep of 9–16-bit code widths in the reference implementation. This RFC takes (a)–(c) wholesale and uses (d) plus a tighter recommended subset of (d) for the parametric code-width design.
 
-  OnPair is a recent, substantive contribution that has received less attention than its results warrant. This RFC's design depends on it heavily and credits accordingly throughout. *If you are reading this RFC and have not yet read the OnPair paper, the paper is the more important document — read it first.*
+  OnPair is a recent, substantive contribution that has received less attention than its results warrant. This RFC's design depends on it heavily and credits accordingly throughout. _If you are reading this RFC and have not yet read the OnPair paper, the paper is the more important document — read it first._
 
 - **FSST12** (post-paper variant in [`cwida/fsst@e638d4c/fsst12.h`](https://github.com/cwida/fsst/blob/e638d4cf8c26129d73c242a4127b42b975de5b63/fsst12.h), MIT) — a small but useful technical reference. Boncz et al. extended the FSST source tree with a 12-bit variant after the paper landed; we adopt its 12-bit bit-packing layout (two codes packed into three bytes) at the 12-bit code width, both because the layout is well-tested in production-adjacent code and because at 12-bit codes there's no reason to invent a different packing. FSST12 itself retains the FSST training algorithm and escape mechanism; we keep only the bit-packing layout.
 
 - **GSST** (Vonk, 2024 thesis Chapter 4; Vonk, Hoozemans, Al-Ars 2025 paper) — the GPU decoder design for the FSST family. Block parallelism format, split parallelism format, coalesced memory access format (thesis §4.2). Shared-memory-resident symbol table, aligned memory access, asynchronous host↔device transfers (§4.3). The GSST design is articulated specifically for FSST8's bitstream; it ports cleanly onto OnPair's escape-free bitstream because the "table-lookup-per-code, variable-length output" decode shape is the same FSST-family shape, simpler in our case because there are no escape codes to detect or handle.
 
-**Caveat on the OnPair reference impl's stability.** The OnPair C++ implementation is pre-1.0; its README explicitly states *"The on-disk format and the public API may change without notice. There are no tagged releases yet — pin to a specific commit hash if you embed the library."* This RFC pins to commit `ae590713`. Any non-trivial upstream format change is a coordinated upstream-and-Vortex update.
+**Caveat on the OnPair reference impl's stability.** The OnPair C++ implementation is pre-1.0; its README explicitly states _"The on-disk format and the public API may change without notice. There are no tagged releases yet — pin to a specific commit hash if you embed the library."_ This RFC pins to commit `ae590713`. Any non-trivial upstream format change is a coordinated upstream-and-Vortex update.
 
 What's new in this RFC, beyond the contributions above: the combination — bringing OnPair's training + OnPair16's bounded decode pattern + OnPair's compressed-domain automata into Vortex, packing the codes at 12 bits using FSST12's bit-packing layout (the 12-bit default is a Vortex-specific choice; the OnPair paper §3.6 recommends 16 bits, but GPU SMEM constraints flip the recommendation here), and porting GSST's GPU decoder design onto OnPair's bitstream. The new pieces are: the GPU kernel implementation, the `OnPair16Array` and `OnPair16Layout` Vortex integration as a cousin to today's `FSSTArray` in [`encodings/fsst`](https://github.com/vortex-data/vortex/tree/6f54d3d6dcc3d9b405658b4afcb4483616daa76f/encodings/fsst), and the validation campaign that measures the cross-product.
 
@@ -94,7 +94,7 @@ This RFC adds two cousin types to the same FSST encoding crate: **`OnPair16Array
 
 ### Two-tier Vortex integration
 
-Vortex already has the right primitive for cross-chunk dictionary sharing: `DictLayout` has two children (`values`, `codes`) and sharing is expressed *structurally* by Arc-sharing the `values` `LayoutRef` across multiple `DictLayout`s wrapped in a `ChunkedLayout` — no IDs, no hashes, no side tables. The reader lazy-materializes the values array via `OnceLock` and caches it across calls; predicate pushdown evaluates on the (small) dict array and applies via `take`. The OnPair16 encoding mirrors this exactly.
+Vortex already has the right primitive for cross-chunk dictionary sharing: `DictLayout` has two children (`values`, `codes`) and sharing is expressed _structurally_ by Arc-sharing the `values` `LayoutRef` across multiple `DictLayout`s wrapped in a `ChunkedLayout` — no IDs, no hashes, no side tables. The reader lazy-materializes the values array via `OnceLock` and caches it across calls; predicate pushdown evaluates on the (small) dict array and applies via `take`. The OnPair16 encoding mirrors this exactly.
 
 The proposed encoding has two surfaces:
 
@@ -145,19 +145,19 @@ This Tier-2 mode is what makes corpus-wide dictionary training viable without in
 
 ### `code_width_bits`: the load-bearing knob
 
-The OnPair paper's natural recommendation, from Section 3.6 ("Dictionary Size Trade-Offs"), is *"across our experiments, we found that allocating 16 bits per token strikes a practical and robust compromise"*; they also note that *"both compression and decompression speeds degrade significantly beyond 16 bits."* The 16-bit width is the paper-recommended default *on a CPU-only deployment*.
+The OnPair paper's natural recommendation, from Section 3.6 ("Dictionary Size Trade-Offs"), is _"across our experiments, we found that allocating 16 bits per token strikes a practical and robust compromise"_; they also note that _"both compression and decompression speeds degrade significantly beyond 16 bits."_ The 16-bit width is the paper-recommended default _on a CPU-only deployment_.
 
 This RFC departs from that recommendation in one direction: **on Hopper-class GPUs and below, the dictionary doesn't fit in shared memory at 16 bits.** The flattened decode table at 65,536 tokens × ~17 bytes/entry (16-byte symbol + 1-byte length) is ~1 MiB, which exceeds every current GPU's per-SM SMEM budget. Forcing 16 bits would either trap GPU decoding in the slower dict-in-global-memory mode (Mode B below; ~150–200 GB/s on H100 vs ~250 GB/s expected for SMEM-resident) or give up GPU acceleration entirely. CPU-only deployments adopt the paper's 16-bit recommendation; mixed CPU/GPU deployments adopt 12-bit as the default.
 
 The bitstream shape is identical at every width — only the dictionary capacity and the code-stream packing change. Recommended values:
 
-| `code_width_bits` | Dict capacity | Decode-time table footprint (16-byte stride + length) | Recommended for |
-|---|---|---|---|
-| **12 (default)** | **4,096** | **~68 KiB** | **Mixed CPU/GPU; SMEM-resident decode on Hopper-class GPUs.** |
-| 16 | 65,536 | ~1 MiB | CPU-only; matches the OnPair paper recommendation |
-| 14 | 16,384 | ~272 KiB | CPU-primary; L2-friendly on GPU |
-| 11 | 2,048 | ~34 KiB | Ada-class GPUs (RTX 4090, L40) at higher occupancy |
-| 10 | 1,024 | ~17 KiB | Extreme GPU occupancy |
+| `code_width_bits` | Dict capacity | Decode-time table footprint (16-byte stride + length) | Recommended for                                               |
+| ----------------- | ------------- | ----------------------------------------------------- | ------------------------------------------------------------- |
+| **12 (default)**  | **4,096**     | **~68 KiB**                                           | **Mixed CPU/GPU; SMEM-resident decode on Hopper-class GPUs.** |
+| 16                | 65,536        | ~1 MiB                                                | CPU-only; matches the OnPair paper recommendation             |
+| 14                | 16,384        | ~272 KiB                                              | CPU-primary; L2-friendly on GPU                               |
+| 11                | 2,048         | ~34 KiB                                               | Ada-class GPUs (RTX 4090, L40) at higher occupancy            |
+| 10                | 1,024         | ~17 KiB                                               | Extreme GPU occupancy                                         |
 
 Note that this is the **decode-time** table footprint (16 byte slots padded for over-copy + 1 byte length per entry). The **on-disk** footprint is OnPair's flat-bytes + offsets format, which at 4K tokens is ~76 KiB (~60 KiB byte data per paper §3.6 + 16 KiB offsets), not ~68 KiB. The disk and decode-time footprints are within ~10% of each other; the decode-time figure is what gates GPU SMEM occupancy.
 
@@ -169,7 +169,7 @@ OnPair16's published training algorithm is used unchanged at every code width. A
 
 **Why not FSST12's own training at the same 4K-symbol budget?** The FSST paper directly addresses this in Section 4.1 ("The Dependency Issue"). Boncz et al. tried both a single-pass suffix-array gain-based selection ("the first symbol picked will indeed have the highest compression gain. However, the compression gain of subsequent symbols depends on earlier symbols. Correcting for the dependencies on earlier symbols is very difficult and, depending on how it is done, leads to large over- or underestimates") and a single-pass dynamic-programming approach ("the compression factor only marginally improves, while encoding performance is severely affected"). They settled on a 5-round evolutionary algorithm that re-tokenizes the sample with the current dict each round and recomputes gains accordingly.
 
-OnPair's pair-merging sidesteps the dependency issue by a different mechanism: it doesn't *select* symbols by gain at all — it *merges* the most-frequent adjacent token pair and immediately replaces it everywhere, so subsequent pair-counting is already conditioned on the new token. The dependency between symbols is resolved incrementally rather than estimated. Whether this resolves the dependency issue *better* than FSST's 5-round approach at the same 4K-symbol budget is an empirical question — the validation campaign in §[Validation](#validation-campaign) tests it explicitly (sub-benchmark 2). The RFC's prior is that OnPair-style pair-merging is competitive or better at 4K codes because (a) the merging avoids FSST's "longest-prefix-first ordering" workaround (FSST paper §4.3: *"we store the (real) symbols in lexicographical order, but when one string prefixes the other, the longest is first"* — a constraint OnPair doesn't impose, expanding the design space), and (b) OnPair training is single-pass and so spends compute on more samples rather than re-tokenizing fewer samples five times.
+OnPair's pair-merging sidesteps the dependency issue by a different mechanism: it doesn't _select_ symbols by gain at all — it _merges_ the most-frequent adjacent token pair and immediately replaces it everywhere, so subsequent pair-counting is already conditioned on the new token. The dependency between symbols is resolved incrementally rather than estimated. Whether this resolves the dependency issue _better_ than FSST's 5-round approach at the same 4K-symbol budget is an empirical question — the validation campaign in §[Validation](#validation-campaign) tests it explicitly (sub-benchmark 2). The RFC's prior is that OnPair-style pair-merging is competitive or better at 4K codes because (a) the merging avoids FSST's "longest-prefix-first ordering" workaround (FSST paper §4.3: _"we store the (real) symbols in lexicographical order, but when one string prefixes the other, the longest is first"_ — a constraint OnPair doesn't impose, expanding the design space), and (b) OnPair training is single-pass and so spends compute on more samples rather than re-tokenizing fewer samples five times.
 
 **A note on speed.** The OnPair paper Table 5 reports training as a small fraction of total compression time (parsing dominates). At 4K codes the dictionary fills earlier, so training cost should be ≤ the paper's numbers; specifically the URL benchmark (paper's slowest) gets faster at smaller dict caps because the training loop terminates earlier.
 
@@ -199,13 +199,13 @@ Primary GPU targets are Hopper (H100, H200), Blackwell (B100, B200), and Ada (RT
 
 The decode-time table is two arrays — a 16-byte-padded symbol slot per code plus a 1-byte length per code — totalling ~17 bytes per entry. Per-SM shared-memory capacities (max user-shared carveout, per NVIDIA tuning guides):
 
-| GPU | Generation | SMEM/SM | Achievable blocks/SM for the flattened table |
-|-----|------------|---------|----------------------------------------------|
-| | | | 1K dict (~17 KiB) / 2K (~34 KiB) / 4K (~68 KiB) / 8K (~136 KiB) / 16K (~272 KiB) |
-| **H100/H200** | Hopper (primary) | 228 KB | ≥8 / 6 / **3** / 1 / does not fit |
-| **B100/B200** | Blackwell (primary) | 228 KB+ | ≥8 / 6 / **3** / 1 / does not fit |
-| **RTX 4090 / L40** | Ada (primary) | 100 KB | 5 / 2 / 1 / does not fit / does not fit |
-| A100 (comparison) | Ampere | 164 KB | ≥8 / 4 / 2 / 1 / does not fit |
+| GPU                | Generation          | SMEM/SM | Achievable blocks/SM for the flattened table                                     |
+| ------------------ | ------------------- | ------- | -------------------------------------------------------------------------------- |
+|                    |                     |         | 1K dict (~17 KiB) / 2K (~34 KiB) / 4K (~68 KiB) / 8K (~136 KiB) / 16K (~272 KiB) |
+| **H100/H200**      | Hopper (primary)    | 228 KB  | ≥8 / 6 / **3** / 1 / does not fit                                                |
+| **B100/B200**      | Blackwell (primary) | 228 KB+ | ≥8 / 6 / **3** / 1 / does not fit                                                |
+| **RTX 4090 / L40** | Ada (primary)       | 100 KB  | 5 / 2 / 1 / does not fit / does not fit                                          |
+| A100 (comparison)  | Ampere              | 164 KB  | ≥8 / 4 / 2 / 1 / does not fit                                                    |
 
 (Bolded entries are the recommended `code_width_bits = 12` row.)
 
@@ -215,8 +215,8 @@ The decode-time table is reconstructed at kernel start by gathering bytes from `
 
 **Adopting GSST's split parallelism format.** The structural insight from GSST (Vonk thesis §4.2.2) is that the writer stores per-split metadata (uncompressed size of each split, where a split is a contiguous run of compressed codes) in the block header, so multiple GPU threads in a single SM can begin decoding at known output offsets without serial dependency on prior splits. The thesis evaluates two split designs:
 
-- *Constant uncompressed size* (Figure 4.2a) — each split outputs the same number of bytes; the block header stores the *number of codes* per split (variable). Pros: uniform write footprint per thread. Cons: variable codes per split means thread-time divergence.
-- *Constant number of codes* (Figure 4.2b) — each split consumes the same number of input codes; the block header stores the *uncompressed size* per split (variable). Pros: uniform input footprint per thread, simpler bit-unpacking. Cons: variable output sizes.
+- _Constant uncompressed size_ (Figure 4.2a) — each split outputs the same number of bytes; the block header stores the _number of codes_ per split (variable). Pros: uniform write footprint per thread. Cons: variable codes per split means thread-time divergence.
+- _Constant number of codes_ (Figure 4.2b) — each split consumes the same number of input codes; the block header stores the _uncompressed size_ per split (variable). Pros: uniform input footprint per thread, simpler bit-unpacking. Cons: variable output sizes.
 
 GSST chose **constant number of codes** for its implementation (thesis §4.2.2: "decompression algorithms are expected to write more data than they read, which is why it's more important to balance the write operations than the read operations"). The OnPair16 encoding adopts the same choice for compatibility with the GSST kernel shape. The optional Coalesced Memory Access Format (thesis §4.2.3) is described separately below.
 
@@ -228,13 +228,13 @@ The competing pressures are amortizing per-split overhead vs. extracting enough 
 
 Under those priors, warp-per-split setup amortization:
 
-| Split size (codes) at 12-bit | Warp iters | Estimated work | Setup | Setup % |
-|---|---|---|---|---|
-| 256 | 2 | ~60 ns | ~30 ns | **33% — bad** |
-| 512 | 4 | ~120 ns | ~30 ns | **20% — marginal** |
-| 1024 | 8 | ~240 ns | ~30 ns | **11% — OK** |
-| 2048 | 16 | ~480 ns | ~30 ns | **6% — good** |
-| 4096 | 32 | ~960 ns | ~30 ns | **3% — great** |
+| Split size (codes) at 12-bit | Warp iters | Estimated work | Setup  | Setup %            |
+| ---------------------------- | ---------- | -------------- | ------ | ------------------ |
+| 256                          | 2          | ~60 ns         | ~30 ns | **33% — bad**      |
+| 512                          | 4          | ~120 ns        | ~30 ns | **20% — marginal** |
+| 1024                         | 8          | ~240 ns        | ~30 ns | **11% — OK**       |
+| 2048                         | 16         | ~480 ns        | ~30 ns | **6% — good**      |
+| 4096                         | 32         | ~960 ns        | ~30 ns | **3% — great**     |
 
 So under the prior, warp-per-split at 12-bit codes wants `codes_per_split ≥ ~1024`, ideally 2K–4K. The recommended default `codes_per_split = 1024`.
 
@@ -246,7 +246,7 @@ A **persistent-thread alternative** — launch ~512 warps once; each warp atomic
 
 #### Coalesced Memory Access Format (optional)
 
-GSST's third format optimization (thesis §4.2.3, Figure 4.4) reorders codes within a compressed block so that the *i*-th code of every split is stored contiguously, then the (*i*+1)-th, and so on. With this ordering, when *N* threads each read their *i*-th code in parallel, the reads coalesce into one or two cache lines instead of *N* scattered ones. The thesis reports this reordering is materially helpful on top of the split format.
+GSST's third format optimization (thesis §4.2.3, Figure 4.4) reorders codes within a compressed block so that the _i_-th code of every split is stored contiguously, then the (_i_+1)-th, and so on. With this ordering, when _N_ threads each read their _i_-th code in parallel, the reads coalesce into one or two cache lines instead of _N_ scattered ones. The thesis reports this reordering is materially helpful on top of the split format.
 
 Whether it helps on OnPair16 codes at 12-bit width and 1024 codes/split is genuinely uncertain — GSST evaluated it on FSST8 with a much smaller dict and a different bit-packing layout. The validation campaign measures whether the reordering pays off on OnPair16 in our setting; until then, the format reserves a `flags` bit (bit 0) for opt-in coalesced-format arrays. **Default off until measured.** A small CPU-decode penalty applies when reading coalesced-format codes scattered, though prefetching helps; so even after validation, the reordering is plausibly best as a GPU-target opt-in rather than a universal default.
 
@@ -265,10 +265,11 @@ The persistent-thread alternative differs in two places: the grid launch is `~51
 **Mode B — dict-in-global-memory (`code_width_bits` ∈ {14, 16}).** A separate kernel for when the encoder chose a larger dict for ratio reasons but GPU decode is still wanted. A pre-pass kernel materializes the padded flattened table into global memory once per chunk-group; subsequent decode kernels read it through L2 (50 MB on H100 per the Hopper tuning guide; the ~1 MiB table fits trivially with high hit rate). The lane-level lookup uses `__ldcg` for a cache-global load. Expected throughput: ~150–200 GB/s on H100 — slower than Mode A but still ~30–50× the CPU.
 
 **CUDA-specific risks worth flagging in implementation:**
-- *Split metadata is required for GPU mode.* The writer must emit the `splits` buffer (per-split uncompressed sizes; ~4 bytes per split) for the GPU decoder to use the split parallelism format. At `codes_per_split = 1024`, metadata overhead is well under 1% of the compressed bytes. Tier-1 arrays without `splits` fall back to single-thread-per-string CPU-style decode on GPU — much slower.
-- *Bank conflicts on dictionary access.* With 16-byte-wide entries, an unlucky access pattern can serialize. Standard fix is a one-word stride or interleaving the low bits of the code with the bank index; CUB scan helpers handle this correctly.
-- *Occupancy vs. SMEM tradeoff.* Mode A at 12-bit codes uses ~68 KiB SMEM/block; on H100 this gives ~3 blocks/SM. Dropping to 10-bit codes (~17 KiB SMEM/block) raises occupancy substantially, but the ratio loss is real and must be measured.
-- *Per-string boundaries are NOT in the GPU bulk hot path.* They live in a separate buffer that bulk-decode kernels skip entirely; only the random-access path reads them. The GPU bulk-decode path uses `splits`, which is independent of string boundaries.
+
+- _Split metadata is required for GPU mode._ The writer must emit the `splits` buffer (per-split uncompressed sizes; ~4 bytes per split) for the GPU decoder to use the split parallelism format. At `codes_per_split = 1024`, metadata overhead is well under 1% of the compressed bytes. Tier-1 arrays without `splits` fall back to single-thread-per-string CPU-style decode on GPU — much slower.
+- _Bank conflicts on dictionary access._ With 16-byte-wide entries, an unlucky access pattern can serialize. Standard fix is a one-word stride or interleaving the low bits of the code with the bank index; CUB scan helpers handle this correctly.
+- _Occupancy vs. SMEM tradeoff._ Mode A at 12-bit codes uses ~68 KiB SMEM/block; on H100 this gives ~3 blocks/SM. Dropping to 10-bit codes (~17 KiB SMEM/block) raises occupancy substantially, but the ratio loss is real and must be measured.
+- _Per-string boundaries are NOT in the GPU bulk hot path._ They live in a separate buffer that bulk-decode kernels skip entirely; only the random-access path reads them. The GPU bulk-decode path uses `splits`, which is independent of string boundaries.
 
 ### Per-string random access and predicate pushdown
 
@@ -302,7 +303,7 @@ A reasonable reader will ask: why a new array? Why not just extend `FSSTArray`, 
 
 - **Why a cousin Array rather than a flag on `FSSTArray`?** The two encodings differ in their codebook representation (FSST stores u64 symbols + u8 lengths; OnPair stores flat lex-ordered bytes + Arrow-style offsets) and in their decode hot loops. Folding them into one Array with a discriminant flag conflates two genuinely different layouts in metadata and forces every reader to handle both. Cleaner to express them as two Array types in the same family, sharing the FSST archetype but choosing different codebook construction strategies. This mirrors `vortex-fastlanes`'s pattern.
 - **Why not adopt OnPair16 verbatim (no Vortex extensions)?** OnPair16's paper-recommended 16-bit default dictionary doesn't fit in any current GPU's SMEM. Either the GPU decoder runs in the slower global-memory mode, or the format carries a width knob so deployments can pick the GPU-friendly point. The latter is strictly more flexible — the 16-bit width of this RFC is functionally identical to upstream OnPair16, so callers who don't want GPU acceleration get the upstream behavior unchanged.
-- **Why not stop at FSST12?** FSST12's bitstream layout is good and we adopt it at the 12-bit width. FSST12's *training* (FSST's 5-round evolutionary algorithm; FSST paper §4) is the part we replace. The training algorithm was tuned for FSST8's 255 codes; at 4096 codes, OnPair's incremental pair-merging plausibly outperforms FSST's gain-estimation-and-reorder heuristic for the reasons in [Training](#training-algorithm). This is the load-bearing empirical claim of this RFC and the validation campaign measures it directly (sub-benchmark 2). If OnPair's training *doesn't* win at 4096 codes, the right answer is to ship FSST12 instead — strictly a smaller change.
+- **Why not stop at FSST12?** FSST12's bitstream layout is good and we adopt it at the 12-bit width. FSST12's _training_ (FSST's 5-round evolutionary algorithm; FSST paper §4) is the part we replace. The training algorithm was tuned for FSST8's 255 codes; at 4096 codes, OnPair's incremental pair-merging plausibly outperforms FSST's gain-estimation-and-reorder heuristic for the reasons in [Training](#training-algorithm). This is the load-bearing empirical claim of this RFC and the validation campaign measures it directly (sub-benchmark 2). If OnPair's training _doesn't_ win at 4096 codes, the right answer is to ship FSST12 instead — strictly a smaller change.
 - **Why not GSST alone?** GSST is a decoder over the same FSST8 bitstream — same compression ratio as FSST8, same escape mechanism. This proposal gets GSST's kernel structure with an escape-free bitstream and a better codebook underneath.
 - **Why both tiers?** Tier 1 (`OnPair16Array`) covers the common case — per-array independence, the same deployment shape as `FSSTArray`. Tier 2 (`OnPair16Layout`) covers the corpus-wide-dictionary case, which gives non-trivial ratio improvements on cross-chunk-redundant data. Vortex already has this two-tier pattern for raw values (Array encoding + `DictLayout`); the FSST family is structurally well-suited to mirror it (the dictionary is small enough to Arc-share cheaply, the codes are independent per chunk).
 
@@ -383,11 +384,11 @@ The design rests on a small set of assumptions that aren't proven elsewhere in t
    │    thread T-1 → split T-1                                    │
    └──────────────────────────────────────────────────────────────┘
                               ↓
-   Global memory:                                                
-     ┌──────────────────────────────────────────┐                
-     │ out[0 .. uncompressed_bytes-1]           │                
-     │  (decompressed bytes, coalesced writes)  │                
-     └──────────────────────────────────────────┘                
+   Global memory:
+     ┌──────────────────────────────────────────┐
+     │ out[0 .. uncompressed_bytes-1]           │
+     │  (decompressed bytes, coalesced writes)  │
+     └──────────────────────────────────────────┘
 ```
 
 ## Compatibility
@@ -427,32 +428,32 @@ The encoding proposed here is a small step in a five-year arc of FSST-family wor
 
 ### OnPair (the core algorithmic contribution this RFC carries)
 
-*OnPair: Short Strings Compression for Fast Random Access*, **Francesco Gargiulo & Rossano Venturini** (University of Pisa). [arXiv:2508.02280v1](https://arxiv.org/abs/2508.02280v1), August 2025.
+_OnPair: Short Strings Compression for Fast Random Access_, **Francesco Gargiulo & Rossano Venturini** (University of Pisa). [arXiv:2508.02280v1](https://arxiv.org/abs/2508.02280v1), August 2025.
 
 OnPair is the recent contribution this RFC is built around. It introduces (1) a single-pass longest-prefix-matching pair-merge codebook construction that's an order of magnitude cheaper than classical BPE and avoids FSST's "dependency issue" (FSST §4.1) via incremental merging rather than gain-estimation; (2) the **OnPair16** bounded-symbol-length variant ([paper §3.4.2, Algorithm 3](https://arxiv.org/abs/2508.02280v1)) whose tight `memcpy(buf, src, 16); buf += len[t]` decode loop achieves 6.5–7.8 GB/s CPU decode on AVX2 hardware (paper Table 3); (3) the lexicographically-ordered flat-bytes-with-Arrow-offsets dictionary representation ([paper §3.5](https://arxiv.org/abs/2508.02280v1); [`include/onpair/core/dictionary.h`](https://github.com/gargiulofrancesco/onpair_cpp/blob/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/core/dictionary.h)); and (4) a published compressed-domain predicate machinery — KMP, Aho–Corasick, prefix, equality, boolean composition — over the token stream ([`include/onpair/search/automata/`](https://github.com/gargiulofrancesco/onpair_cpp/tree/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/search/automata)). The combined design is a meaningfully different point in the random-access-string-compression design space than FSST occupies, and the experimental work in the paper is the strongest external evidence for the design choices in this RFC.
 
 OnPair has received less attention in the database systems community than it warrants. We hope its adoption in a production columnar format helps that. The substantive technical credit for the encoding proposed in this RFC is OnPair's; Vortex's contributions are GPU decoding, parametric width selection, and the standard system-integration plumbing.
 
-- C++ reference implementation: [`gargiulofrancesco/onpair_cpp@ae590713`](https://github.com/gargiulofrancesco/onpair_cpp/tree/ae590713515c7bb7893e14a757b484545e5339c3) (MIT). Pre-1.0; the README explicitly says *"The on-disk format and the public API may change without notice."*
+- C++ reference implementation: [`gargiulofrancesco/onpair_cpp@ae590713`](https://github.com/gargiulofrancesco/onpair_cpp/tree/ae590713515c7bb7893e14a757b484545e5339c3) (MIT). Pre-1.0; the README explicitly says _"The on-disk format and the public API may change without notice."_
 - Rust reference implementation: [`gargiulofrancesco/onpair_rs@ac663abe`](https://github.com/gargiulofrancesco/onpair_rs/tree/ac663abe92ef3de26a65d9684e78f2aea28366ff) (MIT, pre-1.0).
 
 ### FSST (the family this encoding belongs to)
 
-*FSST: Fast Random Access String Compression*, **Peter Boncz, Thomas Neumann, Viktor Leis**. PVLDB Vol 13, 2020. https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf.
+_FSST: Fast Random Access String Compression_, **Peter Boncz, Thomas Neumann, Viktor Leis**. PVLDB Vol 13, 2020. https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf.
 
 FSST established the field-level random-access string compression archetype that this RFC's encoding inherits: small static symbol table, per-string decode, late-decompression-with-pushdown discipline. Vortex's current `FSSTArray` is FSST embedded as Vortex buffers + a Vortex-implemented DFA pushdown.
 
-- Reference implementation: [`cwida/fsst@e638d4cf`](https://github.com/cwida/fsst/tree/e638d4cf8c26129d73c242a4127b42b975de5b63) (MIT). Ships the FSST8 variant from the paper and a 12-bit FSST12 variant introduced in the source tree post-paper (`fsst12.h`, `libfsst12.cpp`). The FSST12 source comment ([`fsst12.h:46`](https://github.com/cwida/fsst/blob/e638d4cf8c26129d73c242a4127b42b975de5b63/fsst12.h#L46)) reads *"12-bits FSST often does not work better dan 8-bits, but it will outperform it on datasets that are more chaotic, such as JSON and widely diverse URLs"* (the "dan/than" typo is in the original).
+- Reference implementation: [`cwida/fsst@e638d4cf`](https://github.com/cwida/fsst/tree/e638d4cf8c26129d73c242a4127b42b975de5b63) (MIT). Ships the FSST8 variant from the paper and a 12-bit FSST12 variant introduced in the source tree post-paper (`fsst12.h`, `libfsst12.cpp`). The FSST12 source comment ([`fsst12.h:46`](https://github.com/cwida/fsst/blob/e638d4cf8c26129d73c242a4127b42b975de5b63/fsst12.h#L46)) reads _"12-bits FSST often does not work better dan 8-bits, but it will outperform it on datasets that are more chaotic, such as JSON and widely diverse URLs"_ (the "dan/than" typo is in the original).
 
 ### GSST (the GPU decoder shape adopted here)
 
-*GSST: Parallel string decompression at 191 GB/s on GPU*, **Robin Vonk, Joost Hoozemans, Zaid Al-Ars** (TU Delft). ACM SIGOPS Operating Systems Review, Vol. 59 No. 1, pp. 55–61, 2025. https://dl.acm.org/doi/10.1145/3759441.3759450 (paywalled).
+_GSST: Parallel string decompression at 191 GB/s on GPU_, **Robin Vonk, Joost Hoozemans, Zaid Al-Ars** (TU Delft). ACM SIGOPS Operating Systems Review, Vol. 59 No. 1, pp. 55–61, 2025. https://dl.acm.org/doi/10.1145/3759441.3759450 (paywalled).
 
-GSST's full design — block parallelism, split parallelism, coalesced memory access; shared memory, alignment, async transfers — is documented in Robin Vonk's MSc thesis *"GSST: High Throughput Parallel String Decompression on GPU"* (TU Delft, 2024), available via the TU Delft repository at https://repository.tudelft.nl/ (search "Robin Vonk GSST"). Chapter 4 has the format-optimization details; Figures 4.1–4.4 are the canonical diagrams. The thesis abstract states GSST source will be released on GitHub.
+GSST's full design — block parallelism, split parallelism, coalesced memory access; shared memory, alignment, async transfers — is documented in Robin Vonk's MSc thesis _"GSST: High Throughput Parallel String Decompression on GPU"_ (TU Delft, 2024), available via the TU Delft repository at https://repository.tudelft.nl/ (search "Robin Vonk GSST"). Chapter 4 has the format-optimization details; Figures 4.1–4.4 are the canonical diagrams. The thesis abstract states GSST source will be released on GitHub.
 
 ### GPU-side FSST encoding (parallel work)
 
-*High Throughput GPU-Accelerated FSST String Compression*, **Tim Anema, Joost Hoozemans, Zaid Al-Ars, H. Peter Hofstee** (TU Delft). VLDB 2025 ADMS Workshop. https://www.vldb.org/2025/Workshops/VLDB-Workshops-2025/ADMS/ADMS25-01.pdf.
+_High Throughput GPU-Accelerated FSST String Compression_, **Tim Anema, Joost Hoozemans, Zaid Al-Ars, H. Peter Hofstee** (TU Delft). VLDB 2025 ADMS Workshop. https://www.vldb.org/2025/Workshops/VLDB-Workshops-2025/ADMS/ADMS25-01.pdf.
 
 The encode-side counterpart to GSST. 74 GB/s on RTX 4090. Not adopted by this RFC (we keep compression on the CPU), but cited here as the natural future complement to the decoder.
 
@@ -483,6 +484,7 @@ Every design choice above is a prior, not a conclusion. Before any production co
 3. **GPU decode throughput sweep.** Port GSST to the same test harness as a baseline; then benchmark the OnPair16 encoding at `code_width_bits ∈ {10, 11, 12, 14, 16}` on H100, Ada (RTX 4090), and A100 (for comparison). Confirms the Mode A vs Mode B crossover and the per-GPU code-width recommendation.
 
    **Sub-benchmark: split sizing, kernel design, coalesced format.** At the recommended `code_width_bits = 12`: measure two kernel designs (GSST block-per-SM, persistent-thread warp-per-split) × four `codes_per_split` values (~512, ~1024, ~2048, ~4096) × two on-disk layouts (with and without coalesced reordering) × three workload shapes (short strings ~30 bytes mean, mixed bimodal, long free-text bodies >1 KiB). The proposal recommends (GSST mapping or persistent threads — whichever measures better) at `codes_per_split = 1024` with coalesced format opt-in.
+
 4. **Ratio vs throughput Pareto frontier on GPU.** For each `code_width_bits`, plot decompression throughput against compression ratio. Visualize where the design lives in tradeoff space; identify the right defaults per GPU class.
 5. **Dictionary materialization cost.** Cold and warm decode-start time at all code widths. Drives the random-access strategy and the Tier-2 caching policy.
 6. **Per-string decode latency.** OnPair16 vs FSST for short strings (names, URLs, UUIDs). Verify SIMD ramp-up doesn't make short-string decode worse than FSST's tight scalar loop. The OnPair paper Table 3 random-access column already shows OnPair16 at 156–335 ns per random access vs FSST at 154–333 ns — comparable. Vortex-specific re-measurement on representative columns is the validation.
@@ -518,32 +520,32 @@ The content below is normative for implementation but does not contradict the de
 
 **Bit-packing layout for `code_width_bits` ∈ {10, 11, 12, 14, 16}.**
 
-- *16-bit:* Each code is a `u16` little-endian. `codes[k]` lives at byte offset `2*k`.
-- *12-bit (FSST12 layout):* Each pair of codes lives in 3 bytes. For codes `c_2i` and `c_{2i+1}` packed into bytes `b_3i`, `b_{3i+1}`, `b_{3i+2}`:
+- _16-bit:_ Each code is a `u16` little-endian. `codes[k]` lives at byte offset `2*k`.
+- _12-bit (FSST12 layout):_ Each pair of codes lives in 3 bytes. For codes `c_2i` and `c_{2i+1}` packed into bytes `b_3i`, `b_{3i+1}`, `b_{3i+2}`:
   ```
   bytes[3i]   = c_2i       & 0xFF     // low 8 bits of even code
   bytes[3i+1] = (c_2i      >> 8) & 0xF  |  (c_{2i+1} & 0xF) << 4  // top 4 of even, bottom 4 of odd
   bytes[3i+2] = (c_{2i+1}  >> 4) & 0xFF  // top 8 bits of odd code
   ```
   This matches the `cwida/fsst@e638d4c/libfsst12.cpp` decode loop (Algorithm 2 in the source). At end-of-stream, if `n_codes` is odd, the trailing half-byte of the last byte is zero-padded.
-- *10-bit, 11-bit, 14-bit:* LSB-first bit-packed into a `u8` stream. Code `k` of width `w` occupies bits `[k*w, k*w + w)` counting from the LSB of byte 0, spilling into subsequent bytes. Equivalently: `code[k] = (load_u64_le(bytes[k*w/8 .. k*w/8 + 8]) >> (k*w % 8)) & ((1 << w) - 1)`. Trailing bits in the final byte beyond `n_codes * w` are zero-padded.
+- _10-bit, 11-bit, 14-bit:_ LSB-first bit-packed into a `u8` stream. Code `k` of width `w` occupies bits `[k*w, k*w + w)` counting from the LSB of byte 0, spilling into subsequent bytes. Equivalently: `code[k] = (load_u64_le(bytes[k*w/8 .. k*w/8 + 8]) >> (k*w % 8)) & ((1 << w) - 1)`. Trailing bits in the final byte beyond `n_codes * w` are zero-padded.
 
 **Code-stream alignment.** The `codes` buffer is 16-byte-aligned at its start (Vortex buffer convention). No internal alignment requirements within the stream; the bit-packing fills contiguously. Implementations using AVX-512 / SIMD loads larger than 16 bytes should over-allocate the read end appropriately.
 
-**`splits` array semantics.** `splits[s]` (for `s ∈ [0, n_splits)`) is the number of *uncompressed bytes* produced by decoding the codes `[s * codes_per_split, (s+1) * codes_per_split)`. The final split may have fewer than `codes_per_split` codes if `n_codes` is not a multiple of `codes_per_split`; in that case `splits[n_splits - 1]` reflects the actual uncompressed bytes produced by the remaining `n_codes - (n_splits - 1) * codes_per_split` codes. The relationship `n_splits = ⌈n_codes / codes_per_split⌉` is an invariant a conforming reader must check.
+**`splits` array semantics.** `splits[s]` (for `s ∈ [0, n_splits)`) is the number of _uncompressed bytes_ produced by decoding the codes `[s * codes_per_split, (s+1) * codes_per_split)`. The final split may have fewer than `codes_per_split` codes if `n_codes` is not a multiple of `codes_per_split`; in that case `splits[n_splits - 1]` reflects the actual uncompressed bytes produced by the remaining `n_codes - (n_splits - 1) * codes_per_split` codes. The relationship `n_splits = ⌈n_codes / codes_per_split⌉` is an invariant a conforming reader must check.
 
 **Metadata invariants enforced at read time.**
 
-| Invariant | Action on violation |
-|---|---|
-| `code_width_bits ∈ {10, 11, 12, 14, 16}` | Reject with `OnPair16Error::UnsupportedCodeWidth(u8)` |
-| `n_tokens >= 256` | Reject with `OnPair16Error::InsufficientDictionary` |
-| `n_tokens <= 2^code_width_bits` | Reject with `OnPair16Error::DictionaryExceedsCodeSpace` |
-| `dict_offsets.len() == n_tokens + 1` and monotonically non-decreasing | Reject with `OnPair16Error::CorruptDictOffsets` |
-| `dict_offsets[n_tokens] == dict_bytes_size` | Reject with `OnPair16Error::DictSizeMismatch` (dict_offsets is authoritative; dict_bytes_size is a redundant check) |
-| `code_offsets.len() == n_strings + 1`, monotonically non-decreasing, with `code_offsets[n_strings] == n_codes` | Reject with `OnPair16Error::CorruptCodeOffsets` |
-| if `n_splits > 0`: `n_splits == ⌈n_codes / codes_per_split⌉` and `sum(splits) == uncompressed_bytes` | Reject with `OnPair16Error::CorruptSplitMetadata` |
-| `dict_bytes` has ≥16 trailing zero bytes past `dict_bytes_size` | Reject with `OnPair16Error::MissingDecodeBufferPadding` |
+| Invariant                                                                                                      | Action on violation                                                                                                 |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `code_width_bits ∈ {10, 11, 12, 14, 16}`                                                                       | Reject with `OnPair16Error::UnsupportedCodeWidth(u8)`                                                               |
+| `n_tokens >= 256`                                                                                              | Reject with `OnPair16Error::InsufficientDictionary`                                                                 |
+| `n_tokens <= 2^code_width_bits`                                                                                | Reject with `OnPair16Error::DictionaryExceedsCodeSpace`                                                             |
+| `dict_offsets.len() == n_tokens + 1` and monotonically non-decreasing                                          | Reject with `OnPair16Error::CorruptDictOffsets`                                                                     |
+| `dict_offsets[n_tokens] == dict_bytes_size`                                                                    | Reject with `OnPair16Error::DictSizeMismatch` (dict_offsets is authoritative; dict_bytes_size is a redundant check) |
+| `code_offsets.len() == n_strings + 1`, monotonically non-decreasing, with `code_offsets[n_strings] == n_codes` | Reject with `OnPair16Error::CorruptCodeOffsets`                                                                     |
+| if `n_splits > 0`: `n_splits == ⌈n_codes / codes_per_split⌉` and `sum(splits) == uncompressed_bytes`           | Reject with `OnPair16Error::CorruptSplitMetadata`                                                                   |
+| `dict_bytes` has ≥16 trailing zero bytes past `dict_bytes_size`                                                | Reject with `OnPair16Error::MissingDecodeBufferPadding`                                                             |
 
 The validation pass runs once on Array construction; subsequent decode operations may assume the metadata is correct.
 
@@ -736,12 +738,12 @@ The persistent-thread variant takes one additional `uint32_t* g_split_counter` f
 
 **SMEM allocation (12-bit codes).** Static allocation per block:
 
-| Allocation | Size | Note |
-|---|---|---|
-| `sym_bytes[4096 * 16]` | 64 KiB | Flattened symbol table (over-copied from `dict_bytes`) |
-| `sym_len[4096]` | 4 KiB | Length of each token in bytes |
-| `output_offsets[257]` | 1 KiB | Per-split exclusive-scan of `splits[]` (256 splits + sentinel) |
-| Total | ~69 KiB | Within H100's 228 KB/SM budget at 3 blocks/SM |
+| Allocation             | Size    | Note                                                           |
+| ---------------------- | ------- | -------------------------------------------------------------- |
+| `sym_bytes[4096 * 16]` | 64 KiB  | Flattened symbol table (over-copied from `dict_bytes`)         |
+| `sym_len[4096]`        | 4 KiB   | Length of each token in bytes                                  |
+| `output_offsets[257]`  | 1 KiB   | Per-split exclusive-scan of `splits[]` (256 splits + sentinel) |
+| Total                  | ~69 KiB | Within H100's 228 KB/SM budget at 3 blocks/SM                  |
 
 For `code_width_bits < 12`, sizes scale down proportionally. For Mode B (14/16-bit codes), the dictionary is in global memory and the SMEM allocation drops to just `output_offsets` + scratch.
 
@@ -804,7 +806,7 @@ Warp-cooperative variants that amortize the byte-stream load across 32 codes (8 
 
 ### Registry and dispatch
 
-- **Encoding IDs:** assigned at PR merge from Vortex's encoding-ID registry. The RFC reserves the *name* `OnPair16` (Array) and `OnPair16Layout` (Layout); the *numeric* IDs are assigned by the registry maintainer to avoid conflict.
+- **Encoding IDs:** assigned at PR merge from Vortex's encoding-ID registry. The RFC reserves the _name_ `OnPair16` (Array) and `OnPair16Layout` (Layout); the _numeric_ IDs are assigned by the registry maintainer to avoid conflict.
 - **VTable impls:** `OnPair16: VTable<Encoding = OnPair16>` and `OnPair16Layout: LayoutVTable` mirror `FSST` and `Dict` respectively. Method-by-method, the implementations follow the corresponding FSST / Dict entries.
 - **Static registration:** via the existing `inventory::submit!` pattern that other Vortex encodings use. Lives at the top of `encodings/fsst/src/lib.rs`.
 
@@ -831,17 +833,17 @@ Warp-cooperative variants that amortize the byte-stream load across 32 codes (8 
 
 These are the targets an implementer can measure during development to confirm they're on track. Failure to hit a budget isn't a hard stop, but is a signal to investigate.
 
-| Budget | Target | Verifiable with |
-|---|---|---|
-| CPU decode throughput at 12-bit | ≥4 GB/s on Zen 4 / Sapphire Rapids, scalar (compiler auto-vectorized: LLVM ≥ 14 or GCC ≥ 11) | criterion benchmark with the OnPair-paper corpora; verify the inner loop emits a 16-byte vector load+store (e.g., `movdqu` / `vmovdqu`) via `cargo asm` or `objdump -d` |
-| CPU decode throughput at 16-bit | ≥5 GB/s on Zen 4 / Sapphire Rapids, scalar (same compiler floors as above) | criterion; same assembly-verification step |
-| CPU decode L1 hit rate | ≥95% for the symbol table at 12-bit; ≥90% at 16-bit | `perf stat -e L1-dcache-load-misses,L1-dcache-loads` |
-| GPU decode throughput at 12-bit (H100) | ≥200 GB/s | nsight compute, runtime divided by uncompressed bytes |
-| GPU kernel launch overhead | ≤50 µs per chunk | nsight systems |
-| Dict materialization (cold) | ≤500 µs for 4K-token dict, ≤8 ms for 64K-token dict | criterion micro-benchmark |
-| Dict materialization (warm via OnceLock) | ≤100 ns per access | criterion |
-| Encoder compression throughput | ≥150 MiB/s at 12-bit on the OnPair-paper corpora, scalar (auto-vectorized) | criterion; matches OnPair paper Table 1 row 12 |
-| Encoder dict-training cost | ≤10% of total compression time on inputs >1 MiB | criterion, separate-phase timing |
+| Budget                                   | Target                                                                                       | Verifiable with                                                                                                                                                         |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CPU decode throughput at 12-bit          | ≥4 GB/s on Zen 4 / Sapphire Rapids, scalar (compiler auto-vectorized: LLVM ≥ 14 or GCC ≥ 11) | criterion benchmark with the OnPair-paper corpora; verify the inner loop emits a 16-byte vector load+store (e.g., `movdqu` / `vmovdqu`) via `cargo asm` or `objdump -d` |
+| CPU decode throughput at 16-bit          | ≥5 GB/s on Zen 4 / Sapphire Rapids, scalar (same compiler floors as above)                   | criterion; same assembly-verification step                                                                                                                              |
+| CPU decode L1 hit rate                   | ≥95% for the symbol table at 12-bit; ≥90% at 16-bit                                          | `perf stat -e L1-dcache-load-misses,L1-dcache-loads`                                                                                                                    |
+| GPU decode throughput at 12-bit (H100)   | ≥200 GB/s                                                                                    | nsight compute, runtime divided by uncompressed bytes                                                                                                                   |
+| GPU kernel launch overhead               | ≤50 µs per chunk                                                                             | nsight systems                                                                                                                                                          |
+| Dict materialization (cold)              | ≤500 µs for 4K-token dict, ≤8 ms for 64K-token dict                                          | criterion micro-benchmark                                                                                                                                               |
+| Dict materialization (warm via OnceLock) | ≤100 ns per access                                                                           | criterion                                                                                                                                                               |
+| Encoder compression throughput           | ≥150 MiB/s at 12-bit on the OnPair-paper corpora, scalar (auto-vectorized)                   | criterion; matches OnPair paper Table 1 row 12                                                                                                                          |
+| Encoder dict-training cost               | ≤10% of total compression time on inputs >1 MiB                                              | criterion, separate-phase timing                                                                                                                                        |
 
 If a budget can't be met after reasonable optimization, raise it as a finding in the implementation PR and discuss before merge.
 
@@ -855,4 +857,4 @@ A project-planning note, not a design choice — included here so implementers a
 
 **Phase 3 — `OnPair16Layout` (Tier 2 shared dict) + Mode B + Coalesced Memory Access Format.** Adds the cross-chunk-shared-dictionary layout, the 14/16-bit GPU decoder kernel, and the optional code-stream reordering for GPU memory coalescing. Validates the corpus-wide-dict ratio uplift and the Mode A/B crossover.
 
-A monolithic merge of all three is also possible — the format is designed so the phases are *implementation* phases, not *format* phases. The phased form is the recommendation only because it bounds review and validation effort per PR.
+A monolithic merge of all three is also possible — the format is designed so the phases are _implementation_ phases, not _format_ phases. The phased form is the recommendation only because it bounds review and validation effort per PR.
