@@ -67,9 +67,10 @@ storage and bandwidth on the table. A first-class lossy quantization path
 opens up new workloads — billions-scale ANN search, on-disk KV-cache, embedding
 serving — where a lossless format is over-engineered.
 
-**Vortex needs a clean answer to "where does lossy data live?"** The original
-RFC modelled TurboQuant as a new physical encoding of the `Vector` extension
-type. That model breaks down on three concrete questions:
+**Vortex needs a clean answer to "where does lossy data live?"** A natural
+starting point would be to model TurboQuant as a new physical encoding of the
+`Vector` extension type — encoding-as-compression is how lossless schemes
+already work. That model breaks down on three concrete questions:
 
 - Are quantized vectors unit-normalized? After scalar quantization on a rotated
   unit vector, the inverse transform does not generally recover a unit vector.
@@ -135,6 +136,12 @@ there is no canonicalization to `Vector`. Decoding goes through the explicit
 and the result is named `Vector`, not "the original floats." `TQDecode(TQEncode(v))`
 returns values close to `v` (within MSE bounds), not `v` itself, and that
 distinction is now visible in the operator chain.
+
+`TQDecode` is a regular scalar function — analogous to a numeric cast or a
+parser — not a privileged canonicalization mechanism. It happens to be the
+_only_ path back to `Vector`, but the routing is no different from any
+other function call: the user writes it, the planner sees it, the executor
+runs it.
 
 ### Implications for the three-stage plan
 
@@ -438,28 +445,28 @@ shares. Stages 1, 2, and 3 in §6–§8 below extend or refine specific aspects;
 nothing in this section ever goes away.
 
 ```text
-        ┌────────────────────────────────────────────────────────┐
-        │                User-facing API surface                 │
-        │                                                        │
-        │   Vector<F, d>  ──TQEncode──▶  Extension<TurboQuant>   │
-        │                 ◀──TQDecode──                          │
-        └────────────────────────────────────────────────────────┘
+        ┌─────────────────────────────────────────────────────────┐
+        │                User-facing API surface                  │
+        │                                                         │
+        │   Vector<F, d>  ──TQEncode──▶  Extension<TurboQuant>    │
+        │                 ◀──TQDecode──                           │
+        └─────────────────────────────────────────────────────────┘
                                   │
                                   │  ExtVTable
                                   ▼
-        ┌────────────────────────────────────────────────────────┐
-        │  Extension<TurboQuant>                                 │
-        │     metadata (prost): {element_ptype, dimensions,      │
-        │       bit_width, seed, num_rounds, [block_size]}       │
-        │                                                        │
-        │     storage:  Struct {                                 │
-        │                 norms:  Primitive<F>     (Stage 1)     │
+        ┌─────────────────────────────────────────────────────────┐
+        │  Extension<TurboQuant>                                  │
+        │     metadata (prost): {element_ptype, dimensions,       │
+        │       bit_width, seed, num_rounds, [block_size]}        │
+        │                                                         │
+        │     storage:  Struct {                                  │
+        │                 norms:  Primitive<F>      (Stage 1)     │
         │                       | FSL<F, num_blocks> (Stage 2 k>1)│
-        │                 codes:  FSL<u8, padded_dim>            │
-        │                       | FSL<u8, num_blocks*block_size> │
-        │                       | PDXArray<u8, ...> (Stage 3)    │
-        │               }                                        │
-        └────────────────────────────────────────────────────────┘
+        │                 codes:  FSL<u8, padded_dim>             │
+        │                       | FSL<u8, num_blocks*block_size>  │
+        │                       | PDXArray<u8, ...> (Stage 3)     │
+        │               }                                         │
+        └─────────────────────────────────────────────────────────┘
                   ▲                                ▲
                   │                                │
                   │ derived (not stored)           │ derived (not stored)
@@ -664,9 +671,11 @@ as a Stage 1 refinement:
   (after Max-Lloyd converges) using EDEN's optimization criterion. The
   implementer should consult EDEN [15] for the precise criterion — the note
   [14] defers to "methods described in the EDEN works" and does not
-  reproduce the algorithm itself. Reference implementation:
-  https://github.com/amitport/EDEN-Distributed-Mean-Estimation (MIT;
-  PyTorch and TensorFlow).
+  reproduce the algorithm itself. The authors' official reproduction lives
+  at https://github.com/amitport/EDEN-Distributed-Mean-Estimation (PyTorch
+  and TensorFlow); note that this repository has **no LICENSE file**, so
+  it is reference reading only — Vortex's implementation must be
+  clean-room from the EDEN paper.
 - Cache `(centroids, S)` together under the existing `(padded_dim,
 bit_width)` key in the `DashMap`.
 - Apply `S` at quantization time (encode: scale `r * S` before
@@ -695,12 +704,27 @@ and selecting at decode time. We recommend (a) — see §13 "Migration."
   diminishing returns vs. lossless schemes.
 
 ```rust
+// vortex-turboquant/src/config.rs, ff120401. Fields are private; access via
+// accessors (bit_width(), seed(), num_rounds()). All three are required at
+// construction — Stage 1 does not currently expose a default-config helper.
 pub struct TurboQuantConfig {
-    pub bit_width: u8,            // 1..=8
-    pub seed: Option<u64>,        // default 42 (or session-configurable)
-    pub num_rounds: u8,           // default 3
+    bit_width: u8,    // 1..=8 (validated in try_new)
+    seed: u64,        // SORF seed
+    num_rounds: u8,   // > 0 (validated in try_new)
+}
+
+impl TurboQuantConfig {
+    pub fn try_new(bit_width: u8, seed: u64, num_rounds: u8) -> VortexResult<Self>;
+    pub fn bit_width(&self) -> u8;
+    pub fn seed(&self) -> u64;
+    pub fn num_rounds(&self) -> u8;
 }
 ```
+
+Stage 1 stabilization may add a `Default` impl with the recommended values
+(bit_width 8, num_rounds 3, a session-derived seed). The seed is not
+currently optional — callers pass a concrete `u64` and the session is
+responsible for choosing one.
 
 ### Power-of-2 padding
 
@@ -1581,9 +1605,11 @@ a prost message; new fields are added as `optional` so that older readers
 treat them as their default value.
 
 Stage 1 → Stage 2: add `block_size: Option<u32>`. Stage 1 writers leave it
-as `None`; Stage 1 readers see `None` and treat the array as a single
-padded block. Stage 2 writers populate it when k > 1; Stage 2 readers
-honor it.
+unset; Stage 1 readers see unset and treat the array as a single padded
+block. Stage 2 writers populate it **only when k > 1**; for k = 1
+(power-of-2 dimensions) Stage 2 writers also leave it unset, producing a
+wire-format-identical artifact to Stage 1 at the same dimension. Stage 2
+readers accept both forms but writers converge on this rule.
 
 Stage 2 → Stage 3: no metadata change. The codes child's physical encoding
 shifts from `FixedSizeListArray` to `PDXArray`; readers detect via
@@ -1699,7 +1725,7 @@ The ICLR 2026 camera-ready proceedings may use different numbering._
 
 [1] Zandieh, A., Daliri, M., Hadian, M. and Mirrokni, V. "TurboQuant: Online
 Vector Quantization with Near-optimal Distortion Rate." ICLR 2026.
-arXiv:2504.19874, April 2025.
+arXiv:2504.19874v1, April 2025.
 
 [2] Ailon, N. and Chazelle, B. "The Fast Johnson-Lindenstrauss Transform and
 Approximate Nearest Neighbors." SIAM J. Comput. 39(1):302-322, 2009.
@@ -1901,45 +1927,57 @@ intentionally leaves open.
 
 ### D.2 Extension type metadata (prost)
 
-The on-disk metadata is the prost-encoded form of:
+**Current schema** at `vortex-turboquant/src/vtable.rs` (ff120401):
 
 ```rust
-// Reproduced from vortex-turboquant/src/vtable.rs at ff120401.
+#[derive(Clone, PartialEq, Message)]
 struct TurboQuantMetadataProto {
-    element_ptype: PType,    // tag 1, enum
-    dimensions:    u32,      // tag 2
-    bit_width:     u32,      // tag 3 (fits in u8 at the type level)
-    seed:          u64,      // tag 4
-    num_rounds:    u32,      // tag 5 (fits in u8 at the type level)
-    // Stage 2 addition (not in current source):
-    block_size:    optional u32,  // tag 6
-    // Future:
-    unbiased:      optional bool, // tag 7 — reserve for EDEN unbiased mode
+    #[prost(enumeration = "PType", tag = "1")]
+    element_ptype: i32,
+    #[prost(uint32, tag = "2")]
+    dimensions: u32,
+    #[prost(uint32, tag = "3")]
+    bit_width: u32,   // u8 at the type level
+    #[prost(uint64, tag = "4")]
+    seed: u64,
+    #[prost(uint32, tag = "5")]
+    num_rounds: u32,  // u8 at the type level
 }
 ```
 
-The current `TurboQuantMetadataProto` in `vortex-turboquant/src/vtable.rs`
-defines tags 1–5. Stage 2 adds `block_size` at tag 6; future stages
-add additional optional tags as needed. Prost optional-field semantics
-mean older readers ignore unknown tags, so the wire format is forward-
-compatible by construction.
+**This RFC proposes** adding the following tags, in this order, as the
+corresponding stages land:
+
+- **Tag 6 — `block_size: Option<u32>`** (Stage 2). Stage 1 writers leave
+  this unset; readers treat unset as "single padded block." Stage 2
+  writers set it when k > 1; for k = 1 (power-of-2 dimensions) writers
+  also leave it unset, preserving bit-identical wire format with Stage 1
+  at d = 1024 (see Open Questions resolution #4 in §16).
+- **Tag 7 — reserved** for a future `unbiased: Option<bool>` flag when (if)
+  EDEN's native b-bit unbiased mode is added (§15). Reserving the tag now
+  keeps the field-add policy clean.
+
+Prost optional-field semantics mean older readers ignore unknown tags, so
+the schema is forward-compatible by construction.
 
 **Constraint:** tags 1–5 are part of Vortex's stable contract once Stage 1
 ships in a release. Renumbering or repurposing them would be a wire-format
-break.
+break. Tag 6's semantics are locked once Stage 2 ships.
 
 ### D.3 Validation
 
-The `ExtVTable::validate_dtype` implementation enforces:
+The `ExtVTable::validate_dtype` implementation enforces (error templates
+shown with `vortex_ensure!` placeholder substitution, where `{var}` is
+filled with the offending value at runtime):
 
-- `dimensions >= MIN_DIMENSION` (`= 128`). On violation: error
-  `"TurboQuant dimensions must be >= 128, got {N}"`.
-- `1 ≤ bit_width ≤ MAX_BIT_WIDTH` (`= 8`). On violation: error
-  `"TurboQuant bit_width must be 1-8, got {N}"`.
-- `num_rounds > 0`. On violation: error
-  `"TurboQuant num_rounds must be > 0, got 0"`.
-- `element_ptype.is_float()` (one of F16, F32, F64). On violation: error
-  `"TurboQuant element_ptype must be a float, got {ptype}"`.
+- `dimensions >= MIN_DIMENSION` (`= 128`). On violation:
+  `"TurboQuant dimensions must be >= 128, got {dimensions}"`.
+- `1 ≤ bit_width ≤ MAX_BIT_WIDTH` (`= 8`). On violation:
+  `"TurboQuant bit_width must be 1-8, got {bit_width}"`.
+- `num_rounds > 0`. On violation:
+  `"TurboQuant num_rounds must be > 0, got {num_rounds}"`.
+- `element_ptype.is_float()` (one of F16, F32, F64). On violation:
+  `"TurboQuant element_ptype must be a float, got {element_ptype}"`.
 - Storage dtype is `Struct { norms: Primitive<element_ptype>, codes:
 FixedSizeList<u8, padded_dim> }` with matching row-validity propagation.
 
@@ -1954,9 +1992,9 @@ fits in `u32` (i.e., `2^31`).
 
 ```text
 fn tq_encode(v: Vector<F, d>, cfg: &TurboQuantConfig) -> TurboQuantArray:
-    padded_dim = next_power_of_two(d)
-    if padded_dim does not fit u32:
-        return Err(OverflowError)
+    if d > MAX_DIMENSION:                          # MAX_DIMENSION = 2^31
+        return Err(OverflowError)                  # next_power_of_two would overflow
+    padded_dim = next_power_of_two(d)              # checked: ≤ 2^31
 
     n = ‖v‖₂   # in input dtype F (f16/f32/f64)
     if n > 0:
@@ -1984,6 +2022,11 @@ fn tq_encode(v: Vector<F, d>, cfg: &TurboQuantConfig) -> TurboQuantArray:
 
 `centroids = get_centroids(padded_dim, bit_width)` and `S = get_eden_scale(padded_dim, bit_width)`
 both come from the process-local cache keyed on `(padded_dim, bit_width)`.
+
+**Licensing note.** The EDEN-`S` derivation must be implemented clean-room
+from the EDEN paper [15]. The authors' official reproduction at
+https://github.com/amitport/EDEN-Distributed-Mean-Estimation has no
+LICENSE file and therefore cannot be copied or adapted into Vortex.
 
 ### D.5 Decode (Stage 1) pseudocode
 
@@ -2162,22 +2205,39 @@ Stages 2 and 3 add:
 
 ### D.11 Performance budgets
 
-Goals (from §11) become budgets here, with verification commands:
+The goals in §11 become measurable budgets once Stage 1 stabilization has
+baseline numbers. Concrete budgets are deliberately **not yet pinned** in
+this RFC — pinning them with fabricated round numbers would mislead the
+implementer about what "on track" means. The plan is:
 
-- **Encode throughput, Stage 1, AVX-512, d = 768, b = 8**: ≥ 1 M vectors/sec.
-  Verify with `cargo run -p vortex-turboquant --release --bench encode_decode`.
-- **Decode throughput, Stage 1, AVX-512, d = 768, b = 8**: ≥ 1 M vectors/sec.
-- **Encode throughput, Stage 2, AVX-512, d = 768, k = 3, B = 256, b = 8**:
-  ≥ 1.3 M vectors/sec (≥ 30% faster than Stage 1 padded, matching the FLOP
-  ratio in §11).
-- **Compression ratio, b = 8**: 3.0× (Stage 1 padded at d = 768), 3.9×
-  (Stage 2 k = 3 at d = 768), 4.0× (any stage at d = 1024).
-- **Normalized MSE, b = 8, d ≥ 128**: < 5e-5 on Gaussian inputs.
-- **Stage 3 PDX scan throughput, AVX-512, b = 4, d = 768**: ≥ 1.5×
-  Stage 2's row-major kernel throughput on 1 M-row scan.
+1. **Baseline.** Run the existing benchmark
+   `cargo bench -p vortex-turboquant --bench encode_decode --release` on a
+   reference machine (e.g., AVX-512 Sapphire Rapids, ARM Neoverse-V2) at
+   d ∈ {768, 1024, 1536} and b ∈ {4, 8}, recording encode and decode
+   throughput in vectors/sec.
+2. **Pin the baselines as budgets** in this appendix, with the machine
+   and command used to produce them.
+3. **Stage 2 and Stage 3 budgets** then become "X% of Stage 1 padded" with
+   `X` chosen against the FLOP-ratio analysis in §11 (Stage 2 should be
+   ~40% faster than padded Stage 1 at d=768; Stage 3 PDX should be 1.5–2×
+   Stage 2 row-major per [4, Table 4]).
 
-These are starting budgets; the Experimental plan (§12) refines them with
-real workloads.
+Until those baselines land, the only budget the RFC commits to is the
+**compression ratio** (which is determined by the wire format and is
+exact, not measured):
+
+| Configuration                    | Per-vec bits (f32 input) | Ratio |
+| -------------------------------- | ------------------------ | ----- |
+| Stage 1 padded, d=768, b=8       | 8,224                    | 3.0×  |
+| Stage 2 (k=3, B=256), d=768, b=8 | 6,240                    | 3.9×  |
+| Stage 1 or 2 (k=1), d=1024, b=8  | 8,224                    | 4.0×  |
+
+And the **normalized MSE bound** (which is from Theorem 1 — see §4 and
+Appendix A): `≤ 2.72 / 4^b` per vector in expectation on Haar-random
+rotations; the SORF approximation observes ~20% slack over this bound at
+d=1024 in `vortex-turboquant`'s test suite, so the operational assertion
+is `normalized_mse_per_vector ≤ 3.3 / 4^b` until tighter empirical bounds
+land.
 
 ### D.12 Registry / dispatch wiring
 
@@ -2245,13 +2305,7 @@ work, not blockers on the design:
    exact mixing function is a Stage 2 implementation detail that should be
    pinned before the first Stage 2 file is written; the wire format
    becomes load-bearing once any file is shipped.
-4. **Wire-format identity at d=1024 across Stage 1 → Stage 2 writers.** When
-   a Stage 2 writer emits a power-of-2-dimension TurboQuant array (so
-   k = 1), should it write `block_size = None` (matching Stage 1 readers'
-   default exactly) or `block_size = Some(padded_dim)`? Stage 2 readers
-   accept both; Stage 1 readers only accept `None`. Writers must converge
-   to one or the other to preserve cross-version write/read interop.
-5. **Whether to lower `MIN_DIMENSION` after Stage 1 experimental
+4. **Whether to lower `MIN_DIMENSION` after Stage 1 experimental
    validation.** If the experimental plan supports lowering to 64–96, the
    change is a wire-format break in the sense that files written at
    d < 128 by a new writer would be rejected by an old reader. Surface
@@ -2281,3 +2335,11 @@ re-litigate.
   Stage 1 cleanup task in §14 "Current state and known gaps." Removal
   follows once `vortex/examples/turboquant_vector_search.rs` migrates to
   the new `TQEncode` / `TQDecode` path.
+- **Wire-format identity at d = 1024 across Stage 1 → Stage 2 writers** —
+  resolved: Stage 2 writers leave `block_size` unset whenever k = 1
+  (i.e., for any power-of-2 dimension that doesn't require decomposition).
+  This produces a wire-format-identical artifact to a Stage 1 writer at
+  d = 1024 and remains readable by Stage 1 readers. Stage 2 readers accept
+  both `unset` (treat as single padded block) and `Some(padded_dim)` (an
+  encoder bug to be flagged in validation), but writers must converge on
+  `unset`. See §13 "Migration and compatibility."
