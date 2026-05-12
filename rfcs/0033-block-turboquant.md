@@ -2,7 +2,7 @@
 
 **Authors:** @lwwmanning, @connortsui20
 **Status:** Proposal
-**Date:** 2026-04-02 (rewritten 2026-05-12)
+**Date:** 2026-04-02 (rewritten 2026-05-12; citations corrected 2026-05-12)
 
 ## Summary
 
@@ -39,14 +39,19 @@ This rewrite supersedes the original RFC 33 draft, which was written against an
 earlier monolithic `TurboQuantArray` design that has since been replaced by the
 extension-type model on `vortex-data/vortex` `develop` (PR #7829, merged
 2026-05-07). It also incorporates a piece of prior art the original RFC missed:
-the **EDEN paper** ([arXiv:2604.18555], ICML 2022) predates TurboQuant
-([arXiv:2504.19874]) and demonstrates that TurboQuant is a suboptimal special
-case of the same RHT + Lloyd-Max scalar quantizer family. We adopt EDEN's
-contributions while keeping the codebase's TurboQuant branding.
+the **EDEN paper** [15] ([arXiv:2108.08842], ICML 2022) and its predecessor
+**DRIVE** [16] ([arXiv:2105.08339], NeurIPS 2021) predate TurboQuant [1]
+([arXiv:2504.19874]). A recent note by the EDEN authors [14]
+([arXiv:2604.18555], April 2026) demonstrates that TurboQuant is a suboptimal
+special case of the same RHT + Lloyd-Max scalar quantizer family. We adopt
+EDEN's contributions while keeping the codebase's TurboQuant branding;
+see §4 "Naming."
 
+[arXiv:2108.08842]: https://arxiv.org/abs/2108.08842
+[arXiv:2105.08339]: https://arxiv.org/abs/2105.08339
 [arXiv:2604.18555]: https://arxiv.org/abs/2604.18555
-[arXiv:2504.19874]: https://arxiv.org/abs/2504.19874
-[current-impl]: https://github.com/spiraldb/vortex/tree/develop/vortex-turboquant
+[arXiv:2504.19874]: https://arxiv.org/abs/2504.19874v1
+[current-impl]: https://github.com/spiraldb/vortex/tree/ff120401a0f4796f2d1aa85d1f87e7195c1f3dbf/vortex-turboquant
 [original-impl]: https://github.com/spiraldb/vortex/pull/7167
 
 ## Motivation
@@ -205,47 +210,55 @@ correlation tests.
 
 ### Relationship to EDEN and DRIVE
 
-The original RFC 33 missed an important piece of prior art: the **EDEN paper**
-[14] (Vargaftik et al., ICML 2022; extended journal version [arXiv:2604.18555]),
-together with its predecessor **DRIVE** [15] (NeurIPS 2021), uses the same
-building blocks as TurboQuant — Randomized Hadamard Transform plus Lloyd–Max
-scalar quantization on a rotated, Beta-distributed unit vector. EDEN predates
-TurboQuant by two-plus years and generalizes it.
+The original RFC 33 missed an important piece of prior art. **EDEN** [15]
+(Vargaftik et al., ICML 2022; [arXiv:2108.08842]) and its predecessor
+**DRIVE** [16] (NeurIPS 2021; [arXiv:2105.08339]) use the same building blocks
+as TurboQuant — Randomized Hadamard Transform plus Lloyd–Max scalar
+quantization on a rotated, Beta-distributed unit vector. EDEN predates
+TurboQuant by two-plus years and generalizes it: DRIVE is a 1-bit quantizer
+that EDEN extends to any `b > 0` bits per coordinate.
+
+In April 2026, the EDEN authors posted a clarification note [14]
+([arXiv:2604.18555], Ben-Basat, Ben-Itzhak, Mendelson, Mitzenmacher, Portnoy,
+Vargaftik) titled "A Note on TurboQuant and the Earlier DRIVE/EDEN Line of
+Work," which explicitly catalogues TurboQuant's relationship to EDEN. We
+draw the comparisons in this section from that note's abstract and from EDEN
+[15] directly.
 
 The substantive differences are:
 
-| Aspect                 | TurboQuant [1]                                | EDEN [14]                                    |
+| Aspect                 | TurboQuant [1]                                | EDEN [15]                                    |
 | ---------------------- | --------------------------------------------- | -------------------------------------------- |
 | Rotation               | Random orthogonal (paper) / SORF (ours)       | Randomized Hadamard Transform (same family)  |
 | Marginal distribution  | Beta `(1-x²)^((d-3)/2)`                       | Same (shifted Beta after rotation)           |
 | Centroids              | Max-Lloyd on the Beta marginal                | Same                                         |
 | Scalar quantizer scale | Fixed `S = 1`                                 | **Optimal `S` per `(dimension, bit_width)`** |
-| Biased mode            | MSE-only                                      | Yes (biased EDEN)                            |
+| Biased mode            | MSE-only                                      | Yes (biased EDEN, optimal `S`)               |
 | Unbiased mode          | MSE + QJL stacking (b-1 MSE bits + 1 QJL bit) | **Native b-bit unbiased EDEN at any b > 0**  |
 | Reported relative MSE  | Theorem 1 bound: `(√3·π/2)/4^b ≈ 2.72·4⁻ᵇ`    | Tighter bound from EDEN's optimal `S`        |
 | Bias of inner product  | Biased (MSE) / unbiased (Prod)                | Either, both natively                        |
 
-EDEN's paper [14] argues TurboQuant is suboptimal in two specific ways:
+The note [14] argues TurboQuant is suboptimal in two specific ways:
 
-1. **Fixed `S = 1` is asymptotically optimal but not finite-dim optimal.**
-   TurboQuant's fixed scale converges to optimal only as dimension grows. At
-   practical dimensions, EDEN's per-`(d, b)` optimal `S` strictly reduces MSE.
-   This holds for the biased mode (TurboQuant_mse).
+1. **Fixed `S = 1` is asymptotically optimal but not finite-dim optimal.** The
+   note states: _"The fixed choice `S = 1` used by TurboQuant is generally
+   suboptimal, although the optimal `S` for biased EDEN converges to `1` as
+   the dimension grows; accordingly TurboQuant_mse approaches EDEN's behavior
+   for large d"_ [14]. At practical dimensions, EDEN's per-`(d, b)` optimal
+   `S` strictly reduces MSE.
 2. **EDEN's native unbiased mode dominates TurboQuant's MSE+QJL "product"
-   stacking.** EDEN reports _"biased EDEN (with optimized S) is more accurate
-   than TurboQuant_mse, and unbiased EDEN is markedly more accurate than
-   TurboQuant_prod, often by more than a bit (e.g., 2-bit EDEN beats 3-bit
-   TurboQuant_prod)"_ [14].
+   stacking.** The note reports _"biased EDEN (with optimized S) is more
+   accurate than TurboQuant_mse, and unbiased EDEN is markedly more accurate
+   than TurboQuant_prod, often by more than a bit (e.g., 2-bit EDEN beats
+   3-bit TurboQuant_prod)"_ [14].
 
 **What this means for the RFC.**
 
-- We use the TurboQuant _framing_ (rotated Beta marginal + Lloyd–Max scalar
-  quantization) because it is widely known in the embedding-quantization
-  community and aligns with the existing `vortex-turboquant` crate, codebase
-  identifiers, and the Vortex tracking issue. Branding stays TurboQuant.
 - We adopt EDEN's **optimized scale `S`** as a Stage 1 refinement (see
   §6 "Stage 1"). This is a strict drop-in win: same storage, same metadata,
-  better quantization accuracy at fixed bit budget.
+  better quantization accuracy at fixed bit budget. The implementer needs
+  EDEN [15] (not the note [14]) for the optimization criterion — the note
+  defers to "methods described in the EDEN works."
 - We adopt EDEN's **native b-bit unbiased mode** as the preferred path for any
   future unbiased estimator, in place of TurboQuant's MSE+QJL stacking (see
   §15 "Future work" and Appendix C).
@@ -257,6 +270,29 @@ quantizer is used — it is a Vortex-specific design that eliminates power-of-2
 padding for non-power-of-2 dimensions (e.g., 768 → 3×256 blocks). Stage 3 (PDX
 layout) is similarly independent of the scalar quantizer choice. So
 adopting EDEN's `S` is orthogonal to the rest of the long-term plan.
+
+### Naming
+
+We use the **TurboQuant** name throughout this RFC and in the codebase
+(`vortex-turboquant`, `vortex.turboquant` extension ID, `TQEncode`,
+`TQDecode`) even though the algorithm is more correctly an instance of EDEN
+with an extra block-decomposition layer. The pragmatic reasons:
+
+- The codebase has converged on `vortex-turboquant` (PR #7829). Renaming the
+  crate, extension ID, and scalar functions to EDEN-derived names mid-stream
+  would churn downstream consumers and the migration story for no algorithmic
+  gain.
+- The embedding-quantization community recognizes "TurboQuant" via its
+  ICLR 2026 acceptance, and external users encountering Vortex's lossy vector
+  type will reach for that name first.
+
+This is a credit-attribution decision rather than a technical one. The
+algorithm we implement is EDEN with optimal `S` plus block decomposition;
+this RFC engages explicitly with the EDEN priority (see §4 "Relationship to
+EDEN and DRIVE" above and the references) so the academic record is
+preserved. If the EDEN authors prefer an alternative framing in published
+materials, we can revisit; we expect to consult them before any public-facing
+launch.
 
 ### Comparison to Product Quantization
 
@@ -401,6 +437,41 @@ for more.
 This section describes the pieces that every stage of the long-term plan
 shares. Stages 1, 2, and 3 in §6–§8 below extend or refine specific aspects;
 nothing in this section ever goes away.
+
+```text
+        ┌────────────────────────────────────────────────────────┐
+        │                User-facing API surface                 │
+        │                                                        │
+        │   Vector<F, d>  ──TQEncode──▶  Extension<TurboQuant>   │
+        │                 ◀──TQDecode──                          │
+        └────────────────────────────────────────────────────────┘
+                                  │
+                                  │  ExtVTable
+                                  ▼
+        ┌────────────────────────────────────────────────────────┐
+        │  Extension<TurboQuant>                                 │
+        │     metadata (prost): {element_ptype, dimensions,      │
+        │       bit_width, seed, num_rounds, [block_size]}       │
+        │                                                        │
+        │     storage:  Struct {                                 │
+        │                 norms:  Primitive<F>     (Stage 1)     │
+        │                       | FSL<F, num_blocks> (Stage 2 k>1)│
+        │                 codes:  FSL<u8, padded_dim>            │
+        │                       | FSL<u8, num_blocks*block_size> │
+        │                       | PDXArray<u8, ...> (Stage 3)    │
+        │               }                                        │
+        └────────────────────────────────────────────────────────┘
+                  ▲                                ▲
+                  │                                │
+                  │ derived (not stored)           │ derived (not stored)
+                  │                                │
+        ┌─────────┴────────┐              ┌────────┴──────────┐
+        │ SorfMatrix       │              │ Centroids + S     │
+        │ (seed, rounds,   │              │ (block_dim,       │
+        │  padded_dim)     │              │  bit_width)       │
+        │ via SplitMix64   │              │ cached in DashMap │
+        └──────────────────┘              └───────────────────┘
+```
 
 ### Extension type
 
@@ -584,18 +655,27 @@ scalar quantization plus inverse SORF is not norm-preserving in general. See
 ### Stage 1 refinement: EDEN's optimized `S`
 
 The current `vortex-turboquant` implementation uses TurboQuant's fixed `S = 1`.
-Per EDEN [14], the optimal `S` is a function of `(padded_dim, bit_width)` and
-converges to 1 only as dimension grows. At practical dimensions, EDEN's `S`
-strictly reduces MSE at fixed bit budget. We adopt it as a Stage 1 refinement:
+Per EDEN [15], the optimal `S` is a function of `(padded_dim, bit_width)` and
+converges to 1 only as dimension grows; the note [14] catalogues this gap as
+the primary algorithmic suboptimality in TurboQuant_mse. At practical
+dimensions, EDEN's `S` strictly reduces MSE at fixed bit budget. We adopt it
+as a Stage 1 refinement:
 
 - Compute `S` alongside the centroids at the same point in the algorithm
-  (after Max-Lloyd converges) using EDEN's optimization criterion.
+  (after Max-Lloyd converges) using EDEN's optimization criterion. The
+  implementer should consult EDEN [15] for the precise criterion — the note
+  [14] defers to "methods described in the EDEN works" and does not
+  reproduce the algorithm itself. Reference implementation:
+  https://github.com/amitport/EDEN-Distributed-Mean-Estimation (MIT;
+  PyTorch and TensorFlow).
 - Cache `(centroids, S)` together under the existing `(padded_dim,
 bit_width)` key in the `DashMap`.
 - Apply `S` at quantization time (encode: scale `r * S` before
   `nearest_centroid`; decode: scale `centroids[c] / S` after lookup).
-- **No storage-shape change.** No metadata change. The scale is reproducible
-  from `(padded_dim, bit_width)`.
+- **No storage-shape change.** No metadata change for biased mode. The scale
+  is reproducible from `(padded_dim, bit_width)`. If a future stage adds
+  EDEN's unbiased mode, an `unbiased: bool` metadata flag is added and the
+  cache key extends to `(padded_dim, bit_width, biased)`; see §15.
 
 EDEN-`S` is a strictly-additive improvement. Files written before the EDEN-`S`
 upgrade and files written after are wire-format-compatible, but they decode to
@@ -798,43 +878,14 @@ its own SORF, has coordinates with the same Beta marginal distribution
 `(1 - x²)^((B-3)/2)`. The Max-Lloyd grid is therefore identical for all
 blocks. Per-block codebooks would just duplicate the same numbers.
 
-### Encode algorithm
+### Encode and decode
 
-```text
-Input: v ∈ ℝ^d, bit_width b, block_size B
-k = ceil(d / B)  [if no qualifying B, fall back to Stage 1]
-
-# Per-block split and normalize
-for i in 0..k:
-    v_i = v[i*B .. (i+1)*B]
-    n_i = ‖v_i‖
-    if n_i > 0:
-        û_i = v_i / n_i
-    else:
-        û_i = zeros(B)
-
-# Per-block SORF + scalar quantize (with EDEN S)
-for i in 0..k:
-    if n_i > 0:
-        r_i = SORF(û_i, block_seed(i), num_rounds)
-        c_i[j] = nearest_centroid(r_i[j] * S, centroids)
-    else:
-        c_i[j] = 0   # zero-norm sub-vector
-
-# Store (in extension-typed Struct):
-#   norms[row] = [n_0, ..., n_{k-1}]
-#   codes[row] = concat(c_0, ..., c_{k-1})
-```
-
-### Decode algorithm
-
-```text
-for i in 0..k:
-    r̂_i[j] = centroids[c_i[j]] / S
-    û_i = SORF^-1(r̂_i, block_seed(i), num_rounds)
-    v̂_i = n_i * û_i      # n_i read from norms[row][i]
-v̂ = concat(v̂_0, ..., v̂_{k-1})
-```
+The Stage 2 encode/decode pseudocode is in Appendix D.6 (encode) and is
+structurally symmetric for decode (per-block dequantize via shared
+centroids, per-block inverse SORF with `block_seed(seed, i)`, multiply by
+`norms[row][i]`, concat). The key changes from Stage 1: split into k
+blocks, store per-block norms, derive per-block SORF seeds from a single
+stored seed, key the centroid cache on `block_size`.
 
 ### Quantized-domain operations
 
@@ -917,16 +968,24 @@ child, enabling SIMD scan kernels. The TurboQuant extension type is
 unchanged; the codes child's logical dtype is unchanged; only its physical
 layout changes.
 
+**Terminology note.** Throughout this section, "chunk" refers to the PDX
+group of 64 vectors over which the dimension-major transpose operates.
+"Block" continues to refer to the TurboQuant Stage 2 block of `block_size`
+coordinates. PDX's chunks and TurboQuant's blocks are orthogonal: a single
+PDX chunk spans 64 rows and includes the full `k × block_size` codes per
+row, while a single TurboQuant block spans `block_size` codes per row
+across all rows.
+
 ### PDX background
 
 PDX [4] is a data layout for vector similarity search. The SIGMOD '25 paper
-describes a dimension-major layout within fixed-size blocks of 64 vectors,
+describes a dimension-major layout within fixed-size chunks of 64 vectors,
 enabling the compiler to auto-vectorize the inner distance loop over vectors
 rather than dimensions. The paper reports an average 2× speedup for
 auto-vectorized PDX distance kernels vs. explicitly SIMD-optimized row-major
 baselines (SimSIMD, FAISS) across four architectures, with larger gains at
 low dimensionality (5.5× at D ≤ 32) and ~1.5× at D > 32 [4, Table 4]. The
-block size of 64 is empirically optimal across AVX-512, AVX2, and NEON
+chunk size of 64 is empirically optimal across AVX-512, AVX2, and NEON
 architectures [4, Table 5].
 
 ### PDX as a physical encoding of FSL
@@ -1009,36 +1068,16 @@ PDXArray<T> (general-purpose dimension-major layout for FixedSizeList):
 
 ### Quantized distance kernel (dot product, b=4)
 
-```rust
-// Precomputed (2^b)² distance table; at b=4 this is 16×16 = 256 floats = 1KB.
-let dist_table = precompute_product_table(&centroids);
+The kernel structure: for each `(tq_block, dim)` pair, fetch the query
+code's row from a precomputed `(2^b)²` centroid distance table (1 KB at
+b=4), then sum the 64-vector lane in a SIMD-friendly inner loop with no
+inter-vector dependencies. After each TQ block, weight the 64 per-block
+unit-norm dot products by `query_norms[tq_block] · data_norms[v][tq_block]`.
 
-let mut distances  = [0.0f32; 64];
-let mut unit_dots  = [0.0f32; 64];
-let mut offset     = 0;
-
-for tq_block in 0..k {
-    for dim in 0..B {
-        let qd  = query_codes[tq_block * B + dim];
-        let row = &dist_table[qd as usize];
-        for v in 0..64 {  // SIMD-friendly: no inter-vector deps
-            unit_dots[v] += row[codes_pdx[offset] as usize];
-            offset += 1;
-        }
-    }
-    // Weight per-block unit-norm dot product by both vectors' block norms.
-    for v in 0..64 {
-        distances[v] += query_norms[tq_block]
-                      * data_norms[v][tq_block]
-                      * unit_dots[v];
-        unit_dots[v] = 0.0;
-    }
-}
-```
-
-The inner SIMD loop (64 vectors) has no inter-vector dependencies. TQ block
-boundaries only affect where norm weighting occurs — they don't affect the
-transpose.
+Full Rust pseudocode is in Appendix D.7. The salient property for design
+review: the inner SIMD loop is purely data-parallel across 64 vectors and
+contains no TQ-block bookkeeping; TQ block boundaries only affect where
+norm weighting occurs, not the transpose.
 
 ### Where PDXArray lives
 
@@ -1125,61 +1164,138 @@ share the same config; cross-column comparisons across schemas are rare.
 
 ## Integration with Vortex
 
-This section describes the end-to-end user flow with a TurboQuant column. It
-mirrors the structure of `vortex/examples/turboquant_vector_search.rs`,
-which is the canonical reference (currently still using the old
-`vortex-tensor/L2Denorm + SorfTransform` path; the example will migrate to
-`vortex-turboquant` as part of Stage 1 stabilization).
+This section describes the end-to-end user flow with a TurboQuant column.
+The canonical reference is
+[`vortex/examples/turboquant_vector_search.rs`][example] in the Vortex
+repo, which exercises both the write path and a filter-pushdown read.
 
-### Write path
+[example]: https://github.com/spiraldb/vortex/blob/ff120401a0f4796f2d1aa85d1f87e7195c1f3dbf/vortex/examples/turboquant_vector_search.rs
+
+**Current vs. target API.** The example today wires TurboQuant through the
+older `vortex-tensor` `L2Denorm + SorfTransform` decomposition (see §13
+"Predecessor implementations"); a Stage 1 stabilization task migrates it
+to the `vortex-turboquant` crate's `TQEncode` / `TQDecode`. The snippets
+below describe the target API. Where a real symbol from the current
+example carries over to the target, the snippet uses the real name;
+symbols marked `// target` are the names this RFC commits to once the
+migration lands.
+
+### Session setup
 
 ```rust
-// Session setup
-let session = VortexSession::default();
-vortex_tensor::initialize(&session);            // register Vector
-vortex_turboquant::initialize(&session);        // register TurboQuant + TQEncode/TQDecode
+use vortex::session::VortexSession;
 
-// Build a Vector column from raw embeddings
-let emb_fsl = parquet_to_vortex_chunks(parquet_path).await?;
-let emb_vec = list_to_vector_ext(emb_fsl)?;     // Vector<f32, 768>
-
-// Encode to TurboQuant
-let cfg = TurboQuantConfig { bit_width: 8, seed: Some(42), num_rounds: 3 };
-let emb_tq = TQEncode::try_new_array(emb_vec, &cfg)?;
-let emb_tq_executed = session.execute(&emb_tq)?;  // materialize codes & norms
-
-// Write a Vortex file
-let struct_array = StructArray::from_fields(&[("id", id_col), ("emb", emb_tq_executed)])?;
-let bytes = write_vortex_file(struct_array).await?;
+let session = VortexSession::default().with_tokio();
+vortex_tensor::initialize(&session);       // register Vector (and dependencies)
+vortex_turboquant::initialize(&session);   // register vortex.turboquant + TQEncode/TQDecode
+let mut ctx = session.create_execution_ctx();
 ```
 
-### Read path
+`vortex_tensor::initialize` must run before `vortex_turboquant::initialize`
+today. The ordering requirement is tracked as the P2 finding from PR
+#7829's review (see §14 "Current state and known gaps").
+
+### Write path (target API, post-migration)
+
+The user has two options. The recommended **opt-in compressor path** wires
+TurboQuant into the cascade compressor — once enabled, the compressor
+matches `Vector<float, d>` columns with `d ≥ MIN_DIMENSION` and applies
+TurboQuant to them:
 
 ```rust
-// Plain scan: decode emb back to Vector and verify within tolerance
-let array = read_vortex_file(&bytes).await?;
-let emb_decoded = TQDecode::try_new_array(array.get_item("emb")?)?;
-let emb_floats = session.execute(&emb_decoded)?;   // FixedSizeList<f32, 768>
-verify_within_tolerance(&original, &emb_floats);
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex::file::WriteStrategyBuilder;
+
+let compressor = BtrBlocksCompressorBuilder::default()
+    .with_turboquant()              // target: opts in to TurboQuantScheme on Vector columns
+    .build();
+
+let strategy = WriteStrategyBuilder::default()
+    .with_compressor(compressor)
+    .build();
+
+let mut buf = vortex::buffer::ByteBufferMut::empty();
+session
+    .write_options()
+    .with_strategy(strategy)
+    .write(&mut buf, struct_array.to_array_stream())
+    .await?;
+let bytes = buf.freeze();
+```
+
+The **explicit-encode path** uses `TQEncode` as a scalar function. Useful
+when the user wants per-column control or wants the lossy mutation to be
+visible in their pipeline as an explicit operator:
+
+```rust
+use vortex_turboquant::{TQEncode, TurboQuantConfig};
+
+let cfg = TurboQuantConfig::try_new(/* bit_width */ 8, /* seed */ 42, /* num_rounds */ 3)?;
+let emb_tq = TQEncode::try_new_array(emb_vector, &cfg)?;   // ScalarFnArray, lazy
+let emb_tq_materialized = emb_tq.execute(&mut ctx)?;
+```
+
+Either path produces an `Extension<vortex.turboquant>` array that can be
+nested in a `StructArray`, written to a Vortex file, and read back as a
+TurboQuant column.
+
+### Read path (plain scan)
+
+```rust
+use futures::TryStreamExt;
+
+let chunks: Vec<vortex::array::ArrayRef> = session
+    .open_options()
+    .open_buffer(bytes.clone())?
+    .scan()?
+    .into_array_stream()?
+    .try_collect()
+    .await?;
+```
+
+Reading yields TurboQuant-typed columns. Decoding back to a `Vector` is an
+explicit step:
+
+```rust
+use vortex_turboquant::TQDecode;
+
+let emb_tq = chunked_table.get_item("emb")?;
+let emb_vector = TQDecode::try_new_array(emb_tq)?;          // ScalarFnArray, lazy
+let emb_executed = emb_vector.execute(&mut ctx)?;           // ExtensionArray<Vector>
 ```
 
 ### Filter pushdown (cosine similarity)
 
+The current example pushes `cosine_similarity(emb, query) > threshold`
+through `scan().with_filter(...)` and selects rows inside the scan rather
+than after materialization:
+
 ```rust
-// Filter: cosine_similarity(emb, query) > 0.85
-let filter = gt(
-    CosineSimilarity::call(col("emb"), lit(query_vector)),
-    lit(0.85),
-);
-let result = scan_with_filter(&bytes, filter).await?;
+use vortex::array::expr::{col, gt, lit};
+use vortex::array::scalar_fn::EmptyOptions;
+use vortex_tensor::scalar_fns::cosine_similarity::CosineSimilarity;
+
+let cosine_expr = CosineSimilarity.new_expr(EmptyOptions, [col("emb"), lit(query_scalar)]);
+let filter = gt(cosine_expr, lit(0.85_f32));
+
+let chunks: Vec<ArrayRef> = session
+    .open_options()
+    .open_buffer(bytes.clone())?
+    .scan()?
+    .with_filter(filter)
+    .into_array_stream()?
+    .try_collect()
+    .await?;
 ```
 
 `CosineSimilarity` over a TurboQuant column inspects the codes child's
-physical encoding (Stage 3: PDXArray vs. FixedSizeListArray) and the
-extension metadata (Stage 2: block_size). For Stage 1/2 with row-major
+physical encoding (Stage 3: `PDXArray` vs. `FixedSizeListArray`) and the
+extension metadata (Stage 2: `block_size`). For Stage 1/2 with row-major
 codes, it dispatches to the per-block weighted-sum kernel without
 decoding. For Stage 3 with PDX codes, it dispatches to the SIMD kernel.
-The query is re-encoded at query time with the column's metadata.
+The constant query literal expands to a `ConstantArray` whose row count
+matches the current batch; the kernel encodes the query once per batch
+with the column's metadata.
 
 ## Performance
 
@@ -1187,24 +1303,26 @@ The query is re-encoded at query time with the column's metadata.
 
 SORF at B dimensions (heuristic; real cost is dominated by memory
 bandwidth and constant factors): `R · B · log₂(B)` butterflies + `R · B`
-sign applications per block, plus `B` normalization multiplies. For Stage 1
-with padded_dim and 3 rounds:
+sign applications per block. The per-vector normalization multiplies
+(`B` per block) are omitted from these counts as in the original RFC 33;
+they amortize against memory bandwidth in practice. For Stage 1 with
+padded_dim and 3 rounds:
 
-| padded_dim | SORF FLOPs                         | k   | Total per-vector FLOPs |
-| ---------- | ---------------------------------- | --- | ---------------------- |
-| 256        | 3×256×8 + 3×256 + 256 = 7,168      | 1   | 7,168                  |
-| 512        | 3×512×9 + 3×512 + 512 = 15,872     | 1   | 15,872                 |
-| 1024       | 3×1024×10 + 3×1024 + 1024 = 34,816 | 1   | 34,816                 |
+| padded_dim | SORF FLOPs                  | k   | Total per-vector FLOPs |
+| ---------- | --------------------------- | --- | ---------------------- |
+| 256        | 3×256×8 + 3×256 = 6,912     | 1   | 6,912                  |
+| 512        | 3×512×9 + 3×512 = 15,360    | 1   | 15,360                 |
+| 1024       | 3×1024×10 + 3×1024 = 33,792 | 1   | 33,792                 |
 
 ### Encode/decode throughput (Stage 2)
 
-Block decomposition at d=768 (k=3, B=256) is ~40% fewer SORF FLOPs than
+Block decomposition at d=768 (k=3, B=256) is ~38% fewer SORF FLOPs than
 the padded single-block Stage 1 approach, despite more blocks, because each
 block is smaller:
 
 | d   | Stage 1 (padded) | Stage 2 (k=3, B=256) | Reduction |
 | --- | ---------------- | -------------------- | --------- |
-| 768 | 34,816 FLOPs     | 3 × 7,168 = 21,504   | ~38%      |
+| 768 | 33,792 FLOPs     | 3 × 6,912 = 20,736   | ~39%      |
 
 ### Scan throughput (Stage 3 vs. Stage 2)
 
@@ -1372,10 +1490,11 @@ this RFC, recorded here so they aren't forgotten.
 ### Unbiased mode: EDEN's native b-bit unbiased quantizer
 
 If unbiased inner-product estimation is needed for a specific workload, the
-preferred path is **EDEN's native b-bit unbiased mode** [14] rather than
-TurboQuant's MSE+QJL "Prod" stacking. EDEN's paper demonstrates that direct
-b-bit unbiased EDEN dominates `(b-1)`-bit MSE + 1-bit QJL stacking, often by
-more than a bit (e.g., 2-bit EDEN beats 3-bit TurboQuant_prod) [14].
+preferred path is **EDEN's native b-bit unbiased mode** [15] rather than
+TurboQuant's MSE+QJL "Prod" stacking. The note [14] reports experimental
+results showing direct b-bit unbiased EDEN dominates `(b-1)`-bit MSE +
+1-bit QJL stacking, often by more than a bit (e.g., 2-bit EDEN beats 3-bit
+TurboQuant_prod).
 
 Storage shape: same as Stage 1/2 — just a different scalar quantizer in
 the encode/decode kernels. Metadata: an additional `unbiased: bool` flag in
@@ -1525,6 +1644,55 @@ Removal is a Stage 1 cleanup task once the example migrates.
 Each stage is independently shippable. Users can upgrade incrementally.
 Files written by earlier stages are always readable by later decoders.
 
+## Drawbacks
+
+The semantic surprises in §9 are the right starting point — TurboQuant is
+materially different from a lossless encoding, and that difference is
+inescapable. This section consolidates the drawback-class costs scattered
+across the design so a reviewer can see them in one place:
+
+- **Decoded vectors are not unit-norm.** `TQDecode(TQEncode(v))` does not
+  preserve `‖v‖ = 1` even when the input was a unit vector; quantization
+  plus inverse SORF is not norm-preserving. Code paths that assume unit
+  norms must renormalize after decode. See §9.
+- **`TQDecode(TQEncode(v)) ≠ v` exactly.** Equal only within Theorem 1's
+  MSE bound (with the SORF-vs-Haar approximation gap on top). Any code
+  that depends on roundtrip identity is incompatible with TurboQuant. See
+  §9 and Appendix A.
+- **L2 norm readthrough degrades O(1) → O(k) at Stage 2.** With per-block
+  norms, computing the full-vector `‖v‖` requires summing k squared norms.
+  At common k values (1–3) this is small but a real regression from the
+  Stage 1 stored-norm fast path.
+- **Two stored implementations during migration.** Until
+  `vortex/examples/turboquant_vector_search.rs` and downstream consumers
+  move to `vortex-turboquant`, the legacy `vortex-tensor` paths
+  (`L2Denorm + SorfTransform` and the older monolithic-array encoding)
+  must continue to deserialize. Dual maintenance cost until the cleanup
+  in §14 completes.
+- **Initialization is order-sensitive.** `vortex_tensor::initialize` must
+  precede `vortex_turboquant::initialize` for the `Vector` parent
+  extension to be registered. Sessions that omit this ordering fail at
+  deserialization. Tracked as the P2 finding from PR #7829's review.
+- **Quantized-domain operations only fuse for matching configs.** Two
+  TurboQuant columns with different `(dimensions, bit_width, block_size,
+seed, num_rounds)` cannot pushdown — at least one side must decode.
+  Cross-column TurboQuant joins are therefore typically more expensive
+  than they would be on a lossless column.
+- **EDEN-`S` adds a centroid-cache lookup dimension.** Adopting EDEN's
+  optimized `S` introduces a per-`(d, b)` constant the implementer must
+  pin and ship alongside the centroid table. If EDEN's optimization
+  criterion ever updates (e.g., a corrected version of the EDEN paper
+  publishes), the constants need a wire-format-stable migration.
+- **PDX layout doubles the maintenance surface for the codes child.**
+  Stage 3 adds a second physical encoding (`PDXArray`) alongside
+  `FixedSizeListArray`. Every scalar function operating on TurboQuant
+  codes must dispatch on the codes-child encoding. The cost is bounded
+  but real.
+
+These are the design's accepted costs. None of them are showstoppers; all
+are direct consequences of the lossy-extension-type model that the RFC's
+two principles (§3) commit to.
+
 ## References
 
 _All lemma, theorem, and definition numbers for [1] refer to arXiv:2504.19874v1.
@@ -1541,7 +1709,12 @@ Approximate Nearest Neighbors." SIAM J. Comput. 39(1):302-322, 2009.
 Transform." Adv. Adaptive Data Analysis 3(1-2):115-126, 2011.
 
 [4] Kuffo, L., Krippner, E. and Boncz, P. "PDX: A Data Layout for Vector
-Similarity Search." SIGMOD '25. arXiv:2503.04422, March 2025.
+Similarity Search." SIGMOD '25. arXiv:2503.04422v1, March 2025.
+Open-source implementation: https://github.com/cwida/PDX (MIT). Specific
+file references throughout this RFC: `include/pdx/quantizers/scalar.hpp`
+(SQ8), `include/pdx/pruners/adsampling.hpp` (ADSampling),
+`include/pdx/layout.hpp` (int8 interleaving),
+`include/pdx/distance_computers/avx512_computers.hpp` (VPDPBUSD kernels).
 
 [5] Yu, F.X., Suresh, A.T., Choromanski, K., Holtmann-Rice, D. and Kumar, S.
 "Orthogonal Random Features." NeurIPS 2016. arXiv:1610.09072.
@@ -1556,17 +1729,17 @@ _(Note: this URL may require Eviox account access; not publicly indexed.)_
 
 [8] Community TurboQuant implementation reports (primarily KV-cache attention):
 
-- https://github.com/tonbistudio/turboquant-pytorch — MSE-only (V3) vs MSE+QJL (V2); reports MSE-only wins for attention and generation quality.
+- https://github.com/tonbistudio/turboquant-pytorch — MSE-only (V3) vs MSE+QJL (V2); reports MSE-only wins for attention and generation quality. License: MIT.
 - https://github.com/ggml-org/llama.cpp/discussions/20969 — TurboQuant discussion; quantized attention analysis and MSE vs Prod comparison.
-- https://github.com/0xSero/turboquant — Triton kernels; paper validation.
-- https://github.com/scos-lab/turboquant — Reference reproduction; MSE vs Prod/QJL comparison.
+- https://github.com/0xSero/turboquant — Triton kernels and vLLM integration; one of multiple groups reporting MSE-only behavior. License: **GPL-3.0** — cited for illustration of community findings only; not implementable under Vortex's MIT/Apache-2.0 license, and not a code dependency.
+- https://github.com/scos-lab/turboquant — Reference reproduction; MSE vs Prod/QJL comparison. License: MIT.
 
 Multiple groups report MSE-only beating MSE+QJL for attention metrics at
 tested bit widths. ANN ranking conclusions remain preliminary pending
-dedicated benchmarks. Note that EDEN [14] dominates TurboQuant_prod
-regardless of these findings (EDEN's biased mode beats TurboQuant_mse, and
-EDEN's unbiased mode beats TurboQuant_prod), so any unbiased work should
-adopt EDEN's quantizer rather than QJL.
+dedicated benchmarks. Note that EDEN [15] dominates TurboQuant_prod
+regardless of these findings (per [14]: EDEN's biased mode beats
+TurboQuant_mse, and EDEN's unbiased mode beats TurboQuant_prod), so any
+unbiased work should adopt EDEN's quantizer rather than QJL.
 
 [9] Jégou, H., Douze, M. and Schmid, C. "Product Quantization for Nearest
 Neighbor Search." IEEE Trans. PAMI 33(1):117-128, 2011.
@@ -1579,7 +1752,7 @@ IEEE Trans. PAMI 36(4):744-755, 2014.
 
 [12] Malinovskii, V., Panferov, A., Ilin, I., Guo, H., Richtárik, P. and
 Alistarh, D. "Pushing the Limits of Large Language Model Quantization via
-the Linearity Theorem." arXiv:2411.17525, November 2024.
+the Linearity Theorem." arXiv:2411.17525v1, November 2024.
 
 [13] johndpope et al. "RotorQuant: Clifford algebra vector quantization."
 PR #34, TheTom/turboquant_plus, March-April 2026.
@@ -1588,17 +1761,26 @@ Explores SO(2)/SO(3)/SO(4) block-diagonal rotations as alternatives to
 full-dimension SORF. Rejected due to 10×+ MSE regressions on real KV-cache
 tensors, attributed to insufficient cross-group decorrelation.
 
-[14] Vargaftik, S., Ben-Itzhak, Y., Ben Basat, R., Mitzenmacher, M. and
-Birk, Y. "EDEN: Communication-Efficient and Robust Distributed Mean
-Estimation for Federated Learning." ICML 2022 / arXiv:2604.18555 (extended
-journal version, 2026). Predates TurboQuant; demonstrates that an optimized
-scalar scale `S` per `(dimension, bit_width)` strictly improves on
-TurboQuant's fixed `S = 1`, and that native b-bit unbiased EDEN dominates
-TurboQuant's MSE+QJL "Prod" stacking.
+[14] Ben-Basat, R., Ben-Itzhak, Y., Mendelson, G., Mitzenmacher, M.,
+Portnoy, A. and Vargaftik, S. "A Note on TurboQuant and the Earlier
+DRIVE/EDEN Line of Work." arXiv:2604.18555, April 2026. Demonstrates that
+TurboQuant_mse is a special case of EDEN [15] with fixed `S = 1`; reports
+experiments where biased EDEN beats TurboQuant_mse and native b-bit
+unbiased EDEN beats TurboQuant_prod, "often by more than a bit (e.g.,
+2-bit EDEN beats 3-bit TurboQuant_prod)."
 
 [15] Vargaftik, S., Ben-Basat, R., Portnoy, A., Mendelson, G., Ben-Itzhak,
-Y. and Mitzenmacher, M. "DRIVE: One-bit Distributed Mean Estimation." NeurIPS 2021. https://proceedings.neurips.cc/paper/2021/hash/0397758f8990c1b41b81b43ac389e143-Abstract.html
-Foundational 1-bit unbiased quantizer; EDEN [14] extends to any b > 0.
+Y. and Mitzenmacher, M. "EDEN: Communication-Efficient and Robust
+Distributed Mean Estimation for Federated Learning." ICML 2022.
+arXiv:2108.08842, August 2021 (v3, June 2022). Foundational paper for the
+RHT + Lloyd-Max scalar quantization family TurboQuant belongs to;
+introduces the optimal scalar scale `S(d, b)` that this RFC adopts in §6.
+
+[16] Vargaftik, S., Ben-Basat, R., Portnoy, A., Mendelson, G., Ben-Itzhak,
+Y. and Mitzenmacher, M. "DRIVE: One-bit Distributed Mean Estimation."
+NeurIPS 2021. arXiv:2105.08339, May 2021.
+https://proceedings.neurips.cc/paper/2021/hash/0397758f8990c1b41b81b43ac389e143-Abstract.html
+Foundational 1-bit unbiased quantizer; EDEN [15] extends to any b > 0.
 
 ## Appendix A: Reference implementation bugs and Theorem 1 constant
 
@@ -1633,7 +1815,7 @@ ICLR 2026 camera-ready proof. The paper's "explicit values" (0.36, 0.117,
 0.03, 0.009) are the actual computed distortion of the optimal quantizer,
 not the bound itself — they are well below the 2.72/4^b bound.
 
-EDEN [14] provides tighter and more rigorous bounds via its optimized
+EDEN [15] provides tighter and more rigorous bounds via its optimized
 `S`; once EDEN-`S` is adopted (§6 Stage 1 refinement), we should cite
 EDEN's bound preferentially.
 
@@ -1656,10 +1838,10 @@ until evaluated on ANN datasets with recall@k and ranking metrics (see
 Experimental plan).
 
 **EDEN's framing supersedes this discussion for unbiased estimation.**
-EDEN [14] demonstrates that direct b-bit unbiased EDEN dominates `(b-1)`-bit
-MSE + 1-bit QJL stacking, often by more than a bit (2-bit EDEN beats
-3-bit TurboQuant_prod). If a future workload needs unbiased estimation,
-adopt EDEN's unbiased mode rather than QJL.
+The note [14] reports that direct b-bit unbiased EDEN [15] dominates
+`(b-1)`-bit MSE + 1-bit QJL stacking, often by more than a bit (2-bit
+EDEN beats 3-bit TurboQuant_prod). If a future workload needs unbiased
+estimation, adopt EDEN's unbiased mode rather than QJL.
 
 ## Appendix C: Alternative rotation strategies
 
@@ -1695,30 +1877,408 @@ with k=3: 768 KB total. Amortizes for large columns (100K+ vectors). Each
 block must have an **independent** rotation matrix. Not the default; only
 worth pursuing if Stage 2 SORF quality benchmarks show a meaningful gap.
 
+## Appendix D: Implementation Specification
+
+This appendix is the operational reference for implementers. The main RFC
+body is calibrated for an expert reviewer to read in 30–60 minutes; this
+appendix is for the implementer who actually writes the Rust. Items here
+either consolidate detail from the main body or fill gaps the main body
+intentionally leaves open.
+
+### D.1 Wire-format invariants
+
+- **Endianness**: codes are `u8` (byte-addressable; endianness moot). The
+  prost metadata uses prost's wire format which is little-endian for
+  fixed-width fields; this is part of Vortex's general dtype-metadata
+  contract, not specific to TurboQuant.
+- **Alignment**: codes are stored as `FixedSizeList<u8, padded_dim>` (or
+  `k × block_size`); no special alignment requirement above the FSL
+  storage's own. PDX layout (§8) adds 64-row chunk-aligned access for
+  fast paths; non-aligned slice/take falls back to row-major.
+- **Validity**: row-aligned across both `norms` and `codes` fields. Invalid
+  rows store `norm = 0` and placeholder zero codes (which are valid byte
+  values referring to centroid 0, not "zero coordinate" — the validity
+  bit is authoritative for whether the row is meaningful).
+
+### D.2 Extension type metadata (prost)
+
+The on-disk metadata is the prost-encoded form of:
+
+```rust
+// Reproduced from vortex-turboquant/src/vtable.rs at ff120401.
+struct TurboQuantMetadataProto {
+    element_ptype: PType,    // tag 1, enum
+    dimensions:    u32,      // tag 2
+    bit_width:     u32,      // tag 3 (fits in u8 at the type level)
+    seed:          u64,      // tag 4
+    num_rounds:    u32,      // tag 5 (fits in u8 at the type level)
+    // Stage 2 addition (not in current source):
+    block_size:    optional u32,  // tag 6
+    // Future:
+    unbiased:      optional bool, // tag 7 — reserve for EDEN unbiased mode
+}
+```
+
+The current `TurboQuantMetadataProto` in `vortex-turboquant/src/vtable.rs`
+defines tags 1–5. Stage 2 adds `block_size` at tag 6; future stages
+add additional optional tags as needed. Prost optional-field semantics
+mean older readers ignore unknown tags, so the wire format is forward-
+compatible by construction.
+
+**Constraint:** tags 1–5 are part of Vortex's stable contract once Stage 1
+ships in a release. Renumbering or repurposing them would be a wire-format
+break.
+
+### D.3 Validation
+
+The `ExtVTable::validate_dtype` implementation enforces:
+
+- `dimensions >= MIN_DIMENSION` (`= 128`). On violation: error
+  `"TurboQuant dimensions must be >= 128, got {N}"`.
+- `1 ≤ bit_width ≤ MAX_BIT_WIDTH` (`= 8`). On violation: error
+  `"TurboQuant bit_width must be 1-8, got {N}"`.
+- `num_rounds > 0`. On violation: error
+  `"TurboQuant num_rounds must be > 0, got 0"`.
+- `element_ptype.is_float()` (one of F16, F32, F64). On violation: error
+  `"TurboQuant element_ptype must be a float, got {ptype}"`.
+- Storage dtype is `Struct { norms: Primitive<element_ptype>, codes:
+FixedSizeList<u8, padded_dim> }` with matching row-validity propagation.
+
+**Gap (PR #7829 P2 finding):** `tq_padded_dim()` currently uses unchecked
+`next_power_of_two()` and panics on oversized dimensions. The Stage 1
+stabilization task switches to the checked version and returns
+`TurboQuant padded dimension overflow for {dimensions}` on the boundary.
+Define `MAX_DIMENSION` as the largest `u32` whose `next_power_of_two()`
+fits in `u32` (i.e., `2^31`).
+
+### D.4 Encode (Stage 1) pseudocode
+
+```text
+fn tq_encode(v: Vector<F, d>, cfg: &TurboQuantConfig) -> TurboQuantArray:
+    padded_dim = next_power_of_two(d)
+    if padded_dim does not fit u32:
+        return Err(OverflowError)
+
+    n = ‖v‖₂   # in input dtype F (f16/f32/f64)
+    if n > 0:
+        u_padded[0..d]    = v / n
+        u_padded[d..padded_dim] = 0.0
+        r = SORF(u_padded, cfg.seed, cfg.num_rounds)   # in f32
+        for j in 0..padded_dim:
+            codes[j] = nearest_centroid(r[j] * S, centroids)
+    else:
+        codes[0..padded_dim] = 0   # placeholder; validity marks the row invalid
+
+    return TurboQuantArray {
+        metadata: TurboQuantMetadata {
+            element_ptype = F,
+            dimensions = d,
+            bit_width = cfg.bit_width,
+            seed = cfg.seed,
+            num_rounds = cfg.num_rounds,
+            block_size = None,   # Stage 1 implicit
+        },
+        norms: n,
+        codes: codes,
+    }
+```
+
+`centroids = get_centroids(padded_dim, bit_width)` and `S = get_eden_scale(padded_dim, bit_width)`
+both come from the process-local cache keyed on `(padded_dim, bit_width)`.
+
+### D.5 Decode (Stage 1) pseudocode
+
+```text
+fn tq_decode(tq: TurboQuantArray) -> Vector<F, d>:
+    d           = tq.metadata.dimensions
+    padded_dim  = next_power_of_two(d)
+    centroids   = get_centroids(padded_dim, tq.metadata.bit_width)
+    S           = get_eden_scale(padded_dim, tq.metadata.bit_width)
+
+    if validity(row) == false:
+        return null
+
+    for j in 0..padded_dim:
+        r_hat[j] = centroids[tq.codes[j]] / S
+
+    u_hat_padded = SORF_inverse(r_hat, tq.metadata.seed, tq.metadata.num_rounds)
+    u_hat        = u_hat_padded[0..d]   # truncate the zero-padding
+
+    v_hat        = tq.norms * u_hat     # in dtype F
+    return v_hat
+```
+
+### D.6 Encode (Stage 2) pseudocode
+
+```text
+fn tq_encode_stage2(v: Vector<F, d>, cfg: &TurboQuantConfig, B: u32) -> TurboQuantArray:
+    k = d / B   # exact division required; if not, fall back to Stage 1 padded
+
+    for i in 0..k:
+        v_i  = v[i*B .. (i+1)*B]
+        n_i  = ‖v_i‖₂
+        if n_i > 0:
+            u_i = v_i / n_i
+            r_i = SORF(u_i, block_seed(seed, i), cfg.num_rounds)
+            for j in 0..B:
+                codes[i*B + j] = nearest_centroid(r_i[j] * S, centroids)
+        else:
+            codes[i*B .. (i+1)*B] = 0
+
+    return TurboQuantArray {
+        metadata: TurboQuantMetadata {
+            element_ptype = F,
+            dimensions = d,
+            bit_width = cfg.bit_width,
+            seed = cfg.seed,
+            num_rounds = cfg.num_rounds,
+            block_size = Some(B),
+        },
+        norms: [n_0, n_1, ..., n_{k-1}],
+        codes: codes,
+    }
+```
+
+`centroids = get_centroids(B, bit_width)` is keyed on the block dimension,
+not the original dimension. `block_seed(seed, i)` is the per-block rotation
+seed derivation, which the implementer must commit to before any Stage 2
+file is shipped (see Open Questions §3).
+
+### D.7 PDX distance kernel (dot product, b=4)
+
+Reproduced verbatim from §8 for the implementer's convenience:
+
+```rust
+// Precomputed (2^b)² distance table; at b=4 this is 16×16 = 256 floats = 1 KB.
+let dist_table = precompute_product_table(&centroids);
+
+let mut distances  = [0.0f32; 64];
+let mut unit_dots  = [0.0f32; 64];
+let mut offset     = 0;
+
+for tq_block in 0..k {
+    for dim in 0..block_size {
+        let qd  = query_codes[tq_block * block_size + dim];
+        let row = &dist_table[qd as usize];
+        for v in 0..64 {  // SIMD-friendly: no inter-vector deps
+            unit_dots[v] += row[codes_pdx[offset] as usize];
+            offset += 1;
+        }
+    }
+    // Weight per-block unit-norm dot product by both vectors' block norms.
+    for v in 0..64 {
+        distances[v] += query_norms[tq_block]
+                      * data_norms[v][tq_block]
+                      * unit_dots[v];
+        unit_dots[v] = 0.0;
+    }
+}
+```
+
+PDX chunk-tail handling at row counts not divisible by 64: the last chunk
+covers the remaining rows row-major (i.e., the kernel above runs over the
+non-tail chunks; the tail uses the FSL row-major fallback). 64-row-aligned
+fast paths skip the transpose; non-aligned slice/take pays
+`O(rows × block_size)` to materialize the FSL form.
+
+### D.8 Error model
+
+| Operation                         | Failure mode                                            | Error                                                                                            |
+| --------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `TQEncode::try_new_array`         | child is not a `Vector` extension                       | `"expected a Vector extension array, got {dtype}"`                                               |
+| `TurboQuantConfig::try_new`       | `bit_width` out of `[1, 8]`                             | `"TurboQuant bit_width must be 1-8, got {N}"`                                                    |
+| `TurboQuantConfig::try_new`       | `num_rounds == 0`                                       | `"TurboQuant num_rounds must be > 0, got {N}"`                                                   |
+| `validate_tq_metadata`            | `dimensions < 128`                                      | `"TurboQuant dimensions must be >= 128, got {N}"`                                                |
+| `validate_tq_metadata`            | `element_ptype` not a float                             | `"TurboQuant element_ptype must be a float, got {ptype}"`                                        |
+| `tq_padded_dim` (after fix)       | `next_power_of_two(dimensions)` overflows `u32`         | `"TurboQuant padded dimension overflow for {dimensions}"`                                        |
+| Stage 2 `block_size` validation   | `B` not a power of 2 in `[64, padded_dim]` dividing `d` | `"TurboQuant block_size {B} must be a power of 2 in [64, padded_dim] that divides {dimensions}"` |
+| `TQDecode::try_new_array`         | child is not a TurboQuant extension                     | `"expected a TurboQuant extension array, got {dtype}"`                                           |
+| Quantized-domain ops, op operands | mismatched `(bit_width, block_size, seed, num_rounds)`  | (fall back to decode-then-compute; no error)                                                     |
+
+Empty inputs (zero rows) return an empty TurboQuant array with `len() == 0`
+and no codes/norms storage — no error.
+
+### D.9 Worked example
+
+Stage 1 round trip for a single vector at `d = 128, bit_width = 8`:
+
+```text
+Input:
+  v = [v_0, v_1, ..., v_127]    (f32, ‖v‖ > 0)
+
+Step 1 — store norm:
+  n = ‖v‖₂                       (f32 scalar)
+
+Step 2 — normalize:
+  u = v / n                      (f32, ‖u‖ = 1)
+
+Step 3 — SORF (3 rounds, seed = 42):
+  r = SORF_3(u, seed=42)         (f32, padded_dim = 128, ‖r‖ = 1, marginally Beta-distributed)
+
+Step 4 — scalar quantize with EDEN's S:
+  for j in 0..128:
+      codes[j] = nearest_centroid(r[j] * S, centroids_128_8)   (u8)
+
+Storage shape (Extension<vortex.turboquant>):
+  Struct {
+    norms: Primitive<f32> = [n]
+    codes: FixedSizeList<u8, 128> = [codes[0], codes[1], ..., codes[127]]
+  }
+
+Decode:
+  for j in 0..128:
+      r_hat[j] = centroids_128_8[codes[j]] / S
+  u_hat = SORF_3_inverse(r_hat, seed=42)
+  v_hat = n * u_hat              (f32, ‖v_hat‖ ≠ ‖v‖ in general; ‖v_hat - v‖² ≤ MSE_bound × ‖v‖²)
+```
+
+At `bit_width = 8`, MSE_bound = 2.72 / 4^8 ≈ 4.15e-5 (relative). On
+random Gaussian inputs, observed normalized MSE ≈ 4e-5.
+
+### D.10 Test plan
+
+The current `vortex-turboquant` test suite (911 lines as of PR #7829)
+covers:
+
+- Roundtrip on random inputs at every supported bit width
+- MSE bound assertions: `normalized_mse < 2.72 / 4^b` per vector
+- Edge cases: empty arrays, single-row, all-zero, nullable vectors
+- Serde roundtrip
+- Compute pushdowns: cosine_similarity, dot product, L2 norm
+- Centroid correctness against numerical integration
+- SORF determinism (same seed → same rotation)
+
+Stages 2 and 3 add:
+
+- **Stage 2**: block-decomposition roundtrip at d ∈ {768, 1536, 3072};
+  per-block norm storage shape assertion; centroid cache key change
+  (`(block_size, bit_width)`); per-block weighted-sum kernel parity vs.
+  decode-then-compute fallback.
+- **Stage 3**: PDXArray transpose / un-transpose roundtrip; PDX kernel
+  parity vs. row-major kernel; 64-aligned vs. non-aligned slice/take
+  perf assertion.
+- **Cross-cutting**: regression tests for each PR #7829 review finding —
+  oversized-dim panic → error, `initialize` ordering documentation, lazy
+  `TQEncode` write path.
+
+### D.11 Performance budgets
+
+Goals (from §11) become budgets here, with verification commands:
+
+- **Encode throughput, Stage 1, AVX-512, d = 768, b = 8**: ≥ 1 M vectors/sec.
+  Verify with `cargo run -p vortex-turboquant --release --bench encode_decode`.
+- **Decode throughput, Stage 1, AVX-512, d = 768, b = 8**: ≥ 1 M vectors/sec.
+- **Encode throughput, Stage 2, AVX-512, d = 768, k = 3, B = 256, b = 8**:
+  ≥ 1.3 M vectors/sec (≥ 30% faster than Stage 1 padded, matching the FLOP
+  ratio in §11).
+- **Compression ratio, b = 8**: 3.0× (Stage 1 padded at d = 768), 3.9×
+  (Stage 2 k = 3 at d = 768), 4.0× (any stage at d = 1024).
+- **Normalized MSE, b = 8, d ≥ 128**: < 5e-5 on Gaussian inputs.
+- **Stage 3 PDX scan throughput, AVX-512, b = 4, d = 768**: ≥ 1.5×
+  Stage 2's row-major kernel throughput on 1 M-row scan.
+
+These are starting budgets; the Experimental plan (§12) refines them with
+real workloads.
+
+### D.12 Registry / dispatch wiring
+
+- **Extension ID**: `vortex.turboquant`, registered via
+  `vortex_turboquant::initialize(&session)`. Implementation:
+  `session.dtypes().register(TurboQuant)`.
+- **Scalar function IDs**: `vortex.turboquant.encode` (TQEncode),
+  `vortex.turboquant.decode` (TQDecode). Registered via
+  `session.scalar_fns().register(...)`.
+- **BtrBlocks scheme wiring (target)**: `BtrBlocksCompressorBuilder::with_turboquant()`
+  installs a `TurboQuantScheme` that matches Vector columns with
+  `dimensions ≥ MIN_DIMENSION` and non-nullable float elements. Not yet
+  present in the new `vortex-turboquant` crate; Stage 1 stabilization
+  adds it.
+- **PDXArray encoding (Stage 3)**: register in `vortex-array` (recommended)
+  or a sibling crate. Encoding ID TBD; suggested `vortex.pdx`.
+
+### D.13 Crate boundaries and dependencies
+
+- `vortex-turboquant` depends on `vortex-array`, `vortex-buffer`,
+  `vortex-error`, `vortex-mask`, `vortex-session`, `vortex-tensor`,
+  `vortex-utils` (with `dashmap` feature). No new external dependencies.
+- Nothing in the main `vortex` crate depends on `vortex-turboquant`. The
+  crate registers itself opt-in.
+- Stage 2: no new crate dependencies.
+- Stage 3: adds a dependency on whatever crate hosts `PDXArray`
+  (recommend `vortex-array`).
+
+### D.14 Migration sequence: removing the predecessor implementations
+
+After `vortex-turboquant` ships:
+
+1. (Now) Both `vortex-tensor/src/encodings/turboquant/` (monolithic) and
+   `vortex-tensor/src/scalar_fns/{l2_denorm,sorf_transform}` (decomposed)
+   exist alongside `vortex-turboquant`.
+2. Migrate `vortex/examples/turboquant_vector_search.rs` to the new
+   `TQEncode` / `TQDecode` path (Stage 1 stabilization task).
+3. Migrate any downstream consumers of the legacy paths (Vortex test
+   suite, benchmarks, duckdb-vortex if applicable).
+4. Deprecate the legacy paths with `#[deprecated]` and a removal target
+   version.
+5. Remove the legacy paths in a follow-up PR.
+
+Each step is independently mergeable.
+
 ## Open questions
 
-These are recorded for resolution during the RFC review or as part of
-Stage 1 / Stage 2 implementation work, not blockers on the design:
+These are recorded for resolution during Stage 1 / Stage 2 implementation
+work, not blockers on the design:
 
-1. **Norm storage shape uniformity (Stage 2).** Should the norm field be
-   `FixedSizeList<element_ptype, num_blocks>` for all k (including k=1),
-   or stay `Primitive<element_ptype>` when k=1 and switch to FSL only
-   when k>1? The Stage 1 single-norm wire format is preserved for k=1 in
-   the current proposal; the simplicity argument for uniformity is real
-   but breaks wire-format identity for the power-of-2 dimension case.
-2. **Where `PDXArray` lives.** `vortex-array` (recommended; general-purpose,
+1. **Where `PDXArray` lives.** `vortex-array` (recommended; general-purpose,
    reusable for other encodings) vs. `vortex-turboquant` (TQ-specific,
-   generalize later).
-3. **EDEN-`S` adoption timing.** Adopt as part of Stage 1 production
-   stabilization (recommended; strict drop-in win, no wire-format change),
-   or defer to a separate follow-up. Recommend the former unless
-   benchmarking shows a reason to wait.
-4. **EDEN-`S` table pinning.** Pin EDEN's `S` table as a Vortex constant
+   generalize later). The deciding factor is whether `PDXArray` will have
+   non-TurboQuant consumers; the first such consumer settles the question.
+2. **EDEN-`S` table pinning.** Pin EDEN's `S` table as a Vortex constant
    (alongside the SplitMix64 stream), or version the centroid/scale
-   algorithm in metadata? Recommend the former for simplicity.
-5. **Unbiased path.** EDEN's native b-bit unbiased quantizer is strictly
-   superior to TurboQuant's MSE+QJL stacking. The RFC recommends EDEN for
-   any future unbiased work; confirm with author of PR #51 in review.
-6. **`vortex-tensor/src/encodings/turboquant/` removal.** Tracked as a
-   Stage 1 cleanup; confirm that no downstream consumers still depend on
-   the old path before removing.
+   algorithm in metadata? Recommend pinning for simplicity, but verify
+   first that EDEN's `S` is fully deterministic from `(d, b)` alone — i.e.,
+   no free parameters in EDEN's optimization criterion that would force
+   versioning. Settle by reading EDEN [15] §X (specific section TBD once
+   the implementer dives in).
+3. **Per-block rotation derivation (Stage 2).** A single stored seed plus
+   block-index mixing keeps metadata small while preserving determinism.
+   One candidate: `block_seed(b) = SplitMix64(seed ^ (b as u64))`. The
+   exact mixing function is a Stage 2 implementation detail that should be
+   pinned before the first Stage 2 file is written; the wire format
+   becomes load-bearing once any file is shipped.
+4. **Wire-format identity at d=1024 across Stage 1 → Stage 2 writers.** When
+   a Stage 2 writer emits a power-of-2-dimension TurboQuant array (so
+   k = 1), should it write `block_size = None` (matching Stage 1 readers'
+   default exactly) or `block_size = Some(padded_dim)`? Stage 2 readers
+   accept both; Stage 1 readers only accept `None`. Writers must converge
+   to one or the other to preserve cross-version write/read interop.
+5. **Whether to lower `MIN_DIMENSION` after Stage 1 experimental
+   validation.** If the experimental plan supports lowering to 64–96, the
+   change is a wire-format break in the sense that files written at
+   d < 128 by a new writer would be rejected by an old reader. Surface
+   this in the migration plan when the experiment lands.
+
+### Resolved during this rewrite
+
+The following questions were live during the first draft of the rewrite
+and have been resolved here. Recording the resolutions so future readers
+don't re-litigate.
+
+- **Norm storage shape uniformity (Stage 2)** — resolved in favor of
+  `Primitive<element_ptype>` when `num_blocks == 1` (matches Stage 1
+  exactly, preserves bit-identical wire format at d = 1024) and
+  `FixedSizeList<element_ptype, num_blocks>` when `num_blocks > 1`. The
+  simplicity-of-uniform-FSL argument is real but breaks wire-format
+  identity. See §7.
+- **EDEN-`S` adoption timing** — resolved: adopt as part of Stage 1
+  production stabilization. The change is strictly additive (no storage
+  or metadata shape change) and a strict MSE win at fixed bit budget;
+  there is no benchmarking reason to wait. See §6 "Stage 1 refinement."
+- **Unbiased path: EDEN vs. QJL** — resolved: when an unbiased mode is
+  eventually added, use EDEN's native b-bit unbiased quantizer [15] in
+  place of TurboQuant's MSE+QJL "Prod" stacking. The note [14] reports
+  EDEN dominates at every bit width they tested. See §15 and Appendix B.
+- **`vortex-tensor/src/encodings/turboquant/` removal** — tracked as a
+  Stage 1 cleanup task in §14 "Current state and known gaps." Removal
+  follows once `vortex/examples/turboquant_vector_search.rs` migrates to
+  the new `TQEncode` / `TQDecode` path.
