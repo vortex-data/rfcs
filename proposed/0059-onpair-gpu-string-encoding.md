@@ -127,7 +127,7 @@ metadata (Prost):
   flags                  : u8     // bit 0: coalesced-memory-access reordering applied to codes
 ```
 
-The first 256 tokens are reserved for the 256 single-byte values (this is OnPair's invariant, paper §3.2). Tokens `256..n_tokens` are learned merge-pair symbols, each represented by its full byte sequence stored contiguously in `dict_bytes`. **The dictionary is stored in lexicographic order of byte sequences** (paper §3.5; [`dictionary.h`](https://github.com/gargiulofrancesco/onpair_cpp/blob/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/core/dictionary.h) docs) — this is load-bearing for the compressed-domain prefix automaton, which uses sorted order to compute prefix-range token-id intervals in O(log n_tokens).
+The first 256 tokens are reserved for the 256 single-byte values (this is OnPair's invariant, paper §3.2). Tokens `256..n_tokens` are learned merge-pair symbols, each represented by its full byte sequence stored contiguously in `dict_bytes`. **The dictionary is stored in lexicographic order of byte sequences** (paper §3.5; [`dictionary.h`](https://github.com/gargiulofrancesco/onpair_cpp/blob/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/core/dictionary.h) docs) — this is load-bearing for the compressed-domain prefix automaton, which uses sorted order to compute prefix-range token-id intervals in O(log n_tokens). When one stored byte sequence is a strict prefix of another (e.g., the single byte `0x68` and the multi-byte token `"hello" = [0x68, 0x65, 0x6C, 0x6C, 0x6F]`), the **shorter sorts first** — standard `memcmp` convention. Token IDs are assigned by position in this final sorted order.
 
 The `dict_bytes` buffer is padded by `MAX_SYMBOL_LEN = 16` zero bytes past the logical end, so a decoder over-copying 16 bytes from any valid offset stays within the allocated buffer (paper §3.5; `pad_for_decoder()` in `dictionary.h`).
 
@@ -135,20 +135,7 @@ For a 4K-token dictionary on Book Titles–like data, the dict footprint is ~76 
 
 The optional `splits` buffer is described in the [GPU decoder](#gpu-decoder-cuda-hopper-class-and-newer) section.
 
-**Tier 2 — `OnPair16Layout` (analog of `DictLayout`).** A layout with two children:
-
-```rust
-pub struct OnPair16Layout {
-    /// The dictionary; typically Arc-shared across many sibling OnPair16Layouts
-    /// in a ChunkedLayout, exactly like DictLayout's `values`. Concretely a
-    /// BinaryView of n_tokens entries (one per token), allowing the compressed-
-    /// domain predicate machinery to query the dictionary directly via Vortex's
-    /// existing BinaryView compute kernels.
-    dict: LayoutRef,
-    /// Codes + per-string offsets + optional splits for this chunk.
-    data: LayoutRef,
-}
-```
+**Tier 2 — `OnPair16Layout` (analog of `DictLayout`).** Two structural children: a **`dict`** `LayoutRef` (a BinaryView of `n_tokens` entries, one per token; typically Arc-shared across many sibling `OnPair16Layout`s in a `ChunkedLayout`, exactly like `DictLayout`'s `values`) and a **`data`** `LayoutRef` (the chunk's codes + per-string offsets + optional `splits` buffer). The canonical Rust struct definition lives in the Implementation Specification appendix (§[Public API](#public-api-rust)).
 
 Sharing across chunks is identical in shape to `DictLayout`: the writer trains one dict on the corpus, emits one `dict` `LayoutRef`, and every chunk's `OnPair16Layout` Arc-shares that same reference. The reader uses an `OnceLock`-cached materialized dictionary view — the dict array is small enough (≤1 MiB at 16-bit codes) to stay resident in L2/L3 between calls, amortized over the millions of strings the dict applies to.
 
@@ -265,44 +252,13 @@ Whether it helps on OnPair16 codes at 12-bit width and 1024 codes/split is genui
 
 #### Mode A — dict-in-shared-memory (`code_width_bits` ≤ 12), GSST one-block-per-SM mapping (reference)
 
-```cuda
-__global__ void decode_kernel_smem_blockwise(
-    /* per-chunk constants */
-    const uint8_t*  dict_bytes,             // padded flat byte buffer
-    const uint32_t* dict_offsets,           // [n_tokens + 1]
-    uint32_t        n_tokens,
-    /* per-chunk variables */
-    const uint8_t*  codes,                  // bit-packed code stream
-    const uint32_t* split_uncompressed_sizes, // [n_splits]
-    uint32_t        n_splits,
-    uint32_t        codes_per_split,
-    uint8_t*        out)
-{
-    __shared__ uint8_t  sym_bytes[4096 * 16];   // 64 KiB (or less for smaller widths)
-    __shared__ uint8_t  sym_len  [4096];        //  4 KiB
-    __shared__ uint32_t output_offsets[N_SPLITS_PER_BLOCK + 1];
+The kernel runs in two phases. The full CUDA function signature, SMEM allocation sizes, choice of CUB primitive, and per-line pseudocode live in the Implementation Specification appendix (§[GPU decoder details](#gpu-decoder-details)). The strategy:
 
-    // Phase 1: cooperative dictionary materialization.
-    //   - Threads in the block cooperatively memcpy dict_bytes/dict_offsets into SMEM.
-    //   - Equivalent to GSST thesis §4.3.1; the dict bytes are over-copied 16 bytes per
-    //     entry into a fixed-stride buffer for cache-friendly access.
-    //   - Per-split output offsets are precomputed once into shared memory via a
-    //     block-wide CUB::ExclusiveScan over split_uncompressed_sizes[].
-    __syncthreads();
+**Phase 1 — cooperative dictionary materialization (per thread block).** Threads in the block cooperatively read `dict_bytes` (via `dict_offsets`) and write into a shared-memory flattened symbol table with 16-byte stride per entry (equivalent to GSST thesis §4.3.1's SMEM-resident symbol table). Per-split output offsets are precomputed once via a block-wide exclusive scan over the `splits` buffer. One `__syncthreads` at the end.
 
-    // Phase 2: each thread owns one split. Per GSST §4.2.2, this is the canonical mapping.
-    //   - thread_id selects split_id within this block's range.
-    //   - Input range:  codes[split_id * codes_per_split * code_width_bits / 8 ..]
-    //   - Output start: output_offsets[split_id]   (precomputed)
-    //   - Walk the split's codes_per_split codes; for each:
-    //       - Unpack 12-bit code from the bit-packed stream.
-    //       - Load sym_bytes[16 * code] (vectorized).
-    //       - memcpy 16 bytes to out[output_offsets[split_id] + local_off].
-    //       - local_off += sym_len[code].
-}
-```
+**Phase 2 — code-stream decode (one thread per split).** Each thread is assigned one split (`split_id` derived from `blockIdx`/`threadIdx`, per GSST §4.2.2's canonical mapping). For each of `codes_per_split` codes in its split, the thread unpacks the bit-packed code, loads the symbol-table entry from SMEM, and `memcpy`s 16 bytes to its output range starting at the precomputed `output_offsets[split_id]`, advancing its local offset by the actual token length.
 
-The persistent-thread alternative differs in two places: the grid launch is `~512` warps once (instead of one block per chunk × many SMs), and each warp claims its split via `atomicAdd(g_split_counter)` instead of computing it from `blockIdx + threadIdx`.
+The persistent-thread alternative differs in two places: the grid launch is `~512` warps once (instead of one block per chunk × many SMs), and each warp claims its split via `atomicAdd` on a global counter instead of computing it from `blockIdx + threadIdx`.
 
 **Expected throughput on H100 at 12-bit codes:** GSST measures 191 GB/s on A100 with a 2 KiB FSST8 symbol table. The OnPair16-on-H100 prediction (~250 GB/s) extrapolates from GSST's A100 result by (a) Hopper's higher HBM bandwidth (~3 TB/s vs ~1.5 TB/s) and (b) lack of escape-code divergence, offset by (c) lower occupancy from the 68 KiB SMEM footprint vs GSST's effectively-free 2 KiB and (d) 12-bit bit-unpacking cost that FSST8 doesn't pay. Net effect is uncertain — the 250 GB/s figure is a prior, not a derivation. Realistic range is ~150–300 GB/s; the validation campaign measures.
 
@@ -593,7 +549,15 @@ The validation pass runs once on Array construction; subsequent decode operation
 
 ### Worked example
 
-Input: `["hello", "world", "hello"]`, `code_width_bits = 12`. Assume training produced a 258-token dictionary: codes 0–255 are the single bytes, code 256 is the 5-byte token `"hello"`, code 257 is the 5-byte token `"world"`. (A realistic 4K-token training would produce a different dictionary; this minimal example shows the wire format.)
+Input: `["hello", "world", "hello"]`, `code_width_bits = 12`. Assume training produced a 258-token dictionary: all 256 single bytes (`0x00..0xFF`) plus the two 5-byte tokens `"hello"` and `"world"`. After lexicographic sorting:
+
+- Single byte `0x68` (= `'h'`) sorts at position 104 (= 0x68).
+- `"hello"` = `[0x68, 0x65, 0x6C, 0x6C, 0x6F]` sorts at position **105**, immediately after single-byte `'h'` — because in lex order `[0x68]` < `[0x68, ...]` (shorter prefix wins).
+- Single byte `0x77` (= `'w'`) sorts at position 120 (= 0x77 + 1, shifted by one because `"hello"` was inserted earlier).
+- `"world"` = `[0x77, 0x6F, 0x72, 0x6C, 0x64]` sorts at position **121**, immediately after single-byte `'w'`.
+- Single bytes `0x78..0xFF` follow at positions 122..257.
+
+So `hello_code = 105` and `world_code = 121`. The full wire format:
 
 ```
 metadata:
@@ -608,50 +572,50 @@ metadata:
   flags             = 0
 
 buffer [0] dict_bytes (266 + 16 = 282 bytes, lexicographically ordered):
-  // Lex order interleaves the single-byte and multi-byte tokens. For this example
-  // (single-byte tokens 0x00..0xFF plus "hello" and "world"):
-  //   "hello" sorts after the single byte 0x67 ('g') and before 0x68 ('h')
-  //   "world" sorts after 0x76 ('v') and before 0x77 ('w')
-  // The implementer must sort the *combined* dictionary lexicographically and
-  // assign code IDs in sorted order. (Single-byte tokens at their natural
-  // byte-value positions; merge-pair tokens at their lex-sorted positions.)
-  // For brevity, the example below shows the byte values; the code IDs are
-  // the *positions in the sorted order*.
-  bytes:    [0x00, 0x01, ..., 0x67, 'h','e','l','l','o', 0x68, ..., 0x76, 'w','o','r','l','d', 0x77, ..., 0xFF, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-                                    ^^^^^^^^^^^^^^^^^^^                   ^^^^^^^^^^^^^^^^^^^                  ^^^^^^^^ 16-byte padding ^^^^^^^^
+  bytes:    [0x00, 0x01, ..., 0x67, 0x68, 'h','e','l','l','o', 0x69, ..., 0x76, 0x77, 'w','o','r','l','d', 0x78, ..., 0xFF, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+                                          ^^^^^^^^^^^^^^^^^^^                         ^^^^^^^^^^^^^^^^^^^                  ^^^^^^^^ 16-byte padding ^^^^^^^^
+                                    ↑                       ↑                   ↑                       ↑
+                            byte 104 = 'h'         byte 110 = 'i'        byte 124 = 'w'         byte 130 = 'x'
+                            byte 105 = start of "hello"                  byte 125 = start of "world"
 
 buffer [1] dict_offsets (259 × u32 = 1036 bytes):
-  offsets: [0, 1, 2, ..., 104, 109, 110, ..., 124, 129, 130, ..., 266]
-                          ^ start of "hello" at byte 104, ends at 109
-                                          ^ start of "world" at byte 124, ends at 129
-  // dict_offsets[hello_code] = 104, dict_offsets[hello_code + 1] = 109 → length 5
-  // dict_offsets[world_code] = 124, dict_offsets[world_code + 1] = 129 → length 5
+  offsets: [0, 1, 2, ..., 104, 105, 110, 111, ..., 124, 125, 130, 131, ..., 266]
+                                ^    ^                   ^    ^
+                                |    end of "hello" /    |    end of "world" /
+                                |    start of next       |    start of next
+                                |    single byte 'i'     |    single byte 'x'
+                                start of "hello"         start of "world"
 
-  // The code IDs in this sorted order:
-  hello_code = 104   // position in lex-sorted dict
-  world_code = 124
+  // dict_offsets[hello_code]     = dict_offsets[105] = 105
+  // dict_offsets[hello_code + 1] = dict_offsets[106] = 110     → length 5 ✓
+  // dict_offsets[world_code]     = dict_offsets[121] = 125
+  // dict_offsets[world_code + 1] = dict_offsets[122] = 130     → length 5 ✓
+
+  // Code IDs (positions in lex-sorted dict):
+  hello_code = 105
+  world_code = 121
 
 buffer [2] code_offsets (4 × u32 = 16 bytes):
-  [0, 1, 2, 3]    // string 0: codes[0..1] = "hello"
-                  // string 1: codes[1..2] = "world"
-                  // string 2: codes[2..3] = "hello"
+  [0, 1, 2, 3]    // string 0: codes[0..1] = ["hello"]
+                  // string 1: codes[1..2] = ["world"]
+                  // string 2: codes[2..3] = ["hello"]
 
 buffer [3] codes (3 codes × 12 bits = 36 bits = 5 bytes, last 4 bits zero-padded):
-  // codes[0] = hello_code = 104
-  // codes[1] = world_code = 124
-  // codes[2] = hello_code = 104
+  // codes[0] = hello_code = 105 = 0x069
+  // codes[1] = world_code = 121 = 0x079
+  // codes[2] = hello_code = 105 = 0x069
   //
-  // Pack two codes per three bytes (FSST12 layout):
-  //   bytes[0] = 104 & 0xFF = 0x68
-  //   bytes[1] = (104 >> 8) & 0xF  |  (124 & 0xF) << 4 = 0x0 | 0xC0 = 0xC0
-  //   bytes[2] = (124 >> 4) & 0xFF = 0x07
-  // Then odd-numbered trailing code:
-  //   bytes[3] = 104 & 0xFF = 0x68
-  //   bytes[4] = (104 >> 8) & 0xF = 0x0  (high half-byte zero-padded)
-  bytes: [0x68, 0xC0, 0x07, 0x68, 0x00]
+  // Pack first pair (codes[0], codes[1]) into 3 bytes (FSST12 layout):
+  //   bytes[0] = 105 & 0xFF                            = 0x69
+  //   bytes[1] = (105 >> 8) & 0xF  |  (121 & 0xF) << 4 = 0x0 | 0x90  = 0x90
+  //   bytes[2] = (121 >> 4) & 0xFF                     = 0x07
+  // Trailing lone code (codes[2]) into 1.5 bytes:
+  //   bytes[3] = 105 & 0xFF                            = 0x69
+  //   bytes[4] = (105 >> 8) & 0xF                      = 0x00     (upper half-byte zero-padded)
+  bytes: [0x69, 0x90, 0x07, 0x69, 0x00]
 ```
 
-Note: in a real-world array with a learned 4096-token dict, the single-byte tokens 0x00..0xFF would not all be present as codes 0..255 in the lex order; the lex order interleaves single-byte and multi-byte tokens. The implementer must sort the combined dictionary lexicographically by byte sequence and assign code IDs by sorted position. This matters because the prefix automaton (see [`prefix_automaton.h`](https://github.com/gargiulofrancesco/onpair_cpp/blob/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/search/automata/prefix_automaton.h)) relies on this lex ordering for O(log n_tokens) prefix-range computation.
+Note that in a real-world array with a learned 4096-token dict, the merge-pair tokens are interleaved with the single bytes throughout the lex order, and most positions correspond to merge tokens (not single bytes). The `prefix_automaton` ([`onpair_cpp@ae590713/include/onpair/search/automata/prefix_automaton.h`](https://github.com/gargiulofrancesco/onpair_cpp/blob/ae590713515c7bb7893e14a757b484545e5339c3/include/onpair/search/automata/prefix_automaton.h)) relies on this lex ordering for O(log n_tokens) prefix-range computation.
 
 ### Public API (Rust)
 
@@ -748,6 +712,24 @@ The training algorithm follows the OnPair paper §3.2 unchanged. Hyperparameter 
 The encoder's parsing phase (paper §3.3) runs longest-prefix-matching against the final sorted dictionary for every input string. Implementation note: the LPM data structures (paper §3.4) — short-pattern hash + long-pattern bucket structure — are the hot path; reuse from `onpair_cpp` if the dependency decision lands that way (see Drawbacks).
 
 ### GPU decoder details
+
+**Kernel signature (Mode A, dict-in-SMEM).** The reference Mode A kernel takes per-chunk constants (the dictionary, which is read-only and shared across the chunk) and per-chunk variables (the codes, splits, output buffer):
+
+```cuda
+__global__ void decode_kernel_smem_blockwise(
+    /* per-chunk constants */
+    const uint8_t*  dict_bytes,             // padded flat byte buffer
+    const uint32_t* dict_offsets,           // [n_tokens + 1]
+    uint32_t        n_tokens,
+    /* per-chunk variables */
+    const uint8_t*  codes,                  // bit-packed code stream
+    const uint32_t* splits,                 // [n_splits] uncompressed sizes per split
+    uint32_t        n_splits,
+    uint32_t        codes_per_split,
+    uint8_t*        out);
+```
+
+The persistent-thread variant takes one additional `uint32_t* g_split_counter` for the atomic claim counter.
 
 **Thread → split mapping.** One thread per split. Block dimension is `min(n_splits, 256)`. If `n_splits > 256`, the kernel loops each thread over multiple splits via `for (split_id = threadIdx.x; split_id < n_splits; split_id += blockDim.x)`. The 256 thread upper bound matches H100's preferred block size with 68 KiB SMEM per block.
 
