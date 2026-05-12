@@ -311,7 +311,7 @@ A reasonable reader will ask: why a new array? Why not just extend `FSSTArray`, 
 - **Empty strings.** `code_offsets[i] == code_offsets[i+1]`. Decoder writes zero bytes. Trivially handled.
 - **Null strings.** Handled by Vortex's standard validity bitmap at the Array level; the OnPair16 encoding never sees a null. The encoding's per-string offsets index into the non-null subset.
 - **Zero rows.** `n_strings == 0`, `n_codes == 0`. The dictionary may still be present (Tier 2) or absent (Tier 1 — encoder may emit an empty dict trivially). Decoder is a no-op.
-- **Very small arrays** (e.g. ≤16 strings, ≤64 codes). Dictionary materialization dominates decode time. The recommended fallback: for arrays below a writer-configurable threshold (default ~256 strings or ~1 KiB compressed), the encoder falls back to FSST or to plain (unencoded) bytes — OnPair16's ratio advantage is lost on tiny arrays and the materialization overhead is wasted. This is an encoder heuristic, not a format requirement.
+- **Very small arrays** (e.g. ≤16 strings, ≤64 codes). Dictionary materialization dominates decode time. The recommended fallback: for arrays below the `MIN_STRINGS_FOR_ONPAIR16` / `MIN_CODES_FOR_ONPAIR16` thresholds defined in §[Encoder algorithm](#encoder-algorithm), the encoder falls back to `FSSTArray` or plain bytes — OnPair16's ratio advantage is lost on tiny arrays and the materialization overhead is wasted. This is an encoder heuristic, not a format requirement; the wire format is identical regardless of which encoding was chosen.
 - **Extreme low entropy** (e.g., every string is the same value). OnPair16's training produces a single learned token for the repeated value; compression ratio is excellent. No special-case logic needed.
 - **Mismatch between Tier-2 dict and a chunk's data.** OnPair16 always covers all 256 bytes (codes 0–255 are reserved single-byte tokens), so any byte sequence is representable. A poorly-matched dict produces a longer code stream; compression ratio degrades but the format remains well-defined.
 - **Single very long string** (e.g., a 10 MB blob in one row). `code_offsets[1] - code_offsets[0]` is the whole code stream; decode is one big sequential operation. The split-parallel GPU decoder treats the codes the same way regardless of how they're partitioned into strings.
@@ -706,7 +706,8 @@ The training algorithm follows the OnPair paper §3.2 unchanged. Hyperparameter 
 
 - **Pair-frequency threshold:** `max(2, ⌊log₂(S)⌋)` where `S` is sample size in MiB, per OnPair paper §3.2.1 ("The threshold is set as a slowly growing function of dataset size"). Override via `TrainingConfig::pair_frequency_threshold`.
 - **Sample size:** 5% of input for inputs >10 MiB; full input for smaller. Override via `TrainingConfig::sample_fraction`. The OnPair paper notes the sample is "randomly selected … shuffled" — implementers should use a deterministic seeded shuffle (`TrainingConfig::seed`) for reproducibility.
-- **Training termination:** dictionary fills to `2^code_width_bits` tokens, OR no pair in the sample exceeds the frequency threshold, OR sample exhausted. Whichever comes first.
+- **Training termination:** dictionary reaches `2^code_width_bits` total tokens (the first 256 of which are always the reserved single-byte tokens; learnable merge slots are therefore `2^code_width_bits − 256`), OR no pair in the sample exceeds the frequency threshold, OR sample exhausted. Whichever comes first.
+- **Small-array fallback threshold:** `MIN_STRINGS_FOR_ONPAIR16 = 256` (constant). For arrays with fewer than `MIN_STRINGS_FOR_ONPAIR16` strings OR `MIN_CODES_FOR_ONPAIR16 = 1024` codes, the encoder skips OnPair16 training and falls back to `FSSTArray` or plain bytes — dictionary materialization dominates decode on tiny arrays and the ratio advantage is lost. This is an encoder-side heuristic; the wire format is unchanged. (See §[Edge cases](#edge-cases).)
 - **Token sorting:** after training completes, the dictionary is sorted lexicographically by byte sequence. Token IDs are reassigned to match sorted position. This is the OnPair paper §3.5 invariant and is load-bearing for the prefix automaton.
 
 The encoder's parsing phase (paper §3.3) runs longest-prefix-matching against the final sorted dictionary for every input string. Implementation note: the LPM data structures (paper §3.4) — short-pattern hash + long-pattern bucket structure — are the hot path; reuse from `onpair_cpp` if the dependency decision lands that way (see Drawbacks).
@@ -775,12 +776,30 @@ for (uint32_t k = code_start; k < code_end; k++) {
 }
 ```
 
-The `unpack_12bit` function implements the two-codes-per-three-bytes layout from the Wire format section.
+The `unpack_12bit` function implements the two-codes-per-three-bytes layout from the Wire format section. Per-thread CUDA body (handles byte-boundary spans; matches the CPU layout at lines 522–527):
+
+```cuda
+__device__ __forceinline__ uint32_t unpack_12bit(const uint8_t* codes, uint32_t k) {
+    uint32_t byte_off = (k / 2) * 3;
+    uint32_t b0 = codes[byte_off];
+    uint32_t b1 = codes[byte_off + 1];
+    if ((k & 1) == 0) {
+        // Even code: low 8 bits in b0, high 4 bits in low nibble of b1
+        return b0 | ((b1 & 0x0F) << 8);
+    } else {
+        // Odd code: low 4 bits in high nibble of b1, high 8 bits in b2
+        uint32_t b2 = codes[byte_off + 2];
+        return (b1 >> 4) | (b2 << 4);
+    }
+}
+```
+
+Warp-cooperative variants that amortize the byte-stream load across 32 codes (8 × 12 bits = 96 bits = 12 bytes per 8 codes per lane) are an implementation optimization, not a format requirement.
 
 ### Memory layout and allocation
 
 - **Decoder output buffer:** caller-allocated. Caller must allocate at least `uncompressed_bytes + DECOMPRESS_BUFFER_PADDING` (= `uncompressed_bytes + 16`) bytes so the unconditional 16-byte over-copy on the final token is in-bounds.
-- **CPU decode-time symbol-table cache:** allocated by `OnPair16Array` lazily on first decode call into an `Arc<[u8]>` scratch buffer of size `16 * n_tokens + n_tokens` (symbol bytes + lengths). Cached for the lifetime of the Array. For Tier 2 (`OnPair16Layout`), the cache lives in the layout reader's `OnceLock<Arc<FlatTable>>` and is shared across all chunks referencing the same dict.
+- **CPU decode-time symbol-table cache:** allocated by `OnPair16Array` lazily on first decode call into an `Arc<[u8]>` scratch buffer of size `16 * n_tokens + n_tokens` (symbol bytes + lengths). Cached for the lifetime of the Array. For Tier 2 (`OnPair16Layout`), the cache lives in the layout reader's `OnceLock<Arc<[u8]>>` (same scratch layout) and is shared across all chunks referencing the same dict.
 - **GPU SMEM:** sized as above; per-block, kernel-local.
 
 ### Registry and dispatch
@@ -814,8 +833,8 @@ These are the targets an implementer can measure during development to confirm t
 
 | Budget | Target | Verifiable with |
 |---|---|---|
-| CPU decode throughput at 12-bit | ≥4 GB/s on Zen 4 / Sapphire Rapids, scalar (compiler auto-vectorized) | criterion benchmark with the OnPair-paper corpora |
-| CPU decode throughput at 16-bit | ≥5 GB/s on Zen 4 / Sapphire Rapids, scalar | criterion |
+| CPU decode throughput at 12-bit | ≥4 GB/s on Zen 4 / Sapphire Rapids, scalar (compiler auto-vectorized: LLVM ≥ 14 or GCC ≥ 11) | criterion benchmark with the OnPair-paper corpora; verify the inner loop emits a 16-byte vector load+store (e.g., `movdqu` / `vmovdqu`) via `cargo asm` or `objdump -d` |
+| CPU decode throughput at 16-bit | ≥5 GB/s on Zen 4 / Sapphire Rapids, scalar (same compiler floors as above) | criterion; same assembly-verification step |
 | CPU decode L1 hit rate | ≥95% for the symbol table at 12-bit; ≥90% at 16-bit | `perf stat -e L1-dcache-load-misses,L1-dcache-loads` |
 | GPU decode throughput at 12-bit (H100) | ≥200 GB/s | nsight compute, runtime divided by uncompressed bytes |
 | GPU kernel launch overhead | ≤50 µs per chunk | nsight systems |
