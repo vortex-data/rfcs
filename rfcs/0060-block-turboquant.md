@@ -14,8 +14,9 @@ foundation and architectural shape:
 1. **Stage 1 — Single-block, biased (MSE-only):** what's implemented today in
    the standalone `vortex-turboquant` crate. Storage is a two-field struct
    `{norms, codes}` under the extension dtype; rotation and centroids are
-   derived from metadata, not stored. Adopts EDEN's optimized scalar scale `S`
-   in place of TurboQuant's fixed `S = 1` as a strict, drop-in improvement.
+   derived from metadata, not stored. Ships with TurboQuant's fixed `S = 1`;
+   EDEN's optimized scalar scale `S` is a deferred Stage 1.5 follow-up
+   (§6).
 2. **Stage 2 — Block decomposition:** add `block_size` to the extension
    metadata; per-block norms move into a fixed-size list. Eliminates power-of-2
    padding for non-power-of-2 dimensions (768 → 3×256 blocks instead of 768 →
@@ -50,8 +51,8 @@ branding; see §4 "Naming."
 [arXiv:2105.08339]: https://arxiv.org/abs/2105.08339
 [arXiv:2604.18555]: https://arxiv.org/abs/2604.18555
 [arXiv:2504.19874]: https://arxiv.org/abs/2504.19874v1
-[current-impl]: https://github.com/spiraldb/vortex/tree/ff120401a0f4796f2d1aa85d1f87e7195c1f3dbf/vortex-turboquant
-[original-impl]: https://github.com/spiraldb/vortex/pull/7167
+[current-impl]: https://github.com/vortex-data/vortex/tree/ff120401a0f4796f2d1aa85d1f87e7195c1f3dbf/vortex-turboquant
+[original-impl]: https://github.com/vortex-data/vortex/pull/7167
 
 ## Motivation
 
@@ -260,11 +261,11 @@ The note [14] argues TurboQuant is suboptimal in two specific ways:
 
 **What this means for the RFC.**
 
-- We adopt EDEN's **optimized scale `S`** as a Stage 1 refinement (see
-  §6 "Stage 1"). This is a strict drop-in win: same storage, same metadata,
-  better quantization accuracy at fixed bit budget. The implementer needs
-  EDEN [15] (not the note [14]) for the optimization criterion — the note
-  defers to "methods described in the EDEN works."
+- We commit to **adopting EDEN's optimized scale `S`** in a Stage 1.5
+  follow-up (see §6 "Stage 1 refinement"). Stage 1 ships with `S = 1`
+  (TurboQuant_mse) since the EDEN paper hasn't been read closely enough
+  yet to pin the S-table as a wire-format-stable constant. The implementer
+  needs EDEN [15] (not the note [14]) for the optimization criterion.
 - We adopt EDEN's **native b-bit unbiased mode** as the preferred path for any
   future unbiased estimator, in place of TurboQuant's MSE+QJL stacking (see
   §15 "Future work" and Appendix C).
@@ -641,7 +642,9 @@ padded_dim = next_power_of_two(dimensions)
    `dimensions` is not a power of 2. Apply SORF (3-round Walsh–Hadamard with
    SplitMix64 sign diagonals derived from `seed`). Result is `r ∈ ℝ^padded_dim`.
 3. Quantize each coordinate of `r`: `codes[i][j] = nearest_centroid(r[j] * S,
-centroids)` where `S` is EDEN's optimized scale for `(padded_dim, bit_width)`.
+centroids)`. Stage 1 uses `S = 1` (TurboQuant_mse). EDEN's optimized
+   `S(padded_dim, bit_width)` is a deferred Stage 1.5 follow-up (§6
+   "Stage 1 refinement").
 4. If `n == 0`: store zero codes; mark validity according to input.
 
 ### Decode path
@@ -660,38 +663,42 @@ scalar quantization plus inverse SORF is not norm-preserving in general. See
 
 ### Stage 1 refinement: EDEN's optimized `S`
 
-The current `vortex-turboquant` implementation uses TurboQuant's fixed `S = 1`.
-Per EDEN [15], the optimal `S` is a function of `(padded_dim, bit_width)` and
-converges to 1 only as dimension grows; the note [14] catalogues this gap as
-the primary algorithmic suboptimality in TurboQuant_mse. At practical
-dimensions, EDEN's `S` strictly reduces MSE at fixed bit budget. We adopt it
-as a Stage 1 refinement:
+The current `vortex-turboquant` implementation uses TurboQuant's fixed
+`S = 1`. Per EDEN [15], the optimal `S` is a function of `(padded_dim,
+bit_width)` and converges to 1 only as dimension grows; the note [14]
+catalogues this gap as the primary algorithmic suboptimality in
+TurboQuant_mse. At practical dimensions EDEN's `S` strictly reduces MSE
+at fixed bit budget.
 
-- Compute `S` alongside the centroids at the same point in the algorithm
-  (after Max-Lloyd converges) using EDEN's optimization criterion. The
-  implementer should consult EDEN [15] for the precise criterion — the note
-  [14] defers to "methods described in the EDEN works" and does not
-  reproduce the algorithm itself. The authors' official reproduction lives
-  at https://github.com/amitport/EDEN-Distributed-Mean-Estimation (PyTorch
-  and TensorFlow); note that this repository has **no LICENSE file**, so
-  it is reference reading only — Vortex's implementation must be
-  clean-room from the EDEN paper.
-- Cache `(centroids, S)` together under the existing `(padded_dim,
-bit_width)` key in the `DashMap`.
-- Apply `S` at quantization time (encode: scale `r * S` before
-  `nearest_centroid`; decode: scale `centroids[c] / S` after lookup).
-- **No storage-shape change.** No metadata change for biased mode. The scale
-  is reproducible from `(padded_dim, bit_width)`. If a future stage adds
-  EDEN's unbiased mode, an `unbiased: bool` metadata flag is added and the
-  cache key extends to `(padded_dim, bit_width, biased)`; see §15.
+**Stage 1 ships with `S = 1`.** Adopting EDEN's `S` requires:
 
-EDEN-`S` is a strictly-additive improvement. Files written before the EDEN-`S`
-upgrade and files written after are wire-format-compatible, but they decode to
-slightly different float values. We treat this as acceptable for an
-experimental/preview feature; production stabilization requires either (a)
-pinning EDEN's `S` table as part of Vortex's stable constants alongside the
-SplitMix64 stream, or (b) versioning the centroid/scale algorithm in metadata
-and selecting at decode time. We recommend (a) — see §13 "Migration."
+1. Reading EDEN [15] to extract the S-optimization algorithm. The note
+   [14] defers to "methods described in the EDEN works" and does not
+   reproduce the algorithm. The authors' official reproduction at
+   https://github.com/amitport/EDEN-Distributed-Mean-Estimation
+   (PyTorch + TensorFlow) has **no LICENSE file**, so Vortex's
+   implementation must be clean-room from the paper.
+2. Pinning the resulting `S(d, b)` table — or the algorithm to derive it
+   deterministically — as a Vortex constant alongside the SplitMix64
+   stream and the centroid algorithm.
+3. Updating `vortex-turboquant`'s encode/decode paths to apply
+   `r * S(d, b)` at quantization and `centroids[c] / S(d, b)` at
+   dequantization. No metadata change (the scale is reproducible from
+   `(padded_dim, bit_width)`); no storage-shape change.
+
+This work is deferred to a Stage 1.5 follow-up rather than blocking
+Stage 1. The reason: until the EDEN paper has been read and the table
+extracted, we can't pin `S` as a wire-format-stable constant, and
+shipping a non-stable EDEN-`S` would mean files written today decode to
+different float values than files written tomorrow at the same bit
+budget. `S = 1` is wire-format-stable today (it's already in the code)
+and matches what the note [14] calls "TurboQuant_mse" — a known but
+suboptimal point on the curve.
+
+If a future stage adds EDEN's native unbiased mode (§15), an
+`unbiased: bool` metadata flag is added at prost tag 7 and the cache
+key extends to `(padded_dim, bit_width, biased)`; biased and unbiased
+modes will have different `S` tables.
 
 ### Defaults and configuration
 
@@ -798,7 +805,8 @@ Tracked in issue #7830 and from the codex review of PR #7829:
 - **SORF dimension padding panics on oversized dims.** `tq_padded_dim()` uses
   unchecked `next_power_of_two()`. Should use the checked version and validate
   in `validate_sorf_options`. (P2 in PR #7829 review.)
-- **EDEN-`S` not yet adopted** (this RFC's recommendation).
+- **EDEN-`S` not yet adopted** (Stage 1 ships with `S = 1`; EDEN-`S`
+  scheduled for Stage 1.5 follow-up).
 - **Pluggable scalar functions for TurboQuant-aware similarity not yet
   designed.** Currently `cosine_similarity` and `inner_product` must fall back
   to `TQDecode → compute on floats`; pushdown kernels that operate directly on
@@ -1192,7 +1200,7 @@ The canonical reference is
 [`vortex/examples/turboquant_vector_search.rs`][example] in the Vortex
 repo, which exercises both the write path and a filter-pushdown read.
 
-[example]: https://github.com/spiraldb/vortex/blob/ff120401a0f4796f2d1aa85d1f87e7195c1f3dbf/vortex/examples/turboquant_vector_search.rs
+[example]: https://github.com/vortex-data/vortex/blob/ff120401a0f4796f2d1aa85d1f87e7195c1f3dbf/vortex/examples/turboquant_vector_search.rs
 
 **Current vs. target API.** The example today wires TurboQuant through the
 older `vortex-tensor` `L2Denorm + SorfTransform` decomposition (see §13
@@ -1368,12 +1376,12 @@ Stage 2's at all dimensions. The win is in scan throughput.
 
 For common model dimensions, the most promising configurations are:
 
-| Dimension             | Recommendation             | Rationale                                                               |
-| --------------------- | -------------------------- | ----------------------------------------------------------------------- |
-| 512, 1024, 2048, 4096 | Stage 1 + EDEN-S + Stage 3 | B=d, no decomposition needed. Same as Stage 1 but with PDX scan layout. |
-| 768, 1536, 3072       | Stage 2 (k=3) + Stage 3    | B=256 or 512. No padding waste. 3 blocks, shared centroids.             |
-| 96, 100, 800 (rare)   | Stage 1 padded             | Internal zero-padding to next power-of-2.                               |
-| < 128                 | Not recommended            | Scheme minimum; SORF mixing quality and overhead ratio degrade.         |
+| Dimension             | Recommendation          | Rationale                                                                        |
+| --------------------- | ----------------------- | -------------------------------------------------------------------------------- |
+| 512, 1024, 2048, 4096 | Stage 1 + Stage 3       | B=d, no decomposition needed. Stage 1.5 layers EDEN-`S` on top (no wire change). |
+| 768, 1536, 3072       | Stage 2 (k=3) + Stage 3 | B=256 or 512. No padding waste. 3 blocks, shared centroids.                      |
+| 96, 100, 800 (rare)   | Stage 1 padded          | Internal zero-padding to next power-of-2.                                        |
+| < 128                 | Not recommended         | Scheme minimum; SORF mixing quality and overhead ratio degrade.                  |
 
 All recommendations default to b=8 (near-lossless, ~4× compression). Users
 who want more aggressive compression can drop to b=4 or b=5 with measurable
@@ -1471,7 +1479,7 @@ checklist, with explicit per-stage status:
   (P2 from PR #7829 review; tracked as TODO in `lib.rs`)
 - ⚠️ SORF dimension validation panics on oversized dims; should error (P2 from
   PR #7829 review)
-- ⏳ **EDEN-`S` adoption** (this RFC's recommendation; near-term work)
+- ⏳ **EDEN-`S` adoption** (Stage 1.5 follow-up; requires reading EDEN [15] and pinning the `S` table — see §6)
 - ⏳ Example migration from `vortex-tensor` `L2Denorm + SorfTransform` to
   `vortex-turboquant`
 - ⏳ Public API stabilization
@@ -1593,10 +1601,13 @@ is speculative under per-block rotations (Stage 2); see Appendix C.
 ## Migration and compatibility
 
 TurboQuant has not been included in a release yet, so the wire format can
-still change freely. The Stage 1 target wire format (with EDEN-`S`
-adopted) is intended to be ready for backward-compatibility guarantees,
+still change freely. The Stage 1 target wire format (`S = 1`, biased
+MSE-only) is intended to be ready for backward-compatibility guarantees,
 without formally committing to stability until confirmed by Stage 2
-implementation and benchmarking.
+implementation and benchmarking. EDEN-`S` adoption (Stage 1.5) is
+explicitly wire-format-compatible — same metadata, same storage shape;
+only the `S` constant lookup changes — so it does not constrain Stage 1
+stabilization.
 
 ### Strategy: single extension ID, additive metadata
 
@@ -1617,10 +1628,19 @@ encoding ID.
 
 ### Wire-format constants
 
-`MIN_DIMENSION = 128`, `MAX_BIT_WIDTH = 8`, default `num_rounds = 3`, the
-SplitMix64 PRNG, and (after Stage 1 stabilization) EDEN's `S` table are
-all part of Vortex's stable contract. Changing any of them is a
-wire-format break.
+The following are part of Vortex's stable contract; changing any of them
+is a wire-format break:
+
+- `MIN_DIMENSION = 128`, `MAX_BIT_WIDTH = 8`, default `num_rounds = 3`.
+- The SplitMix64 step function and constants, the SORF sign-stream
+  extraction order, and the trailing `padded_dim^(-num_rounds/2)`
+  normalization factor — all specified bit-exactly in Appendix D.15
+  "SORF sign-stream contract."
+- The Max-Lloyd centroid construction (numerical integration of the
+  Beta marginal `(1 - x²)^((B-3)/2)` at the relevant block dimension,
+  cached process-locally).
+- After Stage 1.5 lands, EDEN's `S(d, b)` table or the deterministic
+  algorithm that produces it.
 
 ### Norms are always internal children
 
@@ -1660,11 +1680,12 @@ Removal is a Stage 1 cleanup task once the example migrates.
 
 ### Incremental shipping
 
-| Stage      | Ships to users? | Reads prior stage files?   | Notes                                              |
-| ---------- | --------------- | -------------------------- | -------------------------------------------------- |
-| 1 (MSE)    | Yes             | N/A (first preview)        | Single block, EDEN-`S`, biased only                |
-| 2 (blocks) | Yes             | Yes (k=1 is identical)     | `block_size` metadata added; k>1 needs S2+ readers |
-| 3 (PDX)    | Yes             | Yes (FSL codes still work) | PDX codes need `PDXArray` registered               |
+| Stage          | Ships to users? | Reads prior stage files?    | Notes                                                 |
+| -------------- | --------------- | --------------------------- | ----------------------------------------------------- |
+| 1 (MSE)        | Yes             | N/A (first preview)         | Single block, biased only, `S = 1`                    |
+| 1.5 (EDEN-`S`) | Yes             | Yes (wire-format-identical) | Layers EDEN-`S` on top; no metadata or storage change |
+| 2 (blocks)     | Yes             | Yes (k=1 is identical)      | `block_size` metadata added; k>1 needs S2+ readers    |
+| 3 (PDX)        | Yes             | Yes (FSL codes still work)  | PDX codes need `PDXArray` registered                  |
 
 Each stage is independently shippable. Users can upgrade incrementally.
 Files written by earlier stages are always readable by later decoders.
@@ -1995,12 +2016,15 @@ fn tq_encode(v: Vector<F, d>, cfg: &TurboQuantConfig) -> TurboQuantArray:
     if d > MAX_DIMENSION:                          # MAX_DIMENSION = 2^31
         return Err(OverflowError)                  # next_power_of_two would overflow
     padded_dim = next_power_of_two(d)              # checked: ≤ 2^31
+    norm_factor = padded_dim^(-cfg.num_rounds / 2) # SORF orthogonality factor
 
     n = ‖v‖₂   # in input dtype F (f16/f32/f64)
     if n > 0:
         u_padded[0..d]    = v / n
         u_padded[d..padded_dim] = 0.0
-        r = SORF(u_padded, cfg.seed, cfg.num_rounds)   # in f32
+        # SORF: r = norm_factor * H * D_{R} * ... * H * D_1 * u_padded, all in f32.
+        # See D.15 "SORF sign-stream contract" for the bit-exact derivation of D_i.
+        r = SORF(u_padded, cfg.seed, cfg.num_rounds, norm_factor)
         for j in 0..padded_dim:
             codes[j] = nearest_centroid(r[j] * S, centroids)
     else:
@@ -2032,10 +2056,11 @@ LICENSE file and therefore cannot be copied or adapted into Vortex.
 
 ```text
 fn tq_decode(tq: TurboQuantArray) -> Vector<F, d>:
-    d           = tq.metadata.dimensions
-    padded_dim  = next_power_of_two(d)
-    centroids   = get_centroids(padded_dim, tq.metadata.bit_width)
-    S           = get_eden_scale(padded_dim, tq.metadata.bit_width)
+    d            = tq.metadata.dimensions
+    padded_dim   = next_power_of_two(d)
+    norm_factor  = padded_dim^(-tq.metadata.num_rounds / 2)
+    centroids    = get_centroids(padded_dim, tq.metadata.bit_width)
+    S            = get_eden_scale(padded_dim, tq.metadata.bit_width)
 
     if validity(row) == false:
         return null
@@ -2043,7 +2068,11 @@ fn tq_decode(tq: TurboQuantArray) -> Vector<F, d>:
     for j in 0..padded_dim:
         r_hat[j] = centroids[tq.codes[j]] / S
 
-    u_hat_padded = SORF_inverse(r_hat, tq.metadata.seed, tq.metadata.num_rounds)
+    # Inverse SORF is the same construction with sign diagonals applied in reverse
+    # order. The norm_factor squares (forward × inverse) to padded_dim^(-num_rounds),
+    # so SORF_inverse uses the same norm_factor as forward — both sides compose to
+    # the identity matrix.
+    u_hat_padded = SORF_inverse(r_hat, tq.metadata.seed, tq.metadata.num_rounds, norm_factor)
     u_hat        = u_hat_padded[0..d]   # truncate the zero-padding
 
     v_hat        = tq.norms * u_hat     # in dtype F
@@ -2282,6 +2311,111 @@ After `vortex-turboquant` ships:
 5. Remove the legacy paths in a follow-up PR.
 
 Each step is independently mergeable.
+
+### D.15 SORF sign-stream contract (wire-format-stable)
+
+A cross-language reimplementation of Vortex's TurboQuant must produce
+bit-identical SORF rotations. The contract below pins every degree of
+freedom; reproduced from `vortex-turboquant/src/sorf/` at ff120401 so a
+reader doesn't need to consult the Rust source.
+
+**SplitMix64 step function** (translated verbatim from
+https://prng.di.unimi.it/splitmix64.c):
+
+```text
+state: u64                                    // initial value = the array's `seed`
+increment   = 0x9E37_79B9_7F4A_7C15
+mul1        = 0xBF58_476D_1CE4_E5B9
+mul2        = 0x94D0_49BB_1331_11EB
+
+fn next_u64(state: &mut u64) -> u64:
+    *state = (*state).wrapping_add(increment)
+    let mut z = *state
+    z = (z ^ (z >> 30)).wrapping_mul(mul1)
+    z = (z ^ (z >> 27)).wrapping_mul(mul2)
+    z ^ (z >> 31)
+```
+
+All arithmetic is `u64` modular (wrapping). Initial `state` is the
+array's `seed` field; no salting.
+
+**Sign-stream extraction.** Each `next_u64()` call yields one `u64`
+producing 64 signs in **LSB-first** order. Bit `1` means `+1`; bit `0`
+means `-1`. For SORF over `padded_dim` coordinates and `num_rounds`
+rounds, the total sign budget is `num_rounds * padded_dim` signs;
+extract them in **round-major, block-major** order:
+
+```text
+for round in 0..num_rounds:
+    for block in 0..(padded_dim / 64):    // padded_dim divisible by 64 (guaranteed by >= 128 and power-of-2)
+        u = next_u64(state)
+        for bit in 0..64:
+            sign[round][block * 64 + bit] = if (u >> bit) & 1 == 1 { +1.0 } else { -1.0 }
+```
+
+If `padded_dim < 64` the contract degrades (`padded_dim < MIN_DIMENSION
+= 128`, so this is never reached in valid configurations; the validation
+in D.3 rejects it earlier).
+
+**Transform.** Apply alternating sign diagonals and Walsh–Hadamard
+butterflies:
+
+```text
+fn SORF(u_padded: [f32; padded_dim], seed: u64, num_rounds: u8, norm_factor: f32):
+    let mut state = seed
+    let signs = extract_signs(&mut state, num_rounds, padded_dim)
+    let mut r = u_padded.clone()
+    for round in 0..num_rounds:
+        for i in 0..padded_dim:
+            r[i] = r[i] * signs[round][i]      // D_{round+1}
+        fwht_in_place(&mut r)                  // H, unnormalized
+    for i in 0..padded_dim:
+        r[i] = r[i] * norm_factor              // padded_dim^(-num_rounds/2)
+    return r
+```
+
+The unnormalized FWHT is the standard Walsh–Hadamard butterfly (`H_n =
+H_2 ⊗ H_n/2`); no scaling per butterfly. The single trailing
+`norm_factor` multiply restores orthogonality.
+
+**Inverse SORF.** Apply sign diagonals in reverse order; FWHT is its own
+inverse (up to normalization, which the trailing `norm_factor` handles):
+
+```text
+fn SORF_inverse(r: [f32; padded_dim], seed: u64, num_rounds: u8, norm_factor: f32):
+    let mut state = seed
+    let signs = extract_signs(&mut state, num_rounds, padded_dim)
+    let mut u = r.clone()
+    for round in (0..num_rounds).rev():
+        fwht_in_place(&mut u)
+        for i in 0..padded_dim:
+            u[i] = u[i] * signs[round][i]      // D_{round+1}^T = D_{round+1}
+    for i in 0..padded_dim:
+        u[i] = u[i] * norm_factor
+    return u
+```
+
+**Validation.** A reference implementation must reproduce the
+`SPLITMIX64_SEED0_GOLDEN` test vectors from the Rust source's
+`splitmix64.rs` tests module and the SORF roundtrip vectors from
+`sorf/transform.rs` tests at the cited commit.
+
+### D.16 Concurrency model
+
+- `TurboQuant: Send + Sync`, `TurboQuantConfig: Send + Sync + Clone`.
+- `TQEncode` and `TQDecode` scalar-fn instances are `Sync` (they
+  carry the config plus references to immutable parameters); execution
+  is parallelizable across rows.
+- The centroid + scale cache (`CENTROID_CACHE`) is a process-local
+  `DashMap<(u32, u8), ...>`: lock-free reads, sharded writes. Concurrent
+  encoders / decoders share the cache without external synchronization.
+- The SORF sign stream is regenerated per-array-execution from the
+  array's `seed` — it is not cached. Two concurrent transforms over
+  arrays with the same seed independently produce bit-identical sign
+  streams.
+- No `unsafe` invariants beyond `BufferMut::push_unchecked` calls in
+  the encode hot loop, which are guarded by pre-computed capacity (see
+  `quantize.rs`).
 
 ## Open questions
 
