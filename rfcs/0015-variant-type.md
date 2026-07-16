@@ -147,7 +147,7 @@ As described in [this](https://clickhouse.com/blog/a-new-powerful-json-data-type
 
 - Do we want a JSON extension type that automatically compresses as variant?
 
-- ~How do variant expressions operate over different variant encodings?~ Resolved this, just had to talk the new execution model with @joseph-isaacs.
+- ~~How do variant expressions operate over different variant encodings?~~ Resolved this, just had to talk the new execution model with @joseph-isaacs.
 
 ## Future Possibilities
 
